@@ -106,4 +106,3 @@ Rules for every PR:
 
 Hard rules (never break, in any PR):
 - The ledger never stores memory content. IDs, content hashes, edges, and metadata only; content stays in the customer's stores.
-- The library makes no telemetry or network calls home.
