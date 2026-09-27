@@ -93,6 +93,8 @@ If blocked or unsure (ambiguous acceptance criteria, a design decision the issue
 2. Add the label: `gh issue edit <N> --add-label needs-human`.
 3. Stop. No more commits and no PR; the PR-opening step skips issues labeled `needs-human`.
 
+The human answers with an `@claude` comment on the issue. That run removes `needs-human` before Claude starts, so continue from the answer; the PR-opening step then works again.
+
 **Never guess on design decisions.** Data model, APIs, capture semantics, dependencies and anything recorded in `docs/decisions.md` get asked about, not assumed.
 
 Rules for every PR:

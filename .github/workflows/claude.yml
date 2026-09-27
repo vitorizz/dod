@@ -51,6 +51,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      # A @claude comment on a needs-human issue is the human's answer: clear the label so
+      # Claude can continue and the PR-opening step no longer skips this issue.
+      - name: Clear needs-human on follow-up
+        if: github.event_name == 'issue_comment' && !github.event.issue.pull_request && contains(github.event.issue.labels.*.name, 'needs-human')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-human
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
@@ -64,17 +74,17 @@ jobs:
           additional_permissions: |
             actions: read
 
-          # Claude can run tests and open the PR itself, linked to the issue
+          # Behavioural rules (asking when blocked, needs-human, never guessing) live in CLAUDE.md,
+          # which the action loads via settingSources. The PR is opened by the step below.
           claude_args: |
             --model claude-sonnet-5
-            --allowedTools "Bash(pip install *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *),Bash(gh pr create:*),Bash(gh issue comment *),Bash(gh issue edit * --add-label needs-human)"
-            --append-system-prompt "When you finish work on an issue, push your branch and open the pull request yourself with gh pr create. The PR body must include 'Closes #N', where N is the issue number, so the PR is linked to the issue and closes it on merge. If you are blocked or unsure, post the specific question on the issue with gh issue comment, add the label with gh issue edit <N> --add-label needs-human, and stop: no more commits and no PR. Never guess on design decisions; ask instead."
+            --allowedTools "Bash(pip install *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *),Bash(gh issue comment *),Bash(gh issue edit * --add-label needs-human)"
 
       # The action's built-in tag-mode prompt tells Claude to post a "Create PR" link
       # instead of opening one, so open it here. Uses PAT_TOKEN, not GITHUB_TOKEN:
       # PRs opened with GITHUB_TOKEN don't trigger CI or the review workflow.
       - name: Open PR for Claude's branch
-        if: github.event_name == 'issues'
+        if: github.event_name == 'issues' || (github.event_name == 'issue_comment' && !github.event.issue.pull_request)
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           REPO: ${{ github.repository }}
