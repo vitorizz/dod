@@ -30,7 +30,7 @@ Everything else is a query over this graph:
 - **Sell trace + surgical excision. Never promise automated detection of bad memories.** Detection is unreliable (best methods ~14% step-level accuracy); tracing from a recorded edge is cheap and reliable.
 
 ## Build plan
-1. **CrewAI first.** It already emits `MemoryQueryCompleted` and `MemorySaveStarted` events; bind them into one edge with minimal glue.
+1. **CrewAI first.** Wrap the `Memory` instance's `recall` and `remember` (synchronous, exact record IDs), scoping context per agent/task with `contextvars` so concurrent agents never cross-link parents. Don't bind `MemoryQueryCompleted` → `MemorySaveStarted` events: the save events don't carry the record ID, and handlers run in a thread pool, so they can arrive out of order. Pinned to crewai 1.15.22; bump deliberately and re-run the integration test.
 2. Append-only store (SQLite to start). Capture overhead must be sub-millisecond.
 3. Implement `trace` and `blast-radius`.
 4. Add a second store (LangGraph `Store` or pgvector) to prove the cross-store join.
@@ -62,3 +62,35 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 - Keep responses concise.
 - Prefer small, working increments over large scaffolds.
 - Instrument everything: we'll run an experiment measuring how far false memories propagate.
+
+## Stack
+- Python >= 3.9 (CI runs 3.12). Package `dod` in `src/` layout, built with hatchling (`pyproject.toml`).
+- Ledger: stdlib `sqlite3`, append-only, WAL mode. No ORM.
+- Tests: pytest. Benchmarks are plain pytest tests using `tests/perf.py` (p50/p99 via `time.perf_counter_ns`).
+- Framework integrations are optional extras, never core dependencies: `[crewai]` pins `crewai==1.15.22`.
+- CI and agents: GitHub Actions (`ci.yml`, `claude.yml`, `claude-code-review.yml`, `project-board.yml`).
+
+## Test commands
+```bash
+pip install -e ".[dev]"              # install package + test deps
+pytest -q                            # full suite, including p99 < 1 ms capture benchmarks
+pytest -q tests/test_*_perf.py -s    # benchmarks only, printing p50/p99
+pip install -e ".[dev,crewai]"       # add the real CrewAI dependency
+pytest -q -m crewai                  # CrewAI integration tests (skipped without crewai)
+```
+In agent runs, use these exact forms. Don't create a venv or call pip through `python -m`: they are not in the allowed tools and get denied. (`python -m pytest` is allowed.)
+Benchmark files and the `crewai` marker arrive with #11 and #13.
+
+## Workflow
+1. Every change starts as an issue using the agent-task template (Goal / Acceptance criteria / Files involved), sized for one PR. New issues go on the board as Backlog with Priority and Size.
+2. A human approves by adding the `agent-ready` label. The board moves the issue to Ready, then to In progress when Claude starts.
+3. Claude works on a `claude/issue-<N>-*` branch and pushes. A workflow step opens the PR with `Closes #N` (using `PAT_TOKEN`, so CI and review trigger).
+4. CI (pytest + benchmarks) and Claude Code Review run on the PR. Fix findings with `@claude` comments on the PR.
+5. A human merges. Merging closes the issue.
+
+Rules for every PR:
+- New or changed behavior comes with tests. Anything on the capture path includes or updates a benchmark asserting p99 < 1 ms.
+- One issue, one PR. Stay within "Files involved"; if more is needed, say so in the PR instead of expanding scope.
+- Don't edit `.github/workflows/` from agent runs (the GitHub App can't push workflow changes).
+- Keep strategy (pricing, positioning, competitors) out of code, comments, and commit messages.
+- Record decisions in `docs/decisions.md`, one line of why each.
