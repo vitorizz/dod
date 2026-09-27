@@ -11,6 +11,21 @@ on:
     types: [submitted]
 
 jobs:
+  # Moves the issue to "In progress" when Claude starts on it (issues only, not PRs).
+  # Keep these event conditions in sync with the claude job below.
+  board:
+    if: |
+      github.event.issue && !github.event.issue.pull_request && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'agent-ready') ||
+        (github.event_name == 'issues' && github.event.action != 'labeled' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
+    uses: ./.github/workflows/project-board.yml
+    with:
+      issue_number: ${{ github.event.issue.number }}
+      status: In progress
+    secrets: inherit
+
   claude:
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
@@ -48,10 +63,6 @@ jobs:
           # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
             actions: read
-
-          # TEMPORARY: surface permission denials for one run, then remove.
-          # Full output can include tool results; OK only because the repo is private.
-          show_full_output: true
 
           # Claude can run tests and open the PR itself, linked to the issue
           claude_args: |

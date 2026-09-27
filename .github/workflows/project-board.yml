@@ -1,0 +1,66 @@
+name: Project Board
+
+# Moves issues on the "dod project board" (user project #1):
+#   - issue labeled agent-ready          -> "Ready (agent-ready)"   (this workflow's own trigger)
+#   - Claude workflow starts on an issue -> "In progress"           (called from claude.yml)
+# Uses PAT_TOKEN (classic, repo + project scopes): GITHUB_TOKEN can't edit user-owned projects.
+
+on:
+  issues:
+    types: [labeled]
+  workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: number
+      status:
+        required: true
+        type: string
+
+env:
+  PROJECT_OWNER: vitorizz
+  PROJECT_NUMBER: 1
+
+jobs:
+  set-status:
+    if: inputs.status || (github.event.action == 'labeled' && github.event.label.name == 'agent-ready')
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Set Status on project board
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          STATUS: ${{ inputs.status || 'Ready (agent-ready)' }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::PAT_TOKEN secret is not set"; exit 1
+          fi
+
+          project_id=$(gh project view "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json --jq '.id')
+          read -r field_id option_id < <(gh project field-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" \
+            --format json --jq ".fields[] | select(.name == \"Status\") | \"\(.id) \(.options[] | select(.name == \"$STATUS\") | .id)\"")
+          if [ -z "$option_id" ]; then
+            echo "::error::Status option \"$STATUS\" not found on project $PROJECT_NUMBER"; exit 1
+          fi
+
+          # Adds the issue if it isn't on the board yet; returns the existing item otherwise.
+          item_id=$(gh project item-add "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" \
+            --url "https://github.com/$REPO/issues/$ISSUE_NUMBER" --format json --jq '.id')
+
+          # The labeled event starts this workflow and claude.yml at the same time, so
+          # "Ready" must never overwrite a later status that landed first.
+          if [ "$STATUS" = "Ready (agent-ready)" ]; then
+            current=$(gh api graphql -f id="$item_id" -f query='
+              query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
+                fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }' \
+              --jq '.data.node.fieldValueByName.name // ""')
+            if [ -n "$current" ] && [ "$current" != "Backlog" ]; then
+              echo "#$ISSUE_NUMBER is already \"$current\"; not moving back to \"$STATUS\"."; exit 0
+            fi
+          fi
+
+          gh project item-edit --id "$item_id" --project-id "$project_id" \
+            --field-id "$field_id" --single-select-option-id "$option_id"
+          echo "#$ISSUE_NUMBER -> $STATUS"
