@@ -103,3 +103,6 @@ Rules for every PR:
 - Don't edit `.github/workflows/` from agent runs (the GitHub App can't push workflow changes).
 - Keep strategy (pricing, positioning, competitors) out of code, comments, and commit messages.
 - Record decisions in `docs/decisions.md`, one line of why each.
+
+Hard rules (never break, in any PR):
+- The ledger never stores memory content. IDs, content hashes, edges, and metadata only; content stays in the customer's stores.
