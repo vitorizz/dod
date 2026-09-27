@@ -67,7 +67,7 @@ jobs:
           # Claude can run tests and open the PR itself, linked to the issue
           claude_args: |
             --model claude-sonnet-5
-            --allowedTools "Bash(pip install *),Bash(pytest *),Bash(gh pr create:*)"
+            --allowedTools "Bash(pip install *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *),Bash(gh pr create:*)"
             --append-system-prompt "When you finish work on an issue, push your branch and open the pull request yourself with gh pr create. The PR body must include 'Closes #N', where N is the issue number, so the PR is linked to the issue and closes it on merge."
 
       # The action's built-in tag-mode prompt tells Claude to post a "Create PR" link
