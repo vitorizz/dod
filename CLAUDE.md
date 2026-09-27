@@ -88,6 +88,15 @@ Benchmark files and the `crewai` marker arrive with #11 and #13.
 4. CI (pytest + benchmarks) and Claude Code Review run on the PR. Fix findings with `@claude` comments on the PR.
 5. A human merges. Merging closes the issue.
 
+If blocked or unsure (ambiguous acceptance criteria, a design decision the issue doesn't settle, a conflict with this file, a missing dependency or permission):
+1. Comment the specific question on the issue: `gh issue comment <N> --body "..."`. Say what you need decided, the options you see, and what you'd need to proceed.
+2. Add the label: `gh issue edit <N> --add-label needs-human`.
+3. Stop. No more commits and no PR; the PR-opening step skips issues labeled `needs-human`.
+
+The human answers with an `@claude` comment on the issue. That run removes `needs-human` before Claude starts, so continue from the answer; the PR-opening step then works again.
+
+**Never guess on design decisions.** Data model, APIs, capture semantics, dependencies and anything recorded in `docs/decisions.md` get asked about, not assumed.
+
 Rules for every PR:
 - New or changed behavior comes with tests. Anything on the capture path includes or updates a benchmark asserting p99 < 1 ms.
 - One issue, one PR. Stay within "Files involved"; if more is needed, say so in the PR instead of expanding scope.
