@@ -49,8 +49,49 @@ jobs:
           additional_permissions: |
             actions: read
 
+          # TEMPORARY: surface permission denials for one run, then remove.
+          # Full output can include tool results; OK only because the repo is private.
+          show_full_output: true
+
           # Claude can run tests and open the PR itself, linked to the issue
           claude_args: |
             --model claude-sonnet-5
             --allowedTools "Bash(pip install *),Bash(pytest *),Bash(gh pr create:*)"
             --append-system-prompt "When you finish work on an issue, push your branch and open the pull request yourself with gh pr create. The PR body must include 'Closes #N', where N is the issue number, so the PR is linked to the issue and closes it on merge."
+
+      # The action's built-in tag-mode prompt tells Claude to post a "Create PR" link
+      # instead of opening one, so open it here. Uses PAT_TOKEN, not GITHUB_TOKEN:
+      # PRs opened with GITHUB_TOKEN don't trigger CI or the review workflow.
+      - name: Open PR for Claude's branch
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.repository.default_branch }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::PAT_TOKEN secret is not set"; exit 1
+          fi
+          # Branches are claude/issue-<N>-<YYYYMMDD-HHMM>; newest sorts last.
+          branch=$(gh api "repos/$REPO/git/matching-refs/heads/claude/issue-$ISSUE_NUMBER-" \
+            --jq '.[].ref' | sed 's#^refs/heads/##' | sort | tail -n 1)
+          if [ -z "$branch" ]; then
+            echo "No claude/issue-$ISSUE_NUMBER-* branch; Claude made no changes."; exit 0
+          fi
+          ahead=$(gh api "repos/$REPO/compare/$BASE...$branch" --jq '.ahead_by')
+          if [ "$ahead" = "0" ]; then
+            echo "$branch has no commits ahead of $BASE; nothing to open."; exit 0
+          fi
+          existing=$(gh pr list --repo "$REPO" --head "$branch" --state all --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already exists for $branch."; exit 0
+          fi
+          body="Closes #$ISSUE_NUMBER
+
+          Opened automatically from \`$branch\` after Claude worked on #$ISSUE_NUMBER.
+
+          🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+          gh pr create --repo "$REPO" --base "$BASE" --head "$branch" \
+            --title "$ISSUE_TITLE" --body "$body"
