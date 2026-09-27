@@ -26,6 +26,11 @@ jobs:
     if: inputs.status || (github.event.action == 'labeled' && github.event.label.name == 'agent-ready')
     runs-on: ubuntu-latest
     permissions: {}
+    # The labeled event starts this workflow and claude.yml's board job at once.
+    # Serialize writes per issue so the Ready guard below reads a settled status.
+    concurrency:
+      group: project-board-issue-${{ inputs.issue_number || github.event.issue.number }}
+      cancel-in-progress: false
     steps:
       - name: Set Status on project board
         env:
@@ -34,15 +39,22 @@ jobs:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
           STATUS: ${{ inputs.status || 'Ready (agent-ready)' }}
         run: |
+          set -euo pipefail
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::PAT_TOKEN secret is not set"; exit 1
           fi
 
           project_id=$(gh project view "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json --jq '.id')
-          read -r field_id option_id < <(gh project field-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" \
-            --format json --jq ".fields[] | select(.name == \"Status\") | \"\(.id) \(.options[] | select(.name == \"$STATUS\") | .id)\"")
+          fields=$(gh project field-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --limit 100 --format json)
+          field_id=$(jq -r '.fields[] | select(.name == "Status") | .id' <<<"$fields")
+          if [ -z "$field_id" ]; then
+            echo "::error::Project $PROJECT_NUMBER has no \"Status\" field"; exit 1
+          fi
+          option_id=$(jq -r --arg s "$STATUS" \
+            '.fields[] | select(.name == "Status") | .options[]? | select(.name == $s) | .id' <<<"$fields")
           if [ -z "$option_id" ]; then
-            echo "::error::Status option \"$STATUS\" not found on project $PROJECT_NUMBER"; exit 1
+            options=$(jq -r '[.fields[] | select(.name == "Status") | .options[]?.name] | join(", ")' <<<"$fields")
+            echo "::error::Status field has no option \"$STATUS\" (options: $options)"; exit 1
           fi
 
           # Adds the issue if it isn't on the board yet; returns the existing item otherwise.

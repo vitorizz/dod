@@ -38,7 +38,8 @@ jobs:
 
             1. Tests
                - Every new or changed behavior has a test. Missing tests is a blocking finding.
-               - Run `pip install -e .[dev]` (or the repo's requirements) and `pytest`; report failures verbatim.
+               - Run exactly `pip install -e ".[dev]"` then `pytest -q`, directly on the runner; report failures verbatim.
+                 Don't create a venv or call pip/pytest through `python -m`: only these command forms are allowed.
                - Tests must assert behavior, not just that code runs.
             2. Edge cases
                - Empty/None parent_ids, duplicate writes, same content hash, unknown store, concurrent writes,
@@ -60,4 +61,4 @@ jobs:
             Post specific issues as inline comments with `mcp__github_inline_comment__create_inline_comment`,
             then one summary with `gh pr comment` listing blocking vs. non-blocking findings.
             If there are no issues, say so explicitly and state what you checked.
-          claude_args: '--model claude-sonnet-5 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(pip install *),Bash(pytest *)"'
+          claude_args: '--model claude-sonnet-5 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(pip install *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *)"'
