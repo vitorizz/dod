@@ -44,11 +44,10 @@ Plant a false memory, let the agent derive 3–5 downstream memories across two 
 **Capture completeness.** Any write path that bypasses the hook (direct DB insert, out-of-wrapper tool, compaction rewriting memory) silently breaks the guarantee. Make capture the only write path, or continuously reconcile store contents against the ledger.
 
 ## Business model
-- Free, open-source capture library. Security teams can audit exactly what capture records.
-- Paid self-hosted system, running in the customer's cloud: console, cross-store connectors, excision/rollback, reconciliation, audit exports, access controls. We never see customer data.
-- Licensed annually, sized by deployment. Few customers, high ticket: start with 3–5 design partners.
-- Optional hosted version later, for smaller customers.
-- The authority layer (which sources are trustworthy for which claim types) learns per deployment; opt-in anonymized sharing is a later option. The moat is cross-store connectors and reconciliation.
+- Open-source capture library (self-host free).
+- Paid hosted console: storage, retention, querying, rollback, audit.
+- Priced like insurance: small monthly fee by volume/retention; investigations included.
+- Keep the learned authority layer (which sources are trustworthy for which claim types) proprietary. That's the long-term moat.
 
 ## Competitive notes
 - **memory-blackbox** (GitHub, lavkumarv): closest artifact, early stage. Records store-boundary provenance, not explicitly context-at-write. Watch it.
