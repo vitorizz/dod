@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dod"
+version = "0.1.0"
+description = "A capture library for AI agents with long-lived memory: records which retrieved items were in context at every memory write, turning agent memory into a traceable lineage graph."
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dod"]

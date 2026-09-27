@@ -1,2 +1,11 @@
 CLAUDE.local.md
 .private/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
