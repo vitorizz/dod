@@ -12,3 +12,4 @@ Append new decisions at the bottom. One line of why each.
 - **Open-core.** OSS capture library; paid hosted console. Learned authority layer stays proprietary.
 - **Insurance-style pricing.** Small monthly fee by volume/retention, investigations included. Not pay-per-incident.
 - **CrewAI: wrap `Memory.recall`/`remember`, not its events.** Save events carry no record ID and handlers run in a thread pool (can reorder); wrapping is synchronous with exact IDs. Scope per agent/task via `contextvars` so concurrent agents never cross-link parents; pin crewai 1.15.22. (2026-09-26, #13)
+- **Ask instead of guess: `needs-human` gate before opening a PR.** Agents that guess on unsettled design decisions produce work that has to be redone; a comment + label + stop is cheaper than a wrong PR. The `@claude` reply clears the label and resumes work. (2026-09-27, #17)
