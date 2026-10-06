@@ -95,6 +95,12 @@ If blocked or unsure (ambiguous acceptance criteria, a design decision the issue
 
 The human answers with an `@claude` comment on the issue. That run removes `needs-human` before Claude starts, so continue from the answer; the PR-opening step then works again.
 
+Handoffs (Instinct → planner → builders; see `docs/ORCHESTRATION.md`):
+- Instinct hands off through a feature issue labeled `needs-breakdown` stating goal, why, priority, and definition of done.
+- The planner reads it once and creates the technical sub-issues.
+- Questions go on the issue, with at most one clarifying round. Direction or design questions go to the human via `needs-human`.
+- No open-ended agent discussions in Slack.
+
 **Never guess on design decisions.** Data model, APIs, capture semantics, dependencies and anything recorded in `docs/decisions.md` get asked about, not assumed.
 
 Rules for every PR:

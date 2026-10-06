@@ -86,6 +86,13 @@ flowchart LR
   - `needs-human` routes to the human (alert in `#needs-you`).
   - `agent-ready` is added by the human only. It starts a builder.
 
+## Handoff rules
+1. Instinct hands off through a feature issue labeled `needs-breakdown`, stating: goal, why, priority, and definition of done.
+2. The planner reads it once and creates the technical sub-issues.
+3. Any question goes on the issue, not Slack. At most one clarifying round between planner and Instinct.
+4. Direction or design questions go to the human: comment the question on the issue and label it `needs-human`.
+5. No open-ended agent discussions in Slack.
+
 ## Instinct's operating rules
 - Reads `CLAUDE.md`, `docs/decisions.md`, and `docs/ORCHESTRATION.md` a few times a day.
 - Requests doc updates only after a decision is made, always as PRs the human approves.
