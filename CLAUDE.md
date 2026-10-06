@@ -111,6 +111,11 @@ Rules for every PR:
 - Keep strategy (pricing, positioning, competitors) out of code, comments, and commit messages.
 - Record decisions in `docs/decisions.md`, one line of why each.
 
+Keeping CLAUDE.md and decisions.md current:
+- Update CLAUDE.md in the same PR when you change technical content it describes: stack, commands, workflow, conventions.
+- Changes to the business model, positioning, hard rules, or existing `docs/decisions.md` entries must be flagged at the top of the PR description. Never make them just to satisfy a review comment; ask via `needs-human` instead.
+- Any PR touching CLAUDE.md or `docs/decisions.md` lists those changes first in its description.
+
 Hard rules (never break, in any PR):
 - The ledger never stores memory content. IDs, content hashes, edges, and metadata only; content stays in the customer's stores.
 - The library makes no telemetry or network calls home.
