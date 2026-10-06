@@ -53,7 +53,7 @@ flowchart TD
     IP --> CI
     IP --> GR
     CI -->|fail| BU
-    GR -->|"changes requested via @claude<br/>(automated: max 2 rounds)"| BU
+    GR -.->|"not yet: changes requested via @claude<br/>(reviewer doesn't emit @claude)"| BU
     CI -->|pass| IR
     GR -->|approve| IR
     IR -->|PR ready| AL
@@ -111,9 +111,6 @@ Both follow the same flow: branch, PR, human merge.
 2. The label posts an alert to `#needs-you` in Slack.
 3. The human answers with an `@claude` comment. `claude.yml` removes `needs-human` before Claude starts, and Claude resumes from the answer.
 
-## Automated fix cap
-Automated `@claude` fix requests on a PR (from bot accounts, or logins listed in `AUTOMATED_ACTORS` in `claude.yml`) are capped at 2 rounds per PR. A 3rd automated request doesn't run Claude: `claude.yml` labels the PR `needs-human` and comments why. A human `@claude` comment always runs and clears `needs-human` on the PR.
-
 ## PR-opening step
 The Claude Code Action's built-in prompt makes Claude post a "Create PR" link instead of opening a PR, even with `gh pr create` allowed. So `claude.yml` has a final step, **Open PR for Claude's branch**, that runs after Claude on issue events:
 - Finds the newest `claude/issue-<N>-*` branch; skips if there's no branch, no new commits, or a PR already exists.
@@ -148,13 +145,13 @@ The Claude Code Action's built-in prompt makes Claude post a "Create PR" link in
 - [x] Claude Code Review workflow on the repo (replaces Greptile)
 - [ ] CI: pytest + overhead benchmark (pytest runs in `ci.yml`; the benchmark lands with #11)
 - [x] Needs-human flow: ask on issue, label, stop; `@claude` reply clears label (`claude.yml`, CLAUDE.md)
-- [x] Automated `@claude` fix cap: 2 rounds per PR, then `needs-human` (`claude.yml`)
+- [ ] Reviewer → builder `@claude` loop: the reviewer doesn't emit `@claude` yet, so review findings need a human `@claude` comment.
 - [x] `#needs-you` Slack alert on `needs-human`
 - [x] Slack: Claude Tag + GitHub app; agents, alerts, needs-you channels
 - [x] GitHub Mobile app
 - [x] Docs backed up to a Claude.ai Project: decisions, research, CLAUDE.md
 - [ ] `PAT_TOKEN` expires in 90 days (set 2026-09-27, so ~2026-12-26); renew before it lapses or PRs stop opening.
-- [ ] Instinct's GitHub account in `allowed_bots` (`claude.yml`) and `AUTOMATED_ACTORS`
+- [ ] Instinct's GitHub account in `allowed_bots` (`claude.yml`)
 
 ### Post-MVP
 - [ ] Dispatcher workflow: on issue close, find open issues whose "Depends on" issues are all closed and post them to #alerts as ready to approve, respecting max 3 In progress. Auto-labeling `agent-ready` is a flag, off for now. (Instinct dispatches in the meantime.)
