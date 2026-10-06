@@ -102,7 +102,7 @@ flowchart LR
 ## Local Claude Code instances
 Two Claude Code instances run on the human's machine, outside GitHub Actions:
 - **Coding**: hands-on repo work the Action can't or shouldn't do, e.g. `.github/workflows/` changes (the GitHub App can't push them) and process PRs.
-- **Strategy**: `docs/PRODUCT.md`, `docs/decisions.md`, and private notes kept outside the repo.
+- **Strategy**: strategy sections of `CLAUDE.md`, `docs/decisions.md`, and private notes kept outside the repo.
 
 Both follow the same flow: branch, PR, human merge.
 
@@ -128,7 +128,7 @@ The Claude Code Action's built-in prompt makes Claude post a "Create PR" link in
 | Reviewer (Claude Code Review, `claude-code-review.yml`) | Strict review: tests, edge cases, capture overhead < 1 ms, CLAUDE.md conventions | Called from `ci.yml` after tests pass; skipped for docs-only PRs (all files Markdown or under `docs/`) | Inline comments + summary (blocking / non-blocking) |
 | CI (GitHub Actions) | Tests + capture overhead < 1 ms | PR opened or updated | Pass / fail |
 | Local Claude Code: coding | Workflow changes and other repo work outside the Action | Your prompt | Branch + PR |
-| Local Claude Code: strategy | `docs/PRODUCT.md`, decisions log, private notes | Your prompt | Doc edits, PRs |
+| Local Claude Code: strategy | Strategy sections of CLAUDE.md, decisions log, private notes | Your prompt | Doc edits, PRs |
 | GitHub board | Track state of all work | `project-board.yml` (agent-ready label -> Ready, Claude starts -> In progress) + built-in workflows | Card movement |
 | Slack | `#agents` planning and decision log, `#alerts` status, `#needs-you` blocked agents | GitHub app events, Instinct, planner | Alerts to you |
 | `#needs-you` (Slack) | Tell you an agent is blocked | `needs-human` label added | Alert linking the issue |
@@ -136,7 +136,7 @@ The Claude Code Action's built-in prompt makes Claude post a "Create PR" link in
 ## Setup checklist
 
 ### MVP
-- [x] CLAUDE.md trimmed to rules and commands; background in `docs/PRODUCT.md`
+- [x] CLAUDE.md (stack, conventions, test commands, workflow, no strategy in code or commits)
 - [x] Issue template
 - [x] Labels: `agent-ready`, `bug`, `feature`, `needs-human`, `needs-breakdown`
 - [x] Branch protection on `main`: ruleset `protecting_main` (active): PR required, no force-push or deletion, linear history. Not yet: required CI check (no checks listed) and 1 approving review (count is 0).

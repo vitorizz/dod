@@ -17,4 +17,7 @@ Append new decisions at the bottom. One line of why each.
 - **Instinct as PM layer above the Claude planner.** One owner for roadmap, priorities, and dispatch keeps agents on the highest-value work; the human keeps both gates (`agent-ready`, merge). (2026-10-06, #19)
 - **No automated fix-round cap.** The reviewer doesn't emit `@claude` yet, so there's no automated loop to bound; add a cap only if one appears. (2026-10-06, #19)
 - **Review after CI, skip docs-only PRs.** Reviewing a PR whose tests fail, or one that only changes Markdown, spends tokens without catching code bugs. (2026-10-06)
-- **CLAUDE.md holds rules and commands only.** Every agent run loads it; background lives in `docs/PRODUCT.md` and strategy in private notes, so runs load less. (2026-10-06)
+- **Self-hosted system, not hosted SaaS.** The paid system runs in the customer's cloud; we never see their data. Supersedes "Open-core... paid hosted console." (2026-09-27, founder decision)
+- **Few customers, high ticket.** Annual license sized by deployment, starting with 3–5 design partners. Supersedes "Insurance-style pricing." (2026-09-27, founder decision)
+- **Authority layer learns per deployment.** We never see cross-customer data; opt-in anonymized sharing is a later option. The moat shifts to cross-store connectors and reconciliation. (2026-09-27, founder decision)
+- **Open-source library builds trust.** Security teams can audit exactly what capture records. (2026-09-27, founder decision)
