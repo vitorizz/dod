@@ -16,3 +16,5 @@ Append new decisions at the bottom. One line of why each.
 - **Content-free ledger.** The ledger stores IDs, content hashes, edges, and metadata only; memory content stays in the customer's stores. This is a requirement on the schema #11 will build, not yet verified against implemented code. (2026-09-27)
 - **Instinct as PM layer above the Claude planner.** One owner for roadmap, priorities, and dispatch keeps agents on the highest-value work; the human keeps both gates (`agent-ready`, merge). (2026-10-06, #19)
 - **No automated fix-round cap.** The reviewer doesn't emit `@claude` yet, so there's no automated loop to bound; add a cap only if one appears. (2026-10-06, #19)
+- **Review after CI, skip docs-only PRs.** Reviewing a PR whose tests fail, or one that only changes Markdown, spends tokens without catching code bugs. (2026-10-06)
+- **CLAUDE.md holds rules and commands only.** Every agent run loads it; background lives in `docs/PRODUCT.md` and strategy in private notes, so runs load less. (2026-10-06)

@@ -1,8 +1,9 @@
 name: Claude Code Review
 
+# Called from ci.yml after the test job passes, and only for PRs that change code
+# (not docs-only). Runs in the caller's pull_request context.
 on:
-  pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+  workflow_call:
 
 jobs:
   claude-review:
