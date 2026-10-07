@@ -140,6 +140,58 @@ def test_bind_unknown_write_raises(cap):
         cap.bind("missing", "r")
 
 
+class FailOnceLedger:
+    def __init__(self, ledger):
+        self._ledger = ledger
+        self.failed = False
+
+    def __getattr__(self, name):
+        return getattr(self._ledger, name)
+
+    def bind(self, *args):
+        if not self.failed:
+            self.failed = True
+            raise sqlite3.OperationalError("database is locked")
+        self._ledger.bind(*args)
+
+
+def test_bind_retry_after_ledger_failure(path, ledger):
+    cap = Capture(FailOnceLedger(ledger))
+    wid = write(cap, store="pg")
+    with pytest.raises(sqlite3.OperationalError):
+        cap.bind(wid, "row-7")
+    cap.bind(wid, "row-7")
+    rows = raw(path).execute("SELECT store, record_id FROM bindings WHERE write_id=?", (wid,)).fetchall()
+    assert rows == [("pg", "row-7")]
+    # Once bound, the write is no longer pending.
+    with pytest.raises(KeyError):
+        cap.bind(wid, "row-7")
+
+
+def test_pending_evicts_oldest_past_cap(path, ledger):
+    cap = Capture(ledger, max_pending=2)
+    w1, w2, w3 = (write(cap, content=c) for c in "123")
+    with pytest.raises(KeyError):
+        cap.bind(w1, "r1")
+    cap.bind(w2, "r2")
+    cap.bind(w3, "r3")
+    # The evicted write stays in the ledger, unbound.
+    assert n_writes(path) == 3
+    bound = {w for (w,) in raw(path).execute("SELECT write_id FROM bindings")}
+    assert bound == {w2, w3}
+
+
+def test_bound_writes_free_pending_slots(ledger):
+    cap = Capture(ledger, max_pending=1)
+    for i in range(5):
+        cap.bind(write(cap, content=str(i)), f"r{i}")
+
+
+def test_max_pending_must_be_positive(ledger):
+    with pytest.raises(ValueError):
+        Capture(ledger, max_pending=0)
+
+
 def test_compaction_parents_and_trace(path, cap):
     # A, B, C are written and bound to their store IDs.
     for rid in ("A", "B", "C"):
