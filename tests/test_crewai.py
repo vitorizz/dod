@@ -1,6 +1,7 @@
 import asyncio
 import contextvars
 import inspect
+import json
 import logging
 import os
 import sqlite3
@@ -540,11 +541,13 @@ def test_stub_signatures_match_crewai():
 
 
 class _MemStorage:
-    """Minimal in-memory crewai StorageBackend. Scores stay below the
-    consolidation threshold, so saves never need an LLM."""
+    """Minimal in-memory crewai StorageBackend. By default scores stay below
+    the consolidation threshold, so saves never need an LLM; raise ``score``
+    to make EncodingFlow consolidate."""
 
     def __init__(self):
         self.records = {}
+        self.score = 0.5
 
     def save(self, records):
         for r in records:
@@ -552,7 +555,7 @@ class _MemStorage:
 
     def search(self, query_embedding, scope_prefix=None, categories=None,
                metadata_filter=None, limit=10, min_score=0.0):
-        return [(r, 0.5) for r in list(self.records.values())[:limit]]
+        return [(r, self.score) for r in list(self.records.values())[:limit]]
 
     def update(self, record):
         self.records[record.id] = record
@@ -581,12 +584,24 @@ class _NoLLM:
         raise AssertionError("test must not reach the LLM")
 
 
-def _real_memory():
+class _PlanLLM:
+    """Answers crewai's consolidation call with a scripted ConsolidationPlan."""
+
+    def __init__(self):
+        self.plan = None
+        self.calls = 0
+
+    def call(self, messages, **kwargs):
+        self.calls += 1
+        return json.dumps(self.plan)
+
+
+def _real_memory(llm=None):
     from crewai.memory.unified_memory import Memory
 
     return Memory(
         storage=_MemStorage(),
-        llm=_NoLLM(),
+        llm=llm or _NoLLM(),
         embedder=lambda texts: [[1.0, 0.0, 0.0] for _ in texts],
         exploration_budget=0,
     )
@@ -616,6 +631,43 @@ def test_real_memory_end_to_end(path, cap):
     assert parents(path, wc) == {a.id: "retrieved_in_scope", b.id: "retrieved_in_scope"}
     with pytest.raises(NotImplementedError):
         m.remember_many(["D"])
+
+
+@pytest.mark.crewai
+def test_real_consolidation_recorded_as_compaction(path, cap):
+    # Drives crewai's own EncodingFlow through update + delete + insert; only
+    # the LLM's plan is scripted.
+    pytest.importorskip("crewai")
+    llm = _PlanLLM()
+    m = instrument(_real_memory(llm), cap)
+    with agent_task_scope("setup", "setup"):
+        a, b, x = _save(m, "A"), _save(m, "B"), _save(m, "X")
+    assert llm.calls == 0
+
+    m._storage.score = 0.95  # above consolidation_threshold
+    llm.plan = {
+        "actions": [
+            {"action": "update", "record_id": a.id, "new_content": "A merged with C"},
+            {"action": "delete", "record_id": b.id},
+            {"action": "keep", "record_id": x.id},
+        ],
+        "insert_new": True,
+    }
+    with agent_task_scope("agent", "task"):
+        c = m.remember("C", scope="/", categories=[], importance=0.5, source="user")
+    assert llm.calls == 1
+    store = m._storage.records
+    assert store[a.id].content == "A merged with C" and b.id not in store and c.id in store
+
+    w_c, w_a, w_new = (w for w, *_ in writes(path)[3:])
+    assert bound(path, w_c) == [c.id]
+    consulted = {a.id: "in_prompt", b.id: "in_prompt", x.id: "in_prompt"}
+    # The rewritten record comes from the consolidation LLM.
+    assert parents(path, w_a) == consulted and bound(path, w_a) == [a.id]
+    # The newly inserted record keeps the caller's source.
+    assert parents(path, w_new) == consulted and bound(path, w_new) == [c.id]
+    sources = {w: s for w, _, s, *_ in writes(path)}
+    assert (sources[w_c], sources[w_a], sources[w_new]) == ("user", "agent_inference", "user")
 
 
 @pytest.mark.crewai
