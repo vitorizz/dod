@@ -8,10 +8,24 @@ excision silently, while an extra edge only costs precision.
 
 Retrievals are held in memory and never touch the ledger; only writes,
 compactions, and bindings do.
+
+In-memory state and its lifecycle:
+
+- Pending writes. ``on_write`` and ``on_compaction`` remember each write's
+  store until ``bind(write_id, record_id)`` succeeds; a failed ``bind`` keeps
+  the entry so the caller can retry. At most ``max_pending`` writes are held;
+  past that, the oldest unbound write is evicted and can no longer be bound
+  through this ``Capture``. Evicted writes, and writes whose store call failed
+  and are never bound, stay in the ledger with no binding.
+- Context. A key's context lives until ``reset(key)``. It is deliberately not
+  capped or expired: dropping items would silently drop parents. Callers must
+  ``reset`` keys when a unit of work ends, or memory grows with the number of
+  distinct keys and the items retrieved under them.
 """
 
 import threading
-from typing import Dict, Hashable, Iterable, Optional, Tuple, Union
+from collections import OrderedDict
+from typing import Dict, Hashable, Iterable, Optional, Set, Tuple, Union
 
 from dod.ledger import TAGS, Ledger
 
@@ -25,13 +39,18 @@ class Capture:
     never gets parents retrieved under another.
     """
 
-    def __init__(self, ledger: Ledger):
+    def __init__(self, ledger: Ledger, max_pending: int = 100_000):
+        if max_pending < 1:
+            raise ValueError("max_pending must be >= 1")
         self._ledger = ledger
+        self._max_pending = max_pending
         self._lock = threading.Lock()
         # key -> {(store, record_id): tag}; in_prompt wins over retrieved_in_scope.
         self._context: Dict[Hashable, Dict[Item, str]] = {}
-        # write_id -> store, until the store assigns the record ID.
-        self._pending: Dict[str, str] = {}
+        # write_id -> store, oldest first, until bind() succeeds.
+        self._pending: "OrderedDict[str, str]" = OrderedDict()
+        # write_ids with a bind() call in flight; a second concurrent bind raises.
+        self._binding: Set[str] = set()
 
     def on_retrieve(
         self, key: Hashable, items: Iterable[Item], tag: str = "retrieved_in_scope"
@@ -77,10 +96,26 @@ class Capture:
         return self._append(key, replaced, content, store, source, agent_id, session_id)
 
     def bind(self, write_id: str, record_id: str) -> None:
-        """Bind a write to the record ID its store assigned."""
+        """Bind a write to the record ID its store assigned.
+
+        Raises ``KeyError`` if the write is unknown, already bound, evicted, or
+        has another ``bind`` in flight. If the ledger call raises, the write
+        stays pending and can be retried.
+        """
         with self._lock:
-            store = self._pending.pop(write_id)
-        self._ledger.bind(write_id, store, record_id)
+            if write_id in self._binding:
+                raise KeyError(f"bind already in progress for {write_id!r}")
+            store = self._pending[write_id]
+            self._binding.add(write_id)
+        bound = False
+        try:
+            self._ledger.bind(write_id, store, record_id)
+            bound = True
+        finally:
+            with self._lock:
+                self._binding.discard(write_id)
+                if bound:
+                    self._pending.pop(write_id, None)
 
     def reset(self, key: Hashable) -> None:
         """Clear ``key``'s context, for example when a new task starts."""
@@ -101,4 +136,6 @@ class Capture:
         )
         with self._lock:
             self._pending[write_id] = store
+            while len(self._pending) > self._max_pending:
+                self._pending.popitem(last=False)
         return write_id
