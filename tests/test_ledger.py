@@ -155,6 +155,37 @@ def test_same_content_hash_kept_as_distinct_writes(path, ledger):
     assert len(hashes) == 2 and hashes[0] == hashes[1]
 
 
+def test_arbitrary_new_store_accepted(path, ledger):
+    # No store registry: any store name is valid, for writes and parents alike.
+    wid = write(ledger, store="crm-tickets-v2", parents=[("brand-new-store", "r1", "in_prompt")])
+    conn = raw(path)
+    assert conn.execute("SELECT store FROM writes WHERE write_id=?", (wid,)).fetchone() == (
+        "crm-tickets-v2",
+    )
+    assert conn.execute("SELECT parent_store FROM parents WHERE write_id=?", (wid,)).fetchone() == (
+        "brand-new-store",
+    )
+
+
+def test_seq_orders_writes_even_if_clock_steps_back(path, ledger, monkeypatch):
+    clock = iter([3_000, 2_000, 1_000])
+    monkeypatch.setattr("dod.ledger.time.time_ns", lambda: next(clock))
+    wids = [write(ledger) for _ in range(3)]
+    rows = raw(path).execute("SELECT write_id, seq, ts FROM writes ORDER BY seq").fetchall()
+    assert [r[0] for r in rows] == wids
+    assert [r[1] for r in rows] == [1, 2, 3]
+    assert [r[2] for r in rows] == [3_000, 2_000, 1_000]
+
+
+def test_seq_continues_after_reopen(path):
+    with Ledger(path) as led:
+        write(led)
+        write(led)
+    with Ledger(path) as led:
+        wid = write(led)
+    assert raw(path).execute("SELECT seq FROM writes WHERE write_id=?", (wid,)).fetchone() == (3,)
+
+
 def test_reopen_keeps_data(path):
     with Ledger(path) as led:
         wid = write(led, parents=[("mem", "r1", "in_prompt")])
@@ -197,3 +228,5 @@ def test_concurrent_appends(path, ledger):
     conn = raw(path)
     assert conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0] == 4000
     assert conn.execute("SELECT COUNT(*) FROM parents").fetchone()[0] == 4000
+    seqs = [r[0] for r in conn.execute("SELECT seq FROM writes ORDER BY seq")]
+    assert seqs == list(range(1, 4001))

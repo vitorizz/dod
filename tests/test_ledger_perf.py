@@ -1,11 +1,12 @@
+import pytest
 from perf import p99_ms
 
 from dod.ledger import Ledger
 
-PARENTS = [("mem", f"rec-{i}", "retrieved_in_scope") for i in range(5)]
 
-
-def test_append_write_p99_under_1ms(tmp_path):
+@pytest.mark.parametrize("n_parents", [5, 50])
+def test_append_write_p99_under_1ms(tmp_path, n_parents):
+    parents = [("mem", f"rec-{i}", "retrieved_in_scope") for i in range(n_parents)]
     with Ledger(tmp_path / "ledger.db") as ledger:
 
         def append():
@@ -15,8 +16,8 @@ def test_append_write_p99_under_1ms(tmp_path):
                 source="agent_inference",
                 agent_id="a1",
                 session_id="s1",
-                parents=PARENTS,
+                parents=parents,
             )
 
-        p99 = p99_ms(append, label="append_write (5 parents, on-disk)")
+        p99 = p99_ms(append, label=f"append_write ({n_parents} parents, on-disk)")
     assert p99 < 1.0

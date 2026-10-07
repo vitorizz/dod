@@ -22,7 +22,8 @@ _TABLES = ("writes", "parents", "bindings")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS writes (
-    write_id     TEXT PRIMARY KEY,
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    write_id     TEXT NOT NULL UNIQUE,
     content_hash TEXT NOT NULL,
     ts           INTEGER NOT NULL,
     store        TEXT NOT NULL,
@@ -39,8 +40,6 @@ CREATE TABLE IF NOT EXISTS parents (
         CHECK (tag IN ('in_prompt', 'retrieved_in_scope')),
     PRIMARY KEY (write_id, parent_store, parent_record_id)
 );
-CREATE INDEX IF NOT EXISTS parents_by_parent
-    ON parents (parent_store, parent_record_id);
 CREATE TABLE IF NOT EXISTS bindings (
     write_id  TEXT NOT NULL REFERENCES writes (write_id),
     store     TEXT NOT NULL,
@@ -138,6 +137,9 @@ class Ledger:
         ``content`` is hashed (sha256) and discarded; it is never stored.
         ``parents`` are ``(store, record_id, tag)`` tuples. Duplicates are
         stored once; if they disagree on tag, ``in_prompt`` wins.
+
+        Each write gets a strictly increasing ``seq``; order writes by ``seq``.
+        ``ts`` is wall-clock time for display only, since clocks can step back.
         """
         if source not in SOURCES:
             raise ValueError(f"unknown source {source!r}; expected one of {SOURCES}")
@@ -152,7 +154,8 @@ class Ledger:
             conn.execute("BEGIN")
             try:
                 conn.execute(
-                    "INSERT INTO writes VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO writes (write_id, content_hash, ts, store,"
+                    " agent_id, session_id, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (write_id, content_hash, ts, store, agent_id, session_id, source),
                 )
                 conn.executemany(
