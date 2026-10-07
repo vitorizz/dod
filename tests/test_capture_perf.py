@@ -19,6 +19,26 @@ def test_retrieve_and_write_p99_under_1ms(tmp_path):
     assert p99 < 1.0
 
 
+def test_bind_p99_under_1ms(tmp_path):
+    n, warmup = 10_000, 1_000
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        cap = Capture(ledger)
+        cap.on_retrieve("task", ITEMS)
+        write_ids = iter(
+            [
+                cap.on_write("task", f"fact {i}", "mem", "agent_inference", "a1", "s1")
+                for i in range(n + warmup)
+            ]
+        )
+        record_ids = iter(range(n + warmup))
+
+        def bind():
+            cap.bind(next(write_ids), f"rec-{next(record_ids)}")
+
+        p99 = p99_ms(bind, n=n, warmup=warmup, label="bind (on-disk)")
+    assert p99 < 1.0
+
+
 def test_on_retrieve_does_not_touch_database(tmp_path):
     class NoDb:
         def __getattr__(self, name):
