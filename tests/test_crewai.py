@@ -1,0 +1,686 @@
+import asyncio
+import contextvars
+import inspect
+import logging
+import os
+import sqlite3
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+from dod.capture import Capture
+from dod.integrations import crewai as integ
+from dod.integrations.crewai import agent_task_scope, instrument
+from dod.ledger import SOURCES, Ledger
+
+# Keep crewai (when installed) from phoning home during tests.
+os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+
+
+# --- Stub of crewai.Memory 1.15.22 -------------------------------------------
+# recall / remember / remember_many mirror the real signatures (checked by
+# test_stub_signatures_match_crewai). remember mirrors the real save path: it
+# runs on a one-worker pool through contextvars.copy_context().run, searches
+# storage for similar records, then applies a consolidation plan with
+# storage.delete / update / save.
+
+
+class StubRecord:
+    def __init__(self, content, id=None):
+        self.id = id or str(uuid.uuid4())
+        self.content = content
+
+
+class StubMatch:
+    def __init__(self, record):
+        self.record = record
+
+
+class StubStorage:
+    def __init__(self):
+        self.records = {}
+        self.similar = []  # record IDs the next search returns
+
+    def search(self, query_embedding, scope_prefix=None, categories=None,
+               metadata_filter=None, limit=10, min_score=0.0):
+        return [(self.records[rid], 0.9) for rid in self.similar][:limit]
+
+    def save(self, records):
+        for r in records:
+            self.records[r.id] = r
+
+    def update(self, record):
+        self.records[record.id] = record
+
+    def delete(self, scope_prefix=None, categories=None, record_ids=None,
+               older_than=None, metadata_filter=None):
+        for rid in record_ids or ():
+            self.records.pop(rid, None)
+        return len(record_ids or ())
+
+
+class StubMemory:
+    def __init__(self, read_only=False, pool=True):
+        self.read_only = read_only
+        self._storage = StubStorage()
+        self._save_pool = ThreadPoolExecutor(max_workers=1) if pool else None
+        self.results = {}  # query -> [StubRecord]
+        # Consolidation plan for the next save: {"update": {id: content},
+        # "delete": [id], "insert": bool}. None inserts a new record.
+        self.plan = None
+        self.fail = None
+
+    def add(self, *ids):
+        records = [StubRecord(f"content of {i}", id=i) for i in ids]
+        self._storage.save(records)
+        return records
+
+    def recall(self, query, scope=None, categories=None, limit=10,
+               depth="deep", source=None, include_private=False):
+        return [StubMatch(r) for r in self.results.get(query, [])][:limit]
+
+    def remember(self, content, scope=None, categories=None, metadata=None,
+                 importance=None, source=None, private=False, agent_role=None,
+                 root_scope=None):
+        if self.read_only:
+            return None
+        if self._save_pool is None:
+            return self._encode(content)
+        ctx = contextvars.copy_context()
+        return self._save_pool.submit(ctx.run, self._encode, content).result()
+
+    def remember_many(self, contents, scope=None, categories=None,
+                      metadata=None, importance=None, source=None,
+                      private=False, agent_role=None, root_scope=None):
+        return []
+
+    def _encode(self, content):
+        similar = [r for r, _ in self._storage.search([1.0], limit=5)]
+        plan, self.plan = self.plan or {"insert": True}, None
+        if plan.get("delete"):
+            self._storage.delete(record_ids=list(plan["delete"]))
+        updated = []
+        for rid, new_content in plan.get("update", {}).items():
+            rec = StubRecord(new_content, id=rid)
+            self._storage.update(rec)
+            updated.append(rec)
+        if self.fail:
+            raise self.fail
+        if plan.get("insert"):
+            rec = StubRecord(content)
+            self._storage.save([rec])
+            return rec
+        return updated[0] if updated else (similar[0] if similar else None)
+
+
+# --- Fixtures and helpers ----------------------------------------------------
+
+
+@pytest.fixture
+def path(tmp_path):
+    return tmp_path / "ledger.db"
+
+
+@pytest.fixture
+def cap(path):
+    with Ledger(path) as ledger:
+        yield Capture(ledger)
+
+
+@pytest.fixture
+def mem(cap):
+    return instrument(StubMemory(), cap)
+
+
+def raw(path):
+    return sqlite3.connect(str(path), isolation_level=None)
+
+
+def writes(path):
+    return raw(path).execute(
+        "SELECT write_id, store, source, agent_id, session_id FROM writes ORDER BY seq"
+    ).fetchall()
+
+
+def parents(path, write_id):
+    rows = raw(path).execute(
+        "SELECT parent_record_id, tag FROM parents WHERE write_id=?", (write_id,)
+    )
+    return dict(rows)
+
+
+def bound(path, write_id):
+    return [r for (r,) in raw(path).execute(
+        "SELECT record_id FROM bindings WHERE write_id=?", (write_id,)
+    )]
+
+
+def write_for(path, record_id):
+    (wid,) = raw(path).execute(
+        "SELECT write_id FROM bindings WHERE record_id=?", (record_id,)
+    ).fetchone()
+    return wid
+
+
+def last_write(path):
+    return writes(path)[-1][0]
+
+
+# --- Wrapping ----------------------------------------------------------------
+
+
+def test_signatures_and_return_values_unchanged(cap):
+    plain = StubMemory()
+    before = {n: inspect.signature(getattr(plain, n)) for n in ("recall", "remember", "remember_many")}
+    a, b = plain.add("A", "B")
+    plain.results["q"] = [a, b]
+    m = instrument(plain, cap)
+    for name, sig in before.items():
+        assert inspect.signature(getattr(m, name)) == sig
+    with agent_task_scope("agent", "task"):
+        res = m.recall("q", limit=1)
+        rec = m.remember("C")
+    assert [x.record for x in res] == [a]
+    assert isinstance(rec, StubRecord) and rec.content == "C"
+    assert m._storage.records[rec.id] is rec
+
+
+def test_instrument_twice_is_noop(path, cap):
+    m = StubMemory()
+    assert instrument(m, cap) is m
+    wrapped = (m.recall, m.remember, m.remember_many, m._storage.save)
+    assert instrument(m, cap) is m
+    assert instrument(m, Capture(cap._ledger)) is m
+    assert (m.recall, m.remember, m.remember_many, m._storage.save) == wrapped
+    with agent_task_scope("agent", "task"):
+        m.remember("C")
+    assert len(writes(path)) == 1
+
+
+def test_remember_records_before_save_then_binds(path, mem):
+    seen = []
+    orig = mem._storage.save
+    mem._storage.save = lambda records: (seen.append(len(writes(path))), orig(records))
+    with agent_task_scope("agent", "task"):
+        rec = mem.remember("C")
+    assert seen == [1]  # the write was in the ledger before the store saved
+    ((wid, store, source, agent_id, session_id),) = writes(path)
+    assert (store, source, agent_id, session_id) == ("crewai", "agent_inference", "agent", "task")
+    assert bound(path, wid) == [rec.id]
+
+
+def test_read_only_remember_records_unbound_write(path, cap):
+    m = instrument(StubMemory(read_only=True), cap)
+    with agent_task_scope("agent", "task"):
+        assert m.remember("C") is None
+    ((wid, *_),) = writes(path)
+    assert bound(path, wid) == []
+
+
+def test_failed_remember_records_unbound_write_and_propagates(path, mem):
+    err = RuntimeError("storage down")
+    mem.fail = err
+    with agent_task_scope("agent", "task"):
+        with pytest.raises(RuntimeError) as info:
+            mem.remember("C")
+    assert info.value is err
+    ((wid, *_),) = writes(path)
+    assert bound(path, wid) == []
+
+
+def test_recall_exception_propagates(cap):
+    err = ValueError("bad query")
+
+    def boom(*a, **k):
+        raise err
+
+    m = StubMemory()
+    m.recall = boom
+    instrument(m, cap)
+    with agent_task_scope("agent", "task"), pytest.raises(ValueError) as info:
+        m.recall("q")
+    assert info.value is err
+
+
+def test_store_name_used_for_parents_and_bindings(path, cap):
+    m = instrument(StubMemory(), cap, store="crew-mem")
+    (a,) = m.add("A")
+    m.results["q"] = [a]
+    with agent_task_scope("agent", "task"):
+        m.recall("q")
+        rec = m.remember("C")
+    rows = raw(path).execute("SELECT parent_store FROM parents").fetchall()
+    assert rows == [("crew-mem",)]
+    assert raw(path).execute("SELECT store, record_id FROM bindings").fetchall() == [("crew-mem", rec.id)]
+
+
+@pytest.mark.parametrize("value", SOURCES)
+def test_source_kept_when_ledger_value(path, mem, value):
+    with agent_task_scope("agent", "task"):
+        mem.remember("C", source=value)
+    assert writes(path)[0][2] == value
+
+
+@pytest.mark.parametrize("value", [None, "user-123", "session-9", "USER"])
+def test_source_otherwise_agent_inference(path, mem, value):
+    with agent_task_scope("agent", "task"):
+        mem.remember("C", "/", None, None, None, value)  # positional source
+    assert writes(path)[0][2] == "agent_inference"
+
+
+def test_remember_many_raises_and_records_nothing(path, mem):
+    with agent_task_scope("agent", "task"):
+        with pytest.raises(NotImplementedError):
+            mem.remember_many(["C", "D"])
+    assert writes(path) == []
+
+
+# --- Parents -----------------------------------------------------------------
+
+
+def test_every_recall_since_scope_entry_is_a_parent(path, mem):
+    a, b = mem.add("A", "B")
+    mem.results = {"qa": [a], "qb": [b]}
+    with agent_task_scope("agent", "task"):
+        mem.recall("qa")
+        mem.recall("qb")
+        mem.remember("C")
+    assert set(parents(path, last_write(path))) == {"A", "B"}
+
+
+def test_end_to_end_two_tasks(path, mem):
+    a, b = mem.add("A", "B")
+    mem.results = {"both": [a, b], "only b": [b]}
+    with agent_task_scope("agent", "task-1"):
+        mem.recall("both")
+        c = mem.remember("C")
+    with agent_task_scope("agent", "task-2"):
+        mem.recall("only b")
+        d = mem.remember("D")
+    wc, wd = write_for(path, c.id), write_for(path, d.id)
+    assert parents(path, wc) == {"A": "retrieved_in_scope", "B": "retrieved_in_scope"}
+    assert bound(path, wc) == [c.id]
+    assert set(parents(path, wd)) == {"B"}
+    assert bound(path, wd) == [d.id]
+
+
+def test_scope_entry_resets_and_nested_scopes_restore(path, mem):
+    a, b = mem.add("A", "B")
+    mem.results = {"qa": [a], "qb": [b]}
+    with agent_task_scope("agent", "task"):
+        mem.recall("qa")
+        with agent_task_scope("agent", "sub"):
+            mem.recall("qb")
+            mem.remember("inner")
+            assert set(parents(path, last_write(path))) == {"B"}
+        assert integ._key.get() == ("agent", "task")
+        mem.remember("outer")
+        assert set(parents(path, last_write(path))) == {"A"}
+    assert integ._key.get() is None
+    with agent_task_scope("agent", "task"):  # re-entry starts empty
+        mem.remember("again")
+    assert parents(path, last_write(path)) == {}
+
+
+def test_recall_outside_scope_not_tracked(path, mem):
+    (a,) = mem.add("A")
+    mem.results["q"] = [a]
+    mem.recall("q")
+    with agent_task_scope("agent", "task"):
+        mem.remember("C")
+    assert parents(path, last_write(path)) == {}
+
+
+def test_write_outside_scope_has_no_parents_and_warns_once(path, mem, caplog):
+    (a,) = mem.add("A")
+    mem.results["q"] = [a]
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        mem.recall("q")
+        mem.remember("C")
+        mem.remember("D")
+    for wid, *_rest, agent_id, session_id in writes(path):
+        assert parents(path, wid) == {}
+        assert (agent_id, session_id) == (None, None)
+    assert len([r for r in caplog.records if "outside agent_task_scope" in r.message]) == 1
+
+
+# --- Concurrency -------------------------------------------------------------
+
+
+def _run_agent(mem, agent_id, task_id, own, rounds, barrier, out):
+    with agent_task_scope(agent_id, task_id):
+        barrier.wait()
+        for r in range(rounds):
+            mem.recall(own)
+            rec = mem.remember(f"{agent_id}/{task_id}/{r}")
+            out.append((rec.id, own))
+
+
+@pytest.mark.parametrize("agents", [("a1", "t1", "a2", "t2"), ("a1", "t1", "a1", "t2")],
+                         ids=["two-agents", "same-agent-two-tasks"])
+def test_threads_never_cross_link(path, mem, agents):
+    a, b = mem.add("A", "B")
+    mem.results = {"A": [a], "B": [b]}
+    (ag1, t1, ag2, t2), out = agents, []
+    barrier = threading.Barrier(2)
+    threads = [
+        threading.Thread(target=_run_agent, args=(mem, ag1, t1, "A", 50, barrier, out)),
+        threading.Thread(target=_run_agent, args=(mem, ag2, t2, "B", 50, barrier, out)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(out) == 100
+    for record_id, own in out:
+        assert set(parents(path, write_for(path, record_id))) == {own}
+
+
+def test_asyncio_tasks_never_cross_link(path, mem):
+    a, b = mem.add("A", "B")
+    mem.results = {"A": [a], "B": [b]}
+    out = []
+
+    async def agent(agent_id, own):
+        with agent_task_scope(agent_id, "task"):
+            for r in range(20):
+                mem.recall(own)
+                await asyncio.sleep(0)  # let the other agent run in between
+                rec = mem.remember(f"{agent_id}/{r}")
+                out.append((rec.id, own))
+                await asyncio.sleep(0)
+
+    async def main():
+        await asyncio.gather(agent("a1", "A"), agent("a2", "B"))
+
+    asyncio.run(main())
+    assert len(out) == 40
+    for record_id, own in out:
+        assert set(parents(path, write_for(path, record_id))) == {own}
+
+
+def test_executor_worker_without_scope_gets_no_parents(path, mem, caplog):
+    (a,) = mem.add("A")
+    mem.results["q"] = [a]
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        with agent_task_scope("agent", "task"):
+            mem.recall("q")
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                rec = pool.submit(mem.remember, "C").result()
+            # Through copy_context().run, the worker is in the parent's scope.
+            ctx = contextvars.copy_context()
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                rec2 = pool.submit(ctx.run, mem.remember, "D").result()
+    assert parents(path, write_for(path, rec.id)) == {}
+    assert set(parents(path, write_for(path, rec2.id))) == {"A"}
+    assert any("outside agent_task_scope" in r.message for r in caplog.records)
+
+
+# --- Tags --------------------------------------------------------------------
+
+
+def _injects_into_prompt(mem, q):
+    return mem.recall(q)
+
+
+class _ScopeView:
+    """Like crewai's MemoryScope: forwards recall to the memory."""
+
+    def __init__(self, mem):
+        self.mem = mem
+
+    def recall(self, q):
+        return self.mem.recall(q)
+
+
+def _injects_via_scope(view, q):
+    return view.recall(q)
+
+
+def test_tags_in_prompt_only_for_injecting_callers(path, mem, monkeypatch):
+    monkeypatch.setattr(
+        integ, "_in_prompt_callers",
+        {_injects_into_prompt.__code__, _injects_via_scope.__code__},
+    )
+    a, b, c = mem.add("A", "B", "C")
+    mem.results = {"a": [a], "b": [b], "c": [c]}
+    with agent_task_scope("agent", "task"):
+        _injects_into_prompt(mem, "a")
+        _injects_via_scope(_ScopeView(mem), "b")
+        mem.recall("c")
+        mem.remember("D")
+    assert parents(path, last_write(path)) == {
+        "A": "in_prompt", "B": "in_prompt", "C": "retrieved_in_scope",
+    }
+
+
+# --- Compaction --------------------------------------------------------------
+
+
+def test_consolidation_recorded_as_compaction(path, mem):
+    a, b, x, ctx_item = mem.add("A", "B", "X", "K")
+    mem.results["k"] = [ctx_item]
+    mem._storage.similar = ["A", "B", "X"]  # all shown to the consolidation
+    mem.plan = {"update": {"A": "A merged with C"}, "delete": ["B"], "insert": False}
+    with agent_task_scope("agent", "task"):
+        mem.recall("k")
+        rec = mem.remember("C")
+    assert rec.id == "A" and rec.content == "A merged with C"
+    (w_c, *_), (w_merge, _, src, *_) = writes(path)
+    # The write is recorded and bound to the returned record as usual.
+    assert parents(path, w_c) == {"K": "retrieved_in_scope"}
+    assert bound(path, w_c) == ["A"]
+    # The rewrite is a compaction: every consulted/replaced record is an
+    # in_prompt parent, plus the scope's context.
+    assert parents(path, w_merge) == {
+        "A": "in_prompt", "B": "in_prompt", "X": "in_prompt", "K": "retrieved_in_scope",
+    }
+    assert bound(path, w_merge) == ["A"]
+    assert src == "agent_inference"
+
+
+def test_delete_then_insert_is_compaction_of_new_record(path, mem):
+    mem.add("A")
+    mem._storage.similar = ["A"]
+    mem.plan = {"delete": ["A"], "insert": True}
+    with agent_task_scope("agent", "task"):
+        rec = mem.remember("C", source="user")
+    (w_c, *_), (w_merge, _, src, *_) = writes(path)
+    assert bound(path, w_c) == [rec.id]
+    assert parents(path, w_merge) == {"A": "in_prompt"}
+    assert bound(path, w_merge) == [rec.id]
+    assert src == "user"
+
+
+def test_no_compaction_without_rewrite_or_delete(path, mem):
+    mem.add("A")
+    mem._storage.similar = ["A"]  # consulted, but left alone
+    with agent_task_scope("agent", "task"):
+        mem.remember("C")
+    assert len(writes(path)) == 1
+    assert parents(path, last_write(path)) == {}
+
+
+def test_compaction_recorded_even_if_save_fails(path, mem):
+    mem.add("A")
+    mem._storage.similar = ["A"]
+    mem.plan = {"update": {"A": "rewritten"}, "insert": True}
+    mem.fail = RuntimeError("insert failed")
+    with agent_task_scope("agent", "task"), pytest.raises(RuntimeError):
+        mem.remember("C")
+    (w_c, *_), (w_merge, *_) = writes(path)
+    assert bound(path, w_c) == []
+    assert bound(path, w_merge) == ["A"]
+
+
+def test_storage_calls_outside_remember_not_observed(path, mem):
+    mem.add("A")
+    mem._storage.update(StubRecord("direct", id="A"))
+    mem._storage.delete(record_ids=["A"])
+    assert writes(path) == []
+
+
+# --- Real crewai 1.15.22 -----------------------------------------------------
+
+
+def _params(fn):
+    return [(p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()]
+
+
+@pytest.mark.crewai
+def test_stub_signatures_match_crewai():
+    pytest.importorskip("crewai")
+    from crewai.memory.unified_memory import Memory
+
+    for name in ("recall", "remember", "remember_many"):
+        assert _params(getattr(StubMemory, name)) == _params(getattr(Memory, name)), name
+
+
+class _MemStorage:
+    """Minimal in-memory crewai StorageBackend. Scores stay below the
+    consolidation threshold, so saves never need an LLM."""
+
+    def __init__(self):
+        self.records = {}
+
+    def save(self, records):
+        for r in records:
+            self.records[r.id] = r
+
+    def search(self, query_embedding, scope_prefix=None, categories=None,
+               metadata_filter=None, limit=10, min_score=0.0):
+        return [(r, 0.5) for r in list(self.records.values())[:limit]]
+
+    def update(self, record):
+        self.records[record.id] = record
+
+    def delete(self, scope_prefix=None, categories=None, record_ids=None,
+               older_than=None, metadata_filter=None):
+        for rid in record_ids or ():
+            self.records.pop(rid, None)
+        return len(record_ids or ())
+
+    def get_record(self, record_id):
+        return self.records.get(record_id)
+
+    def list_scopes(self, path="/"):
+        return []
+
+    def list_categories(self, scope_prefix=None):
+        return {}
+
+    def touch_records(self, record_ids):
+        pass
+
+
+class _NoLLM:
+    def call(self, *args, **kwargs):
+        raise AssertionError("test must not reach the LLM")
+
+
+def _real_memory():
+    from crewai.memory.unified_memory import Memory
+
+    return Memory(
+        storage=_MemStorage(),
+        llm=_NoLLM(),
+        embedder=lambda texts: [[1.0, 0.0, 0.0] for _ in texts],
+        exploration_budget=0,
+    )
+
+
+def _save(m, content):
+    # Explicit fields skip the LLM field-resolution call.
+    return m.remember(content, scope="/", categories=[], importance=0.5)
+
+
+@pytest.mark.crewai
+def test_real_memory_end_to_end(path, cap):
+    pytest.importorskip("crewai")
+    m = _real_memory()
+    before = {n: inspect.signature(getattr(m, n)) for n in ("recall", "remember")}
+    assert instrument(m, cap) is m
+    assert {n: inspect.signature(getattr(m, n)) for n in before} == before
+    m.model_dump(exclude={"embedder", "llm", "storage"})  # pydantic still happy
+
+    with agent_task_scope("agent", "task-0"):
+        a, b = _save(m, "A"), _save(m, "B")
+    with agent_task_scope("agent", "task-1"):
+        found = m.recall("anything", depth="shallow")
+        c = _save(m, "C")
+    assert {x.record.id for x in found} == {a.id, b.id}
+    wc = write_for(path, c.id)
+    assert parents(path, wc) == {a.id: "retrieved_in_scope", b.id: "retrieved_in_scope"}
+    with pytest.raises(NotImplementedError):
+        m.remember_many(["D"])
+
+
+@pytest.mark.crewai
+def test_real_in_prompt_paths(path, cap):
+    pytest.importorskip("crewai")
+    from crewai.agent.core import Agent
+    from crewai.task import Task
+    from crewai.tools.memory_tools import RecallMemoryTool
+
+    m = instrument(_real_memory(), cap)
+    with agent_task_scope("setup", "setup"):
+        a = _save(m, "A")
+
+    agent = Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini", memory=m)
+    task = Task(description="short query", expected_output="x", agent=agent)
+    with agent_task_scope("agent", "prompt"):
+        prompt = agent._retrieve_memory_context(task, "base prompt")
+        assert "Relevant memories" in prompt
+        _save(m, "from prompt")
+    assert parents(path, last_write(path)) == {a.id: "in_prompt"}
+
+    # Later recalls also return the records saved above; check every tag.
+    with agent_task_scope("agent", "tool"):
+        RecallMemoryTool(memory=m)._run("query")
+        _save(m, "from tool")
+    tags = parents(path, last_write(path))
+    assert a.id in tags and set(tags.values()) == {"in_prompt"}
+
+    with agent_task_scope("agent", "user"):
+        m.recall("query")  # user code: deep recall, not injected by crewai
+        _save(m, "from user")
+    tags = parents(path, last_write(path))
+    assert a.id in tags and set(tags.values()) == {"retrieved_in_scope"}
+
+
+@pytest.mark.crewai
+def test_install_task_scopes_enters_scope_in_real_task(path, cap):
+    pytest.importorskip("crewai")
+    from crewai.agent.core import Agent
+    from crewai.hooks.dispatch import InterceptionPoint, unregister
+    from crewai.task import Task
+
+    m = instrument(_real_memory(), cap)
+    with agent_task_scope("setup", "setup"):
+        a = _save(m, "A")
+    seen = []
+
+    class ProbeAgent(Agent):
+        def execute_task(self, task, context=None, tools=None):
+            seen.append(integ._key.get())
+            m.recall("query", depth="shallow")
+            _save(m, "derived")
+            return "done"
+
+    integ.install_task_scopes()
+    integ.install_task_scopes()  # idempotent
+    try:
+        agent = ProbeAgent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        task = Task(description="d", expected_output="x", agent=agent)
+        task.execute_sync()
+    finally:
+        unregister(InterceptionPoint.PRE_STEP, integ._enter_task_scope)
+        unregister(InterceptionPoint.POST_STEP, integ._exit_task_scope)
+    assert seen == [(str(agent.id), str(task.id))]
+    assert integ._key.get() is None  # POST_STEP restored the previous key
+    wid = last_write(path)
+    assert parents(path, wid) == {a.id: "retrieved_in_scope"}
+    assert writes(path)[-1][3:] == (str(agent.id), str(task.id))
