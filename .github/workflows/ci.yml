@@ -28,3 +28,38 @@ jobs:
         # Exit code 5 = no tests collected; tolerated until the first tests land.
         run: |
           pytest -q || { code=$?; [ $code -eq 5 ] && echo "No tests collected" || exit $code; }
+
+  # Docs-only PRs (every changed file is Markdown or under docs/) skip the review.
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.files.outputs.code }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename')
+          if printf '%s\n' "$files" | grep -qEv '(^docs/|\.md$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Docs-only PR; skipping Claude Code Review."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Review only after tests pass, so failing PRs don't spend review tokens.
+  review:
+    needs: [test, changes]
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/claude-code-review.yml
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+    secrets: inherit

@@ -51,10 +51,10 @@ flowchart TD
     RD -->|label triggers| BU
     BU -->|"pushes branch; workflow step opens PR"| IP
     IP --> CI
-    IP --> GR
+    CI -->|"pass, code changes"| GR
     CI -->|fail| BU
     GR -.->|"not yet: changes requested via @claude<br/>(reviewer doesn't emit @claude)"| BU
-    CI -->|pass| IR
+    CI -->|"pass, docs-only"| IR
     GR -->|approve| IR
     IR -->|PR ready| AL
     BU -.->|"blocked: comments question,<br/>labels needs-human, stops"| NH
@@ -125,7 +125,7 @@ The Claude Code Action's built-in prompt makes Claude post a "Create PR" link in
 | Instinct (PM) | Roadmap and priorities; feature issues; progress tracking; dispatch unblocked work; log text decisions; request doc updates after decisions | Text message or Slack from you; doc reads a few times a day; issue closes | `needs-breakdown` issues, `#alerts` posts, `#agents` decision log, doc-update PRs |
 | Planner, team lead (Claude via Slack) | Break `needs-breakdown` features into technical sub-issues | `@Claude` in `#agents` | Sub-issues in Backlog with priority + size |
 | Builders (Claude Code Action) | Code, tests, fixes; push a `claude/issue-N-*` branch. When blocked: ask on the issue, label `needs-human`, stop | `agent-ready` label; `@claude` on an issue or PR | Branch; PR opened by the PR-opening step. Or a question + `needs-human` |
-| Reviewer (Claude Code Review, `claude-code-review.yml`) | Strict review: tests, edge cases, capture overhead < 1 ms, CLAUDE.md conventions | PR opened or updated | Inline comments + summary (blocking / non-blocking) |
+| Reviewer (Claude Code Review, `claude-code-review.yml`) | Strict review: tests, edge cases, capture overhead < 1 ms, CLAUDE.md conventions | Called from `ci.yml` after tests pass; skipped for docs-only PRs (all files Markdown or under `docs/`) | Inline comments + summary (blocking / non-blocking) |
 | CI (GitHub Actions) | Tests + capture overhead < 1 ms | PR opened or updated | Pass / fail |
 | Local Claude Code: coding | Workflow changes and other repo work outside the Action | Your prompt | Branch + PR |
 | Local Claude Code: strategy | Strategy sections of CLAUDE.md, decisions log, private notes | Your prompt | Doc edits, PRs |
@@ -142,7 +142,7 @@ The Claude Code Action's built-in prompt makes Claude post a "Create PR" link in
 - [x] Branch protection on `main`: ruleset `protecting_main` (active): PR required, no force-push or deletion, linear history. Not yet: required CI check (no checks listed) and 1 approving review (count is 0).
 - [x] Claude subscription token (`CLAUDE_CODE_OAUTH_TOKEN`): watch Pro usage limits.
 - [x] Claude Code GitHub Action (`/install-github-app`)
-- [x] Claude Code Review workflow on the repo (replaces Greptile)
+- [x] Claude Code Review workflow on the repo (replaces Greptile): runs after CI passes, skips docs-only PRs
 - [ ] CI: pytest + overhead benchmark (pytest runs in `ci.yml`; the benchmark lands with #11)
 - [x] Needs-human flow: ask on issue, label, stop; `@claude` reply clears label (`claude.yml`, CLAUDE.md)
 - [ ] Reviewer → builder `@claude` loop: the reviewer doesn't emit `@claude` yet, so review findings need a human `@claude` comment.

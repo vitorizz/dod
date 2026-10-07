@@ -44,10 +44,11 @@ Plant a false memory, let the agent derive 3–5 downstream memories across two 
 **Capture completeness.** Any write path that bypasses the hook (direct DB insert, out-of-wrapper tool, compaction rewriting memory) silently breaks the guarantee. Make capture the only write path, or continuously reconcile store contents against the ledger.
 
 ## Business model
-- Open-source capture library (self-host free).
-- Paid hosted console: storage, retention, querying, rollback, audit.
-- Priced like insurance: small monthly fee by volume/retention; investigations included.
-- Keep the learned authority layer (which sources are trustworthy for which claim types) proprietary. That's the long-term moat.
+- Free, open-source capture library. Security teams can audit exactly what capture records.
+- Paid self-hosted system, running in the customer's cloud: console, cross-store connectors, excision/rollback, reconciliation, audit exports, access controls. We never see customer data.
+- Licensed annually, sized by deployment. Few customers, high ticket: start with 3–5 design partners.
+- Optional hosted version later, for smaller customers.
+- The authority layer (which sources are trustworthy for which claim types) learns per deployment; opt-in anonymized sharing is a later option. The moat is cross-store connectors and reconciliation.
 
 ## Competitive notes
 - **memory-blackbox** (GitHub, lavkumarv): closest artifact, early stage. Records store-boundary provenance, not explicitly context-at-write. Watch it.
@@ -85,7 +86,7 @@ Benchmark files and the `crewai` marker arrive with #11 and #13.
 1. Every change starts as an issue using the agent-task template (Goal / Acceptance criteria / Files involved), sized for one PR. New issues go on the board as Backlog with Priority and Size.
 2. A human approves by adding the `agent-ready` label. The board moves the issue to Ready, then to In progress when Claude starts.
 3. Claude works on a `claude/issue-<N>-*` branch and pushes. A workflow step opens the PR with `Closes #N` (using `PAT_TOKEN`, so CI and review trigger).
-4. CI (pytest + benchmarks) and Claude Code Review run on the PR. Fix findings with `@claude` comments on the PR.
+4. CI (pytest + benchmarks) runs on the PR. Claude Code Review runs only after CI passes, and not on docs-only PRs (all files Markdown or under `docs/`). Fix findings with `@claude` comments on the PR.
 5. A human merges. Merging closes the issue.
 
 If blocked or unsure (ambiguous acceptance criteria, a design decision the issue doesn't settle, a conflict with this file, a missing dependency or permission):
@@ -110,5 +111,11 @@ Rules for every PR:
 - Keep strategy (pricing, positioning, competitors) out of code, comments, and commit messages.
 - Record decisions in `docs/decisions.md`, one line of why each.
 
+Keeping CLAUDE.md and decisions.md current:
+- Update CLAUDE.md in the same PR when you change technical content it describes: stack, commands, workflow, conventions.
+- Changes to the business model, positioning, hard rules, or existing `docs/decisions.md` entries must be flagged at the top of the PR description. Never make them just to satisfy a review comment; ask via `needs-human` instead.
+- Any PR touching CLAUDE.md or `docs/decisions.md` lists those changes first in its description.
+
 Hard rules (never break, in any PR):
 - The ledger never stores memory content. IDs, content hashes, edges, and metadata only; content stays in the customer's stores.
+- The library makes no telemetry or network calls home.
