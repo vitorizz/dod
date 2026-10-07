@@ -29,3 +29,7 @@ Append new decisions at the bottom. One line of why each.
 - **Context scope is the session's context window.** Parents are whatever was in that window at write time, not just the latest retrieval. (2026-10-07, founder decision)
 - **Compaction counts as a write.** Compaction rewrites memory; if it isn't captured, lineage breaks at the summary. (2026-10-07, founder decision)
 - **Excision offers delete, quarantine (default), and regenerate.** Quarantine is reversible, so it's the safe default when over-inclusion flags clean items. (2026-10-07, founder decision)
+- **Duplicate parent with different tags keeps `in_prompt`.** The stronger claim wins; dropping it would understate what the model saw. (2026-10-07, founder decision)
+- **Compaction parents are tagged `in_prompt` and include the key's current context.** Compaction reads everything it replaces, and over-inclusion covers whatever else was in the window. (2026-10-07, founder decision)
+- **Retrievals default to `retrieved_in_scope`; `in_prompt` only when confirmed.** Claiming an item was in the prompt without evidence would make the tag meaningless for filtering. (2026-10-07, founder decision)
+- **Compaction has its own capture call, `on_compaction(key, replaced, ...)`.** A plain write can't carry the set it replaced, and those are its parents. (2026-10-07, founder decision)
