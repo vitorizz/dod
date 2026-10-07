@@ -168,6 +168,39 @@ def test_bind_retry_after_ledger_failure(path, ledger):
         cap.bind(wid, "row-7")
 
 
+class BlockingLedger:
+    def __init__(self, ledger):
+        self._ledger = ledger
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __getattr__(self, name):
+        return getattr(self._ledger, name)
+
+    def bind(self, *args):
+        self.entered.set()
+        assert self.release.wait(5)
+        self._ledger.bind(*args)
+
+
+def test_overlapping_binds_same_write_bind_once(path, ledger):
+    led = BlockingLedger(ledger)
+    cap = Capture(led)
+    wid = write(cap, store="pg")
+    first = threading.Thread(target=cap.bind, args=(wid, "row-1"))
+    first.start()
+    assert led.entered.wait(5)
+    # The first bind is in flight in the ledger; a second one must not race it.
+    with pytest.raises(KeyError):
+        cap.bind(wid, "row-2")
+    led.release.set()
+    first.join(5)
+    rows = raw(path).execute("SELECT store, record_id FROM bindings WHERE write_id=?", (wid,)).fetchall()
+    assert rows == [("pg", "row-1")]
+    with pytest.raises(KeyError):
+        cap.bind(wid, "row-1")
+
+
 def test_pending_evicts_oldest_past_cap(path, ledger):
     cap = Capture(ledger, max_pending=2)
     w1, w2, w3 = (write(cap, content=c) for c in "123")

@@ -25,7 +25,7 @@ In-memory state and its lifecycle:
 
 import threading
 from collections import OrderedDict
-from typing import Dict, Hashable, Iterable, Optional, Tuple, Union
+from typing import Dict, Hashable, Iterable, Optional, Set, Tuple, Union
 
 from dod.ledger import TAGS, Ledger
 
@@ -49,6 +49,8 @@ class Capture:
         self._context: Dict[Hashable, Dict[Item, str]] = {}
         # write_id -> store, oldest first, until bind() succeeds.
         self._pending: "OrderedDict[str, str]" = OrderedDict()
+        # write_ids with a bind() call in flight; a second concurrent bind raises.
+        self._binding: Set[str] = set()
 
     def on_retrieve(
         self, key: Hashable, items: Iterable[Item], tag: str = "retrieved_in_scope"
@@ -96,14 +98,24 @@ class Capture:
     def bind(self, write_id: str, record_id: str) -> None:
         """Bind a write to the record ID its store assigned.
 
-        Raises ``KeyError`` if the write is unknown, already bound, or evicted.
-        If the ledger call raises, the write stays pending and can be retried.
+        Raises ``KeyError`` if the write is unknown, already bound, evicted, or
+        has another ``bind`` in flight. If the ledger call raises, the write
+        stays pending and can be retried.
         """
         with self._lock:
+            if write_id in self._binding:
+                raise KeyError(f"bind already in progress for {write_id!r}")
             store = self._pending[write_id]
-        self._ledger.bind(write_id, store, record_id)
-        with self._lock:
-            self._pending.pop(write_id, None)
+            self._binding.add(write_id)
+        bound = False
+        try:
+            self._ledger.bind(write_id, store, record_id)
+            bound = True
+        finally:
+            with self._lock:
+                self._binding.discard(write_id)
+                if bound:
+                    self._pending.pop(write_id, None)
 
     def reset(self, key: Hashable) -> None:
         """Clear ``key``'s context, for example when a new task starts."""
