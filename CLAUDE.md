@@ -3,7 +3,7 @@
 ## What we're building
 A capture library for AI agents with long-lived memory. At every memory write, it records which retrieved items were in the model's context at that moment. That single edge turns agent memory into a traceable lineage graph.
 
-One-liner: **Your agent learned something false. We tell you which belief, and everything it touched.**
+One-liner: **Context management decides what goes into the context. We record what came out because of it.**
 
 ## Why it matters
 - Agents with persistent memory accumulate false beliefs (wrong facts, stale info, poisoned inputs).
@@ -23,6 +23,10 @@ Everything else is a query over this graph:
 - `excise <memory_ids>`: remove the contaminated subgraph, keep the rest
 
 ## Positioning (important)
+- **Lineage for long-lived agent context.** Context managers decide what goes into context; we record what came out because of it, and clean only what's contaminated.
+- **Complementary, not competing**, with Mem0, Supermemory, Zep, and markdown-based memory: they decide what goes in; none record lineage.
+- **Any agent write**: memory, DB, CRM, tickets. Not just memory stores.
+- **Target**: teams building long-lived agents with memory for their users (personal agents, AI companions, support agents, "agent employees"). Opening pitch: real forgetting, deleting a memory plus everything derived from it.
 - **Sits at the orchestration/harness layer**, not the storage layer. The database only sees the finished write; it never sees the context window.
 - **Cross-store**: real deployments span Mongo, Postgres, vector DBs, framework state. No single DB vendor can join across them.
 - **Model-agnostic**: works with Claude, OpenAI, or self-hosted open-weight models.
@@ -46,7 +50,7 @@ Plant a false memory, let the agent derive 3–5 downstream memories across two 
 ## Business model
 - Free, open-source capture library. Security teams can audit exactly what capture records.
 - Paid self-hosted system, running in the customer's cloud: console, cross-store connectors, excision/rollback, reconciliation, audit exports, access controls. We never see customer data.
-- Licensed annually, sized by deployment. Few customers, high ticket: start with 3–5 design partners.
+- Paid pilots first, with 3–5 design partners. Then an annual license: base fee plus a metric that scales with the customer (writes tracked or active end users), not seats. Compliance pack (proof of real deletion, audit exports) as an add-on.
 - Optional hosted version later, for smaller customers.
 - The authority layer (which sources are trustworthy for which claim types) learns per deployment; opt-in anonymized sharing is a later option. The moat is cross-store connectors and reconciliation.
 
