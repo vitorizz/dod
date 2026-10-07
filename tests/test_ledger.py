@@ -1,10 +1,14 @@
 import hashlib
+import shutil
 import sqlite3
 import threading
+import time
 
 import pytest
 
 from dod.ledger import Ledger
+
+TABLES = ("writes", "parents", "bindings")
 
 
 @pytest.fixture
@@ -66,6 +70,21 @@ def test_content_is_not_stored(path, ledger):
         assert b"secret-memory-content" not in wal.read_bytes()
 
 
+def test_bytes_content_hashed_like_str(path, ledger):
+    raw_bytes = b"\xffnot-utf8-secret"
+    wid = write(ledger, content=raw_bytes)
+    wid_str = write(ledger, content="hello")
+    wid_bytes = write(ledger, content="hello".encode("utf-8"))
+    conn = raw(path)
+    hashes = dict(conn.execute("SELECT write_id, content_hash FROM writes"))
+    assert hashes[wid] == hashlib.sha256(raw_bytes).hexdigest()
+    assert hashes[wid_str] == hashes[wid_bytes]
+    assert raw_bytes not in path.read_bytes()
+    wal = path.with_name(path.name + "-wal")
+    if wal.exists():
+        assert raw_bytes not in wal.read_bytes()
+
+
 def test_bind_appends(path, ledger):
     wid = write(ledger)
     ledger.bind(wid, "mem", "rec-1")
@@ -98,6 +117,40 @@ def test_update_and_delete_are_rejected(path, ledger, sql):
     conn = raw(path)
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute(sql)
+
+
+@pytest.mark.parametrize("recursive_triggers", [False, True])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Conflict on each unique key, and on the rowid of every table.
+        "INSERT OR REPLACE INTO writes (write_id, content_hash, ts, store, source)"
+        " VALUES (:wid, 'h', 0, 'other', 'user')",
+        "INSERT OR REPLACE INTO writes (seq, write_id, content_hash, ts, store, source)"
+        " VALUES (1, 'other', 'h', 0, 'other', 'user')",
+        "REPLACE INTO parents VALUES (:wid, 'mem', 'r1', 'in_prompt')",
+        "INSERT OR REPLACE INTO parents (rowid, write_id, parent_store, parent_record_id, tag)"
+        " VALUES (1, :wid, 'other', 'other', 'in_prompt')",
+        "INSERT OR REPLACE INTO bindings (rowid, write_id, store, record_id, ts)"
+        " VALUES (1, :wid, 'other', 'other', 0)",
+        "INSERT INTO parents VALUES (:wid, 'mem', 'r1', 'in_prompt')"
+        " ON CONFLICT DO UPDATE SET tag = excluded.tag",
+    ],
+)
+def test_replace_cannot_alter_or_remove_rows(path, ledger, sql, recursive_triggers):
+    wid = write(ledger, parents=[("mem", "r1", "retrieved_in_scope")])
+    ledger.bind(wid, "mem", "rec-1")
+    conn = raw(path)
+    # A connection that never enabled recursive_triggers must be blocked too.
+    conn.execute(f"PRAGMA recursive_triggers={'ON' if recursive_triggers else 'OFF'}")
+    snapshot = [conn.execute(f"SELECT rowid, * FROM {t}").fetchall() for t in TABLES]
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(sql, {"wid": wid})
+    assert [conn.execute(f"SELECT rowid, * FROM {t}").fetchall() for t in TABLES] == snapshot
+
+
+def test_ledger_connection_enables_recursive_triggers(ledger):
+    assert ledger._conn.execute("PRAGMA recursive_triggers").fetchone() == (1,)
 
 
 def test_unknown_source_raises(ledger):
@@ -207,6 +260,39 @@ def test_close_checkpoints_wal(path):
     wal = path.with_name(path.name + "-wal")
     assert not wal.exists() or wal.stat().st_size == 0
     assert raw(path).execute("SELECT COUNT(*) FROM writes").fetchone()[0] == 100
+
+
+def rows_in_main_file(path, tmp_path):
+    # Copy only the main database file, leaving the WAL behind, so the count
+    # reflects what a checkpoint has already moved out of the WAL.
+    copy = tmp_path / "main-only.db"
+    shutil.copyfile(path, copy)
+    try:
+        return raw(copy).execute("SELECT COUNT(*) FROM writes").fetchone()[0]
+    except sqlite3.Error:  # schema not checkpointed yet, or copied mid-checkpoint
+        return 0
+    finally:
+        copy.unlink()
+
+
+def test_background_checkpoint_runs_before_close(path, tmp_path):
+    with Ledger(path, checkpoint_interval=0.05) as led:
+        for _ in range(100):
+            write(led)
+        deadline = time.monotonic() + 5
+        while rows_in_main_file(path, tmp_path) < 100 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert rows_in_main_file(path, tmp_path) == 100
+
+
+def test_no_checkpoint_on_append_path(path, tmp_path):
+    # Control for the test above: without the background thread, appends
+    # alone never move rows into the main file.
+    with Ledger(path, checkpoint_interval=3600) as led:
+        for _ in range(100):
+            write(led)
+        time.sleep(0.2)
+        assert rows_in_main_file(path, tmp_path) == 0
 
 
 def test_concurrent_appends(path, ledger):

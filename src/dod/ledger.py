@@ -55,6 +55,25 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
 """
     for t in _TABLES
     for op in ("UPDATE", "DELETE")
+) + "".join(
+    # REPLACE deletes the conflicting row without firing DELETE triggers
+    # unless the writing connection enabled recursive_triggers, which is a
+    # per-connection setting. Reject the conflict before it happens instead.
+    f"""
+CREATE TRIGGER IF NOT EXISTS {t}_no_replace BEFORE INSERT ON {t}
+WHEN EXISTS (SELECT 1 FROM {t} WHERE rowid = NEW.rowid){extra}
+BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
+"""
+    for t, extra in (
+        ("writes", "\n    OR EXISTS (SELECT 1 FROM writes WHERE write_id = NEW.write_id)"),
+        (
+            "parents",
+            "\n    OR EXISTS (SELECT 1 FROM parents WHERE write_id = NEW.write_id"
+            "\n        AND parent_store = NEW.parent_store"
+            " AND parent_record_id = NEW.parent_record_id)",
+        ),
+        ("bindings", ""),
+    )
 )
 
 
@@ -99,6 +118,7 @@ class Ledger:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA recursive_triggers=ON")
         self._conn.execute("PRAGMA wal_autocheckpoint=0")
         self._conn.executescript(_SCHEMA)
 
