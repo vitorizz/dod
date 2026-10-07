@@ -33,3 +33,4 @@ Append new decisions at the bottom. One line of why each.
 - **Compaction parents are tagged `in_prompt` and include the key's current context.** Compaction reads everything it replaces, and over-inclusion covers whatever else was in the window. (2026-10-07, founder decision)
 - **Retrievals default to `retrieved_in_scope`; `in_prompt` only when confirmed.** Claiming an item was in the prompt without evidence would make the tag meaningless for filtering. (2026-10-07, founder decision)
 - **Compaction has its own capture call, `on_compaction(key, replaced, ...)`.** A plain write can't carry the set it replaced, and those are its parents. (2026-10-07, founder decision)
+- **Ledger checkpoints run off the append path.** SQLite's auto-checkpoint fsyncs inside the commit that crosses the threshold, pushing append p99 to ~4 ms; a background thread on a second connection keeps it ~0.2 ms. (2026-10-07, #11)
