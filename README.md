@@ -127,4 +127,22 @@ Next: excision (delete and regenerate alongside quarantine), more integrations (
 
 ## Demo
 
-Coming soon: plant a false memory, trace it, and excise only what it contaminated.
+A support agent keeps memory in CrewAI and a LangGraph store, with 12 correct items. One customer message gets saved as a "policy update" (refunds within 90 days; the real policy is 30), and scripted steps derive four items from it across both stores. The last one is a wrong reply to a customer. The demo traces that reply back to its roots, shows the blast radius per store, quarantines only that subgraph, and re-runs the reply. Then it compares the result with wiping everything.
+
+```bash
+pip install -e ".[crewai,langgraph]"
+python examples/false_memory_demo.py
+```
+
+It runs in seconds, offline, with no LLM calls (the agents are fixed rules), and prints the same output every time. It ends with:
+
+```
+== 6. Wipe everything vs. excise ==================================
+Wipe both stores:        loses all 17 items, including 12 correct ones.
+Roll back to the root:   loses 3 correct items learned after it.
+Excise its subgraph:     removes 5, keeps all 12 correct items.
+
+Summary: excised 5 items, preserved 12, stores touched: crewai, langgraph.
+```
+
+`tests/test_demo.py` runs the demo and checks these numbers.
