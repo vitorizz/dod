@@ -84,12 +84,25 @@ Excision
     ``DeleteAdapter(tool)`` lets ``dod.excise`` delete files through the
     instrumented ``execute``, so each deletion is tombstoned.
 
+File hashes (opt-in)
+    With ``instrument(tool, capture, hash_files=True)``, after each
+    ``create``, ``str_replace``, ``insert`` and ``rename`` succeeds, the
+    wrapper reads each written file through the tool's own ``view`` and
+    records its hash (sha256 of the file's text, rebuilt exactly from the
+    documented ``<number>\\t<text>`` lines) on the file's binding. That is
+    one extra ``view`` per file written: cheap for local files, a second
+    round trip for a remote backend, so it is off by default. A file that
+    can't be read, or whose ``view`` isn't in the documented format, is
+    bound with no hash (logged). A write landing between the command and the
+    read is hashed in its later state.
+
 Reconciliation
     ``ReconcileAdapter(tool)`` lets ``dod.reconcile`` list every file under
-    ``/memories`` through the tool's own ``view``. It checks existence only
-    (the recorded hash is a command's payload, not the file), so a file
-    edited outside capture is not detected; one created or deleted outside
-    it is.
+    ``/memories`` through the tool's own ``view``. With file hashes on it
+    also detects files edited outside capture, by comparing each file with
+    its binding's hash; without them it checks existence only (the write
+    hash is a command's payload, not the file), so only files created or
+    deleted outside capture are found.
 """
 
 import asyncio
@@ -106,7 +119,7 @@ from anthropic.types.beta import (
 )
 
 from dod import scope as _scope
-from dod.capture import Capture
+from dod.capture import Capture, _content_hash
 from dod.excise import deletion_reason
 from dod.quarantine import QuarantineCache, count_blocked
 
@@ -122,11 +135,15 @@ def record_id(path: str) -> str:
     return posixpath.normpath(path) if path else path
 
 
-def instrument(tool: Any, capture: Capture, store: str = "anthropic_memory") -> Any:
+def instrument(
+    tool: Any, capture: Capture, store: str = "anthropic_memory", hash_files: bool = False
+) -> Any:
     """Wrap ``tool``'s ``execute`` and ``clear_all_memory`` in place.
 
     Signatures, return values and exceptions are unchanged. Instrumenting an
-    already instrumented tool is a no-op.
+    already instrumented tool is a no-op. ``hash_files=True`` also records
+    each written file's resulting hash on its binding (one extra ``view``
+    per file written; see "File hashes" in the module docs).
     """
     if getattr(getattr(tool, "execute", None), _MARK, False):
         return tool
@@ -142,7 +159,7 @@ def instrument(tool: Any, capture: Capture, store: str = "anthropic_memory") -> 
             "through execute can be captured"
         )
     _scope.register(capture)
-    rec = _Recorder(capture, store)
+    rec = _Recorder(capture, store, hash_files)
     execute, clear_all = tool.execute, tool.clear_all_memory
 
     if is_async:
@@ -155,6 +172,9 @@ def instrument(tool: Any, capture: Capture, store: str = "anthropic_memory") -> 
             found = (await _afiles(tool.view, *probe)) if probe else []
             pending = rec.record(command, found)
             result = await execute(command)
+            if rec.hash_files and pending:
+                pending = rec.with_hashes(
+                    pending, [await _afile_hash(tool.view, r) for _, r in pending[3]])
             rec.settle(pending)
             return result
 
@@ -175,6 +195,8 @@ def instrument(tool: Any, capture: Capture, store: str = "anthropic_memory") -> 
             found = _files(tool.view, *probe) if probe else []
             pending = rec.record(command, found)
             result = execute(command)
+            if rec.hash_files and pending:
+                pending = rec.with_hashes(pending, [_file_hash(tool.view, r) for _, r in pending[3]])
             rec.settle(pending)
             return result
 
@@ -188,6 +210,7 @@ def instrument(tool: Any, capture: Capture, store: str = "anthropic_memory") -> 
 
     for fn in (wrapped_execute, wrapped_clear_all):
         setattr(fn, _MARK, True)
+    wrapped_execute._dod_hash_files = hash_files
     tool.execute = wrapped_execute
     tool.clear_all_memory = wrapped_clear_all
     return tool
@@ -230,28 +253,36 @@ class ReconcileAdapter:
     the tool's own (uninstrumented) ``view``, so nothing is recorded as a
     retrieval and quarantined files are seen too.
 
-    Existence only: the hash capture records for a file is the payload of
-    the command that wrote it, not the file, so file content can't be
-    compared with the ledger, and ``modified`` is never reported here.
+    By default it follows the tool's ``instrument(..., hash_files=...)``.
+    With file hashes it reads each file too and compares it with the hash
+    recorded on its last binding (``compare_bound_hash``); a file whose last
+    binding has none (written before hashing was on) is checked for
+    existence only. Without them it checks existence only: the write hash is
+    a command's payload, not the file.
+
     Unlike capture's probes, any error other than the tool's not-found
     ``ToolError`` propagates: a store that can't be read is never reported
-    as empty. An async tool runs each listing in a new event loop
+    as empty. An async tool runs each read in a new event loop
     (``asyncio.run``), so it can't be used from inside a running loop.
     """
 
-    def __init__(self, tool: Any) -> None:
+    def __init__(self, tool: Any, hash_files: Optional[bool] = None) -> None:
         if not isinstance(tool, (BetaAbstractMemoryTool, BetaAsyncAbstractMemoryTool)):
             raise TypeError("tool must be an anthropic memory tool")
+        if hash_files is None:
+            hash_files = bool(getattr(getattr(tool, "execute", None), "_dod_hash_files", False))
         self.tool = tool
+        self.hash_files = self.compare_bound_hash = hash_files
+        self.is_async = isinstance(tool, BetaAsyncAbstractMemoryTool)
 
-    def scan(self) -> List[Tuple[str, None]]:
-        if isinstance(self.tool, BetaAsyncAbstractMemoryTool):
-            files = asyncio.run(self._ascan())
-        else:
-            files = self._walk(lambda p: _strict_view(self.tool.view, p))
-        return [(f, None) for f in files]
+    def scan(self) -> List[Tuple[str, Optional[str]]]:
+        if self.is_async:
+            return asyncio.run(self._ascan())
+        files = self._walk(lambda p: _strict_view(self.tool.view, p))
+        return [(f, self._hash(f, _strict_view(self.tool.view, f)) if self.hash_files else None)
+                for f in files]
 
-    async def _ascan(self) -> List[str]:
+    async def _ascan(self) -> List[Tuple[str, Optional[str]]]:
         out: List[str] = []
         todo, seen = [_ROOT], set()
         while todo:
@@ -259,7 +290,10 @@ class ReconcileAdapter:
             if p not in seen:
                 seen.add(p)
                 todo += _expand(p, await _astrict_view(self.tool.view, p), True, out)
-        return list(dict.fromkeys(out))
+        files = list(dict.fromkeys(out))
+        if not self.hash_files:
+            return [(f, None) for f in files]
+        return [(f, self._hash(f, await _astrict_view(self.tool.view, f))) for f in files]
 
     @staticmethod
     def _walk(view: Callable) -> List[str]:
@@ -272,12 +306,19 @@ class ReconcileAdapter:
                 todo += _expand(p, view(p), True, out)
         return list(dict.fromkeys(out))
 
-    def get(self, record_id: str) -> Tuple[bool, None]:
-        if isinstance(self.tool, BetaAsyncAbstractMemoryTool):
+    @staticmethod
+    def _hash(path: str, result: Any) -> Optional[str]:
+        text = _file_text(path, result)
+        return None if text is None else _content_hash(text)
+
+    def get(self, record_id: str) -> Tuple[bool, Optional[str]]:
+        if self.is_async:
             result = asyncio.run(_astrict_view(self.tool.view, record_id))
         else:
             result = _strict_view(self.tool.view, record_id)
-        return _classify(record_id, result)[0] == "file", None
+        if _classify(record_id, result)[0] != "file":
+            return False, None
+        return True, self._hash(record_id, result) if self.hash_files else None
 
 
 def _strict_view(view: Callable, path: str) -> Any:
@@ -295,13 +336,61 @@ async def _astrict_view(view: Callable, path: str) -> Any:
         return None
 
 
+_CONTENT_HEADER = "Here's the content of {} with line numbers:\n"
+
+
+def _file_text(path: str, result: Any) -> Optional[str]:
+    """A file's exact text from a whole-file ``view`` of ``path``, or None if
+    ``result`` isn't in the documented format (a header line, then every line
+    as ``<number>\\t<text>``, numbered from 1)."""
+    header = _CONTENT_HEADER.format(path)
+    if not isinstance(result, str) or not result.startswith(header):
+        return None
+    out = []
+    for i, line in enumerate(result[len(header):].split("\n"), 1):
+        number, tab, text = line.partition("\t")
+        if not tab or number.strip() != str(i):
+            return None
+        out.append(text)
+    return "\n".join(out)
+
+
+def _hash_of(path: str, result: Any) -> Optional[str]:
+    text = _file_text(path, result)
+    if text is None:
+        if result is not None:
+            logger.warning("dod: couldn't read memory file %r from view's output; "
+                           "its binding has no content hash", path)
+        return None
+    return _content_hash(text)
+
+
+def _file_hash(view: Callable, path: str) -> Optional[str]:
+    """The hash of the file at ``path`` as the tool's ``view`` returns it, or
+    None if it can't be read (logged: the write already happened)."""
+    try:
+        return _hash_of(path, view(_view_command(path)))
+    except Exception:
+        logger.warning("dod: reading memory file %r for its hash failed", path, exc_info=True)
+        return None
+
+
+async def _afile_hash(view: Callable, path: str) -> Optional[str]:
+    try:
+        return _hash_of(path, await view(_view_command(path)))
+    except Exception:
+        logger.warning("dod: reading memory file %r for its hash failed", path, exc_info=True)
+        return None
+
+
 class _Recorder:
     """What the wrapper records around each command, shared by the sync and
     async tools."""
 
-    def __init__(self, capture: Capture, store: str) -> None:
+    def __init__(self, capture: Capture, store: str, hash_files: bool = False) -> None:
         self.capture = capture
         self.store = store
+        self.hash_files = hash_files
         self.quarantine = QuarantineCache(capture._ledger)
         self.warned = False
 
@@ -387,6 +476,13 @@ class _Recorder:
         agent_id, session_id = key if key is not None else (None, None)
         reason = deletion_reason()
         return object(), agent_id, session_id, [], [(f, reason, None) for f in found]
+
+    @staticmethod
+    def with_hashes(pending: tuple, hashes: List[Optional[str]]) -> tuple:
+        """``pending`` with each bind carrying its file's hash."""
+        ctx_key, agent_id, session_id, binds, deletes = pending
+        binds = [(w, r, h) for (w, r), h in zip(binds, hashes)]
+        return ctx_key, agent_id, session_id, binds, deletes
 
     def settle(self, pending: Optional[tuple]) -> None:
         """Record binds and tombstones after the command succeeded."""

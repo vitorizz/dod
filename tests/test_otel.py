@@ -197,6 +197,8 @@ def test_events_on_active_span(ledger, otel):
     assert dict(bind.attributes) == {
         "dod.write.id": w, "dod.write.store": "mem", "dod.write.record_id": "rec-9",
     }
+    observer.on_bind(BindEvent(w, "mem", "rec-9", "abc"))  # no active span: its own
+    assert exporter.get_finished_spans()[-1].attributes["dod.bind.content_hash"] == "abc"
     assert delete.name == "dod.memory_delete"
     assert dict(delete.attributes) == {
         "dod.delete.store": "mem", "dod.delete.record_id": "rec-9",

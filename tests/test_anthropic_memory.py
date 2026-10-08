@@ -445,3 +445,77 @@ def test_trace_and_blast_radius_cross_store_with_langgraph(path, ledger, cap, to
     assert b.store_counts == {STORE: 1, "langgraph": 1}
     reached = {item for items in b.bindings.values() for item in items}
     assert {("langgraph", lg_id), (STORE, "/memories/groceries.md")} <= reached
+
+
+# --- File hashes (opt-in) ------------------------------------------------------
+
+
+def binding_hashes(path):
+    return raw(path).execute(
+        "SELECT record_id, content_hash FROM bindings ORDER BY rowid").fetchall()
+
+
+def file_sha(mem_dir, p):
+    return hashlib.sha256((mem_dir / p.lstrip("/")).read_bytes()).hexdigest()
+
+
+def test_file_hashes_are_off_by_default(path, tool):
+    with agent_task_scope("agent", "task"):
+        create(tool, "/memories/a.md", "a\n")
+    assert binding_hashes(path) == [("/memories/a.md", None)]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_file_hashes_record_each_written_file(path, cap, mem_dir, asynchronous):
+    cls = BetaAsyncLocalFilesystemMemoryTool if asynchronous else BetaLocalFilesystemMemoryTool
+    tool = instrument(cls(base_path=str(mem_dir)), cap, hash_files=True)
+
+    def call(command):
+        result = tool.call(command)
+        return asyncio.run(result) if asynchronous else result
+
+    # Texts the view's line numbering must round-trip exactly: a trailing
+    # newline, none, CRLF, tabs, and an empty file.
+    texts = {"/memories/a.md": "one\ntwo\n", "/memories/b.md": "no newline",
+             "/memories/c.md": "crlf\r\nline\tx\ty\r\n", "/memories/e.md": ""}
+    with agent_task_scope("agent", "task"):
+        for p, text in texts.items():
+            call({"command": "create", "path": p, "file_text": text})
+        call({"command": "str_replace", "path": "/memories/a.md",
+              "old_str": "two", "new_str": "2"})
+        call({"command": "insert", "path": "/memories/b.md", "insert_line": 0,
+              "insert_text": "first\n"})
+        call({"command": "create", "path": "/memories/dir/x.md", "file_text": "x\n"})
+        call({"command": "rename", "old_path": "/memories/dir", "new_path": "/memories/moved"})
+    on_disk = {p: file_sha(mem_dir, p) for p in
+               ("/memories/a.md", "/memories/b.md", "/memories/c.md", "/memories/e.md",
+                "/memories/moved/x.md")}
+    latest = dict(binding_hashes(path))
+    assert {p: latest[p] for p in on_disk} == on_disk
+    assert latest["/memories/e.md"] == sha("")
+
+
+def test_unreadable_file_is_bound_without_hash(path, cap, mem_dir, caplog):
+    class NoViews(BetaLocalFilesystemMemoryTool):
+        def view(self, command):
+            if command.path.endswith("a.md"):
+                raise OSError("read failed")
+            return super().view(command)
+
+    tool = instrument(NoViews(base_path=str(mem_dir)), cap, hash_files=True)
+    with agent_task_scope("agent", "task"):
+        result = create(tool, "/memories/a.md", "a\n")  # the probe fails too: treated as new
+    assert "created" in str(result).lower()
+    assert binding_hashes(path) == [("/memories/a.md", None)]
+    assert "for its hash failed" in caplog.text
+
+
+def test_file_text_rejects_other_formats():
+    from dod.integrations.anthropic_memory import _file_text
+
+    head = "Here's the content of /memories/a.md with line numbers:\n"
+    assert _file_text("/memories/a.md", head + "     1\ta\n     2\tb") == "a\nb"
+    assert _file_text("/memories/a.md", head + "     1\ta\n     3\tb") is None  # gap
+    assert _file_text("/memories/a.md", head + "a\nb") is None  # unnumbered
+    assert _file_text("/memories/b.md", head + "     1\ta") is None  # other path
+    assert _file_text("/memories/a.md", None) is None

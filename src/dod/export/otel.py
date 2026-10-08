@@ -17,7 +17,8 @@ Attributes (all in the ``dod.`` namespace, never ``gen_ai.``):
   ``dod.parents.count``, and the parallel arrays ``dod.parents.store``,
   ``dod.parents.record_id``, ``dod.parents.tag`` (one entry per edge).
 - ``dod.memory_bind``: ``dod.write.id``, ``dod.write.store``,
-  ``dod.write.record_id``.
+  ``dod.write.record_id``, and ``dod.bind.content_hash`` when the integration
+  reported the stored record's hash.
 - ``dod.memory_delete``: ``dod.delete.store``, ``dod.delete.record_id``,
   ``dod.delete.reason``, ``dod.write.id`` (the write that caused it, if any),
   ``dod.agent.id``, ``dod.session.id``.
@@ -73,11 +74,13 @@ class OTelObserver:
         self._emit(WRITE_EVENT, attrs)
 
     def on_bind(self, event: BindEvent) -> None:
-        self._emit(BIND_EVENT, {
+        attrs = {
             "dod.write.id": event.write_id,
             "dod.write.store": str(event.store),
             "dod.write.record_id": str(event.record_id),
-        })
+        }
+        _put(attrs, "dod.bind.content_hash", event.content_hash)
+        self._emit(BIND_EVENT, attrs)
 
     def on_tombstone(self, event: TombstoneEvent) -> None:
         attrs = {

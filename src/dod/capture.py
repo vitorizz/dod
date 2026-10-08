@@ -64,11 +64,13 @@ class WriteEvent(NamedTuple):
 
 
 class BindEvent(NamedTuple):
-    """A write bound to the record ID its store assigned."""
+    """A write bound to the record ID its store assigned. ``content_hash``
+    is the stored record's hash when the integration reported one."""
 
     write_id: str
     store: str
     record_id: str
+    content_hash: Optional[str] = None
 
 
 class TombstoneEvent(NamedTuple):
@@ -173,7 +175,7 @@ class Capture:
         key: Hashable,
         store: str,
         writes: Iterable[Tuple[Iterable[Item], Union[str, bytes], str, Optional[str]]] = (),
-        binds: Iterable[Tuple[str, str]] = (),
+        binds: Iterable[Tuple[str, ...]] = (),
         agent_id: Optional[str] = None,
         session_id: Optional[str] = None,
         deletes: Iterable[Tuple[str, str, Optional[str]]] = (),
@@ -183,15 +185,16 @@ class Capture:
         Each of ``writes`` is ``(replaced, content, source, record_id)``: a
         compaction of ``replaced`` as with ``on_compaction`` (a plain write if
         ``replaced`` is empty), bound to ``record_id`` in the same transaction
-        unless it is None. ``binds`` are ``(write_id, record_id)`` for writes
-        recorded earlier, with ``bind``'s rules. ``deletes`` are
+        unless it is None. ``binds`` are ``(write_id, record_id)``, or
+        ``(write_id, record_id, content_hash)``, for writes recorded earlier,
+        with ``bind``'s rules. ``deletes`` are
         ``(record_id, reason, write_id)`` tombstones in ``store``, as with
         ``on_delete``. All or nothing: if the ledger call raises, nothing is
         recorded and every write in ``binds`` stays pending. Returns the new
         write IDs in order.
         """
         writes = [(list(r), c, s, rid) for r, c, s, rid in writes]
-        binds = list(binds)
+        binds = [(b[0], b[1], b[2] if len(b) > 2 else None) for b in binds]
         tombstones = [
             dict(store=store, record_id=r, reason=reason, write_id=w,
                  agent_id=agent_id, session_id=session_id)
@@ -200,10 +203,10 @@ class Capture:
         with self._lock:
             ctx = self._context.get(key)
             parents = [(s, r, t) for (s, r), t in ctx.items()] if ctx else []
-            ids = [w for w, _ in binds]
+            ids = [w for w, _, _ in binds]
             if len(set(ids)) != len(ids) or any(w in self._binding for w in ids):
                 raise KeyError(f"bind already in progress for one of {ids!r}")
-            bindings = [(w, self._pending[w], r) for w, r in binds]
+            bindings = [(w, self._pending[w], r, h) for w, r, h in binds]
             self._binding.update(ids)
         rows = [
             dict(
@@ -238,8 +241,8 @@ class Capture:
                     w, store, record_id, source, _content_hash(content), agent_id,
                     session_id, _edges([(s, r, "in_prompt") for s, r in replaced], parents),
                 ))
-            for w, s, r in bindings:
-                self._notify("on_bind", BindEvent(w, s, r))
+            for w, s, r, h in bindings:
+                self._notify("on_bind", BindEvent(w, s, r, h))
             for t in tombstones:
                 self._notify("on_tombstone", TombstoneEvent(**t))
         return write_ids
@@ -283,8 +286,10 @@ class Capture:
                 self._context[snap] = dict(ctx)
         return snap
 
-    def bind(self, write_id: str, record_id: str) -> None:
-        """Bind a write to the record ID its store assigned.
+    def bind(self, write_id: str, record_id: str, content_hash: Optional[str] = None) -> None:
+        """Bind a write to the record ID its store assigned. ``content_hash``
+        is the stored record's hash, for integrations whose write hash isn't
+        the stored content (see ``Ledger.bind``).
 
         Raises ``KeyError`` if the write is unknown, already bound, evicted, or
         has another ``bind`` in flight. If the ledger call raises, the write
@@ -297,7 +302,7 @@ class Capture:
             self._binding.add(write_id)
         bound = False
         try:
-            self._ledger.bind(write_id, store, record_id)
+            self._ledger.bind(write_id, store, record_id, content_hash)
             bound = True
         finally:
             with self._lock:
@@ -305,7 +310,7 @@ class Capture:
                 if bound:
                     self._pending.pop(write_id, None)
         if self._observers:
-            self._notify("on_bind", BindEvent(write_id, store, record_id))
+            self._notify("on_bind", BindEvent(write_id, store, record_id, content_hash))
 
     def reset(self, key: Hashable) -> None:
         """Clear ``key``'s context, for example when a new task starts."""
