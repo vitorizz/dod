@@ -164,7 +164,11 @@ class LLMAgent:
     def __init__(self, cfg: Config):
         from crewai import LLM  # provider keys come from the environment
 
-        self.llm = LLM(model=cfg.model, temperature=0)
+        # Current Anthropic models take no sampling parameters (the SDK's
+        # Messages.create has no temperature), so those replies can vary
+        # between runs; other providers get temperature 0.
+        sampling = {} if cfg.model.startswith("anthropic/") else {"temperature": 0}
+        self.llm = LLM(model=cfg.model, **sampling)
 
     def decide(self, topic: Topic, policy: Optional[int], prompt: List[str]) -> Optional[int]:
         memory = "\n".join(f"- {_TEXT.match(t)['body']}" for t in prompt)
