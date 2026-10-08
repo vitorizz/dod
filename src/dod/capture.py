@@ -24,15 +24,82 @@ In-memory state and its lifecycle:
   capped or expired: dropping items would silently drop parents. Callers must
   ``reset`` keys when a unit of work ends, or memory grows with the number of
   distinct keys and the items retrieved under them.
+
+Observers. ``Capture(ledger, observers=[...])`` calls each observer's
+``on_write(WriteEvent)``, ``on_bind(BindEvent)`` and
+``on_tombstone(TombstoneEvent)`` after the ledger commit succeeds, in the
+calling thread; a method an observer lacks is skipped. Events carry IDs,
+hashes and tags, never content. An observer that raises is logged and
+ignored: it never affects capture or the caller. With no observers, nothing
+extra runs.
 """
 
+import hashlib
+import logging
 import threading
 from collections import OrderedDict
-from typing import Dict, Hashable, Iterable, List, Optional, Set, Tuple, Union
+from typing import (
+    Dict, Hashable, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union,
+)
 
 from dod.ledger import TAGS, Ledger
 
+logger = logging.getLogger(__name__)
+
 Item = Tuple[str, str]
+Edge = Tuple[str, str, str]
+
+
+class WriteEvent(NamedTuple):
+    """A recorded write. ``parents`` are its ``(store, record_id, tag)`` edges."""
+
+    write_id: str
+    store: str
+    record_id: Optional[str]
+    source: str
+    content_hash: str
+    agent_id: Optional[str]
+    session_id: Optional[str]
+    parents: Tuple[Edge, ...]
+
+
+class BindEvent(NamedTuple):
+    """A write bound to the record ID its store assigned."""
+
+    write_id: str
+    store: str
+    record_id: str
+
+
+class TombstoneEvent(NamedTuple):
+    """A recorded deletion of ``record_id`` from ``store``."""
+
+    store: str
+    record_id: str
+    reason: str
+    write_id: Optional[str]
+    agent_id: Optional[str]
+    session_id: Optional[str]
+
+
+def _content_hash(content: Union[str, bytes]) -> str:
+    """The ledger's content hash: sha256 of the UTF-8 (or raw) bytes."""
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _edges(direct, context) -> Tuple[Edge, ...]:
+    """A write's parent edges as the ledger's ``parents`` view has them.
+
+    One edge per item; where context and direct parents disagree on the
+    tag, ``in_prompt`` wins.
+    """
+    edges = {}
+    for s, r, t in list(context) + list(direct):
+        if edges.get((s, r)) != "in_prompt":
+            edges[(s, r)] = t
+    return tuple((s, r, t) for (s, r), t in edges.items())
 
 
 class Capture:
@@ -42,10 +109,13 @@ class Capture:
     never gets parents retrieved under another.
     """
 
-    def __init__(self, ledger: Ledger, max_pending: int = 100_000):
+    def __init__(
+        self, ledger: Ledger, max_pending: int = 100_000, observers: Sequence = ()
+    ):
         if max_pending < 1:
             raise ValueError("max_pending must be >= 1")
         self._ledger = ledger
+        self._observers = tuple(observers)
         self._max_pending = max_pending
         self._lock = threading.Lock()
         # key -> {(store, record_id): tag}; in_prompt wins over retrieved_in_scope.
@@ -162,6 +232,16 @@ class Capture:
                             self._pending[w] = store
                     while len(self._pending) > self._max_pending:
                         self._pending.popitem(last=False)
+        if self._observers:
+            for w, (replaced, content, source, record_id) in zip(write_ids, writes):
+                self._notify("on_write", WriteEvent(
+                    w, store, record_id, source, _content_hash(content), agent_id,
+                    session_id, _edges([(s, r, "in_prompt") for s, r in replaced], parents),
+                ))
+            for w, s, r in bindings:
+                self._notify("on_bind", BindEvent(w, s, r))
+            for t in tombstones:
+                self._notify("on_tombstone", TombstoneEvent(**t))
         return write_ids
 
     def on_delete(
@@ -180,11 +260,15 @@ class Capture:
         them, if any, and ``agent_id``/``session_id`` the actor. A deletion
         has no parents, so no context key is involved.
         """
-        self._ledger.append_tombstones(
+        tombstones = [
             dict(store=store, record_id=r, reason=reason, write_id=write_id,
                  agent_id=agent_id, session_id=session_id)
             for r in record_ids
-        )
+        ]
+        self._ledger.append_tombstones(tombstones)
+        if self._observers:
+            for t in tombstones:
+                self._notify("on_tombstone", TombstoneEvent(**t))
 
     def snapshot(self, key: Hashable) -> Hashable:
         """Return a new key whose context is a copy of ``key``'s.
@@ -220,6 +304,8 @@ class Capture:
                 self._binding.discard(write_id)
                 if bound:
                     self._pending.pop(write_id, None)
+        if self._observers:
+            self._notify("on_bind", BindEvent(write_id, store, record_id))
 
     def reset(self, key: Hashable) -> None:
         """Clear ``key``'s context, for example when a new task starts."""
@@ -243,4 +329,21 @@ class Capture:
             self._pending[write_id] = store
             while len(self._pending) > self._max_pending:
                 self._pending.popitem(last=False)
+        if self._observers:
+            self._notify("on_write", WriteEvent(
+                write_id, store, None, source, _content_hash(content), agent_id,
+                session_id, _edges(extra, parents),
+            ))
         return write_id
+
+    def _notify(self, method: str, event) -> None:
+        """Call ``method`` on every observer that has it; log and swallow errors."""
+        for observer in self._observers:
+            fn = getattr(observer, method, None)
+            if fn is None:
+                continue
+            try:
+                fn(event)
+            except Exception:
+                logger.exception("dod observer %r failed in %s; capture unaffected",
+                                 observer, method)
