@@ -384,3 +384,52 @@ def test_quarantined_items_are_not_returned_or_recorded_as_parents(path, ledger,
 
     asyncio.run(run())
     _blocked.clear()
+
+
+def _fail_after_store_call(cap, monkeypatch):
+    """Make only the post-store-call recording (binds, tombstones) fail.
+
+    Recording before the store call still works: that step fails closed by
+    design (no lineage, no write), which is a separate policy.
+    """
+    real = cap.on_batch
+
+    def flaky(*args, **kwargs):
+        if kwargs.get("binds") or kwargs.get("deletes"):
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cap, "on_batch", flaky)
+
+
+@pytest.mark.parametrize("op", ["put", "delete"])
+def test_ledger_failure_after_store_call_never_reaches_caller(cap, store, monkeypatch, caplog, op):
+    # The store call succeeded; recording its bind or tombstone fails. The
+    # caller must see exactly what an uninstrumented store would: success.
+    with agent_task_scope("agent", "seed"):
+        store.put(NS, "k", {"v": 1})
+
+    _fail_after_store_call(cap, monkeypatch)
+    with agent_task_scope("agent", "task"), caplog.at_level("ERROR"):
+        if op == "put":
+            store.put(NS, "k", {"v": 2})
+        else:
+            store.delete(NS, "k")
+    expected = {"v": 2} if op == "put" else None
+    got = store.get(NS, "k")
+    assert (got.value if got else None) == expected
+    assert "lineage for these items is incomplete" in caplog.text
+
+
+def test_ledger_failure_after_async_store_call_never_reaches_caller(cap, store, monkeypatch, caplog):
+    _fail_after_store_call(cap, monkeypatch)
+
+    async def run():
+        with agent_task_scope("agent", "task"):
+            await store.aput(NS, "k", {"v": 1})
+            return await store.aget(NS, "k")
+
+    with caplog.at_level("ERROR"):
+        got = asyncio.run(run())
+    assert got.value == {"v": 1}
+    assert "lineage for these items is incomplete" in caplog.text

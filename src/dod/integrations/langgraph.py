@@ -148,8 +148,18 @@ def instrument(store: Any, capture: Capture, store_name: str = "langgraph") -> A
         """Record binds and tombstones, then filter and track the reads."""
         ctx_key, agent_id, session_id, binds, deletes = pending
         if binds or deletes:
-            capture.on_batch(ctx_key, store_name, binds=binds, agent_id=agent_id,
-                             session_id=session_id, deletes=deletes)
+            # The store call already succeeded: a ledger failure here must not
+            # surface as a failed put or delete. Log it; unbound writes stay
+            # pending in the Capture and can be bound later.
+            try:
+                capture.on_batch(ctx_key, store_name, binds=binds, agent_id=agent_id,
+                                 session_id=session_id, deletes=deletes)
+            except Exception:
+                logger.exception(
+                    "dod: recording %d bind(s) and %d tombstone(s) for store %r failed "
+                    "after the store call succeeded; lineage for these items is incomplete",
+                    len(binds), len(deletes), store_name,
+                )
         results = _drop_quarantined(quarantine.current(), store_name, ops, results)
         key = _scope.current_key()
         if key is None:
