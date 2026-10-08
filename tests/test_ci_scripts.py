@@ -266,3 +266,90 @@ def test_up_to_date_pr_is_left_alone(gh, repo):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "#7 is up to date." in r.stdout
     assert not any(c[:2] == ["pr", "update-branch"] for c in gh.calls)
+
+
+# --- update-branches.sh: needs-human handling ------------------------------------
+
+MARKER = "<!-- update-branches:conflict -->"
+
+
+def timeline(gh, pr, events):
+    # `gh api --paginate --slurp` returns a list of pages.
+    gh.on("api", "--slurp", f"repos/{REPO}/issues/{pr}/timeline?per_page=100", json_out=[events])
+
+
+def conflict_comment():
+    return {"event": "commented", "body": f"Couldn't update this branch...\n\n{MARKER}"}
+
+
+def labeled(name="needs-human"):
+    return {"event": "labeled", "label": {"name": name}}
+
+
+def labels_removed(gh):
+    return [c[c.index("--remove-label") + 1] for c in gh.calls if "--remove-label" in c]
+
+
+def test_resolved_conflict_removes_label_then_updates(gh, repo):
+    clone = repo({"b.txt": "feature\n"})  # no longer conflicts with main
+    pr_list(gh, labels=["needs-human"])
+    timeline(gh, 7, [conflict_comment(), labeled()])
+    gh.on("pr", "update-branch", "7")
+    r = gh.run("update-branches.sh", clone, BASE="main")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "#7 no longer conflicts with main; removing needs-human." in r.stdout
+    assert labels_removed(gh) == ["needs-human"]
+    assert gh.comments() == ["Merge conflict with `main` is resolved; removed `needs-human`."]
+    # Unblocked in the same run, so the behind branch is updated right away.
+    assert ["pr", "update-branch", "7", "--repo", REPO] in gh.calls
+
+
+def test_still_conflicting_keeps_label_and_skips(gh, repo):
+    clone = repo({"a.txt": "feature\n"})  # still conflicts on a.txt
+    pr_list(gh, labels=["needs-human"])
+    timeline(gh, 7, [conflict_comment(), labeled()])
+    r = gh.run("update-branches.sh", clone, BASE="main")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "#7 still conflicts with main." in r.stdout
+    assert "#7 is 1 behind but labeled needs-human; skipping." in r.stdout
+    assert labels_removed(gh) == [] and gh.comments() == []
+    assert not any(c[:2] == ["pr", "update-branch"] for c in gh.calls)
+
+
+@pytest.mark.parametrize("events", [
+    # Labeled by the review cap: preceded by a comment without the marker.
+    [{"event": "commented", "body": "Handing off to a human."}, labeled()],
+    # Labeled for a conflict once, then removed and relabeled for another reason.
+    [conflict_comment(), labeled(), {"event": "unlabeled", "label": {"name": "needs-human"}},
+     {"event": "commented", "body": "Review still reports 1 blocking finding(s)"}, labeled()],
+    # The marker comment is not immediately before the label.
+    [conflict_comment(), {"event": "committed"}, labeled()],
+    # A conflict comment followed by a different label.
+    [conflict_comment(), labeled("bug")],
+    # No events at all.
+    [],
+])
+def test_needs_human_for_other_reasons_is_never_removed(gh, repo, events):
+    clone = repo({"b.txt": "feature\n"})  # mergeable, so only the timeline check protects the label
+    pr_list(gh, labels=["needs-human"])
+    timeline(gh, 7, events)
+    r = gh.run("update-branches.sh", clone, BASE="main")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert labels_removed(gh) == [] and gh.comments() == []
+    assert "#7 is 1 behind but labeled needs-human; skipping." in r.stdout
+    assert not any(c[:2] == ["pr", "update-branch"] for c in gh.calls)
+
+
+def test_conflict_check_error_fails_without_touching_label(gh, repo):
+    clone = repo({"b.txt": "feature\n"})
+    gh.on("pr", "list", json_out=[{  # PR #8 has no refs/pull/8/head, so the fetch fails
+        "number": 8, "headRefName": "feature", "headRepositoryOwner": {"login": "o"},
+        "labels": [{"name": "needs-human"}],
+    }])
+    gh.on("api", f"repos/{REPO}/compare/main...o:feature", json_out={"behind_by": 1})
+    timeline(gh, 8, [conflict_comment(), labeled()])
+    r = gh.run("update-branches.sh", clone, BASE="main")
+    assert r.returncode == 1
+    assert "Couldn't check #8 for conflicts." in r.stdout
+    assert labels_removed(gh) == [] and gh.comments() == []
+    assert not any(c[:2] == ["pr", "update-branch"] for c in gh.calls)
