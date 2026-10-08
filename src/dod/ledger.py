@@ -4,9 +4,19 @@ A memory item is identified by ``(store, record_id)``, so edges can cross
 stores. A deleted item gets a tombstone row; nothing is ever removed. The
 ledger never stores memory content: only IDs, content hashes, edges, and
 metadata.
+
+A write's parents are its context set plus its direct parents. A context set
+is a scope's shared context, stored once per distinct set of
+``(store, record_id, tag)`` members and addressed by their hash, so a scope's
+writes reference it instead of each copying every edge. Direct parents (for
+example a compaction's replaced items) are stored per write. The ``parents``
+view joins both into one row per edge, ``(write_id, parent_store,
+parent_record_id, tag)``; where an item is in both, the direct row carries
+the merged tag and the context row is hidden.
 """
 
 import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -20,7 +30,10 @@ REASONS = ("consolidation", "excision", "forget", "other")
 Item = Tuple[str, str]
 Parent = Tuple[str, str, str]
 
-_TABLES = ("writes", "parents", "bindings", "tombstones", "quarantine")
+_TABLES = (
+    "writes", "direct_parents", "context_sets", "context_members", "bindings",
+    "tombstones", "quarantine",
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS writes (
@@ -32,15 +45,40 @@ CREATE TABLE IF NOT EXISTS writes (
     agent_id     TEXT,
     session_id   TEXT,
     source       TEXT NOT NULL
-        CHECK (source IN ('user', 'tool', 'document', 'agent_inference'))
+        CHECK (source IN ('user', 'tool', 'document', 'agent_inference')),
+    context_set  TEXT REFERENCES context_sets (set_hash)
 );
-CREATE TABLE IF NOT EXISTS parents (
+CREATE TABLE IF NOT EXISTS context_sets (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    set_hash TEXT NOT NULL UNIQUE,
+    size     INTEGER NOT NULL,
+    ts       INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS context_members (
+    set_hash  TEXT NOT NULL REFERENCES context_sets (set_hash),
+    store     TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    tag       TEXT NOT NULL
+        CHECK (tag IN ('in_prompt', 'retrieved_in_scope')),
+    PRIMARY KEY (set_hash, store, record_id)
+);
+CREATE TABLE IF NOT EXISTS direct_parents (
     write_id         TEXT NOT NULL REFERENCES writes (write_id),
     parent_store     TEXT NOT NULL,
     parent_record_id TEXT NOT NULL,
     tag              TEXT NOT NULL
         CHECK (tag IN ('in_prompt', 'retrieved_in_scope')),
     PRIMARY KEY (write_id, parent_store, parent_record_id)
+);
+CREATE VIEW IF NOT EXISTS parents (write_id, parent_store, parent_record_id, tag) AS
+SELECT write_id, parent_store, parent_record_id, tag FROM direct_parents
+UNION ALL
+SELECT w.write_id, m.store, m.record_id, m.tag
+FROM writes w JOIN context_members m ON m.set_hash = w.context_set
+WHERE NOT EXISTS (
+    SELECT 1 FROM direct_parents d
+    WHERE d.write_id = w.write_id AND d.parent_store = m.store
+        AND d.parent_record_id = m.record_id
 );
 CREATE TABLE IF NOT EXISTS bindings (
     write_id  TEXT NOT NULL REFERENCES writes (write_id),
@@ -90,10 +128,19 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
     for t, extra in (
         ("writes", "\n    OR EXISTS (SELECT 1 FROM writes WHERE write_id = NEW.write_id)"),
         (
-            "parents",
-            "\n    OR EXISTS (SELECT 1 FROM parents WHERE write_id = NEW.write_id"
+            "direct_parents",
+            "\n    OR EXISTS (SELECT 1 FROM direct_parents WHERE write_id = NEW.write_id"
             "\n        AND parent_store = NEW.parent_store"
             " AND parent_record_id = NEW.parent_record_id)",
+        ),
+        (
+            "context_sets",
+            "\n    OR EXISTS (SELECT 1 FROM context_sets WHERE set_hash = NEW.set_hash)",
+        ),
+        (
+            "context_members",
+            "\n    OR EXISTS (SELECT 1 FROM context_members WHERE set_hash = NEW.set_hash"
+            "\n        AND store = NEW.store AND record_id = NEW.record_id)",
         ),
         ("bindings", ""),
         ("tombstones", ""),
@@ -146,6 +193,22 @@ def _dedupe_parents(parents: Iterable[Parent]) -> list:
         if merged.get(key) != "in_prompt":
             merged[key] = tag
     return [(s, r, t) for (s, r), t in merged.items()]
+
+
+def _context_set(context: Iterable[Parent]) -> Tuple[Optional[str], list]:
+    """Deduped ``context`` members and their content address.
+
+    The address is the sha256 of the sorted members, tags included, so the
+    same context always maps to the same set, and a grown or re-tagged
+    context to a new one. An empty context has no set (``None``).
+    """
+    # Keyed as stored: the TEXT columns store a non-str ID as its str().
+    members = sorted(_dedupe_parents(context), key=lambda m: (str(m[0]), str(m[1])))
+    if not members:
+        return None, []
+    key = [(str(s), str(r), t) for s, r, t in members]
+    digest = hashlib.sha256(json.dumps(key, separators=(",", ":")).encode("utf-8"))
+    return digest.hexdigest(), members
 
 
 def _tombstone_row(t: dict, ts: int) -> tuple:
@@ -226,12 +289,16 @@ class Ledger:
         agent_id: Optional[str] = None,
         session_id: Optional[str] = None,
         parents: Iterable[Parent] = (),
+        context: Iterable[Parent] = (),
     ) -> str:
         """Record a write and its parent edges in one transaction.
 
         ``content`` is hashed (sha256) and discarded; it is never stored.
-        ``parents`` are ``(store, record_id, tag)`` tuples. Duplicates are
-        stored once; if they disagree on tag, ``in_prompt`` wins.
+        ``parents`` (the write's own, stored per write) and ``context`` (the
+        scope's shared context, stored once per distinct set) are
+        ``(store, record_id, tag)`` tuples. The write's parent edges are both
+        together: duplicates are one edge, and if they disagree on tag,
+        ``in_prompt`` wins.
 
         Each write gets a strictly increasing ``seq``; order writes by ``seq``.
         ``ts`` is wall-clock time for display only, since clocks can step back.
@@ -245,6 +312,7 @@ class Ledger:
                     agent_id=agent_id,
                     session_id=session_id,
                     parents=parents,
+                    context=context,
                 )
             ]
         )
@@ -258,7 +326,8 @@ class Ledger:
     ) -> List[str]:
         """Record several writes, bindings and tombstones in one transaction.
 
-        Each of ``writes`` is a dict of ``append_write``'s keyword arguments,
+        Each of ``writes`` is a dict of ``append_write``'s keyword arguments
+        (writes passing the same ``context`` object have it hashed once),
         plus an optional ``record_id`` that binds the new write in the same
         transaction. ``bindings`` are ``(write_id, store, record_id)`` tuples
         for writes recorded earlier. ``tombstones`` are dicts as for
@@ -266,6 +335,10 @@ class Ledger:
         nothing: if anything is invalid or fails, nothing is recorded.
         """
         write_rows, parent_rows, binding_rows, write_ids = [], [], [], []
+        # id(context) -> (context, set_hash, members, tags): writes in one
+        # batch usually pass the same context object, so hash it once.
+        contexts = {}
+        sets = {}  # set_hash -> members, for sets this batch references
         ts = time.time_ns()
         for w in writes:
             source = w["source"]
@@ -274,12 +347,25 @@ class Ledger:
             content = w["content"]
             if isinstance(content, str):
                 content = content.encode("utf-8")
+            context = w.get("context", ())
+            if id(context) not in contexts:
+                set_hash, members = _context_set(context)
+                tags = {(str(s), str(r)): t for s, r, t in members}
+                contexts[id(context)] = (context, set_hash, members, tags)
+            _, set_hash, members, tags = contexts[id(context)]
+            if set_hash is not None:
+                sets[set_hash] = members
             write_id = _write_id(ts)
             write_rows.append((
                 write_id, hashlib.sha256(content).hexdigest(), ts, w["store"],
-                w.get("agent_id"), w.get("session_id"), source,
+                w.get("agent_id"), w.get("session_id"), source, set_hash,
             ))
-            parent_rows += [(write_id, s, r, t) for s, r, t in _dedupe_parents(w.get("parents", ()))]
+            for s, r, t in _dedupe_parents(w.get("parents", ())):
+                # Shadows the context's edge in the parents view, so it carries
+                # the merged tag.
+                if tags.get((str(s), str(r))) == "in_prompt":
+                    t = "in_prompt"
+                parent_rows.append((write_id, s, r, t))
             if w.get("record_id") is not None:
                 binding_rows.append((write_id, w["store"], w["record_id"], ts))
             write_ids.append(write_id)
@@ -287,14 +373,34 @@ class Ledger:
         tombstone_rows = [_tombstone_row(t, ts) for t in tombstones]
         with self._lock:
             conn = self._conn
-            conn.execute("BEGIN")
+            # IMMEDIATE takes the write lock up front (waiting via
+            # busy_timeout), so the context-set check below reads the latest
+            # state. A deferred BEGIN would read a snapshot, and if another
+            # connection committed the same set before our first INSERT, the
+            # upgrade fails with SQLITE_BUSY_SNAPSHOT, which is never retried.
+            conn.execute("BEGIN IMMEDIATE")
             try:
+                for set_hash, members in sets.items():
+                    # Content-addressed and append-only: a set already
+                    # recorded (by any connection) is referenced, not rewritten.
+                    if conn.execute(
+                        "SELECT 1 FROM context_sets WHERE set_hash = ?", (set_hash,)
+                    ).fetchone():
+                        continue
+                    conn.execute(
+                        "INSERT INTO context_sets (set_hash, size, ts) VALUES (?, ?, ?)",
+                        (set_hash, len(members), ts),
+                    )
+                    conn.executemany(
+                        "INSERT INTO context_members VALUES (?, ?, ?, ?)",
+                        [(set_hash, s, r, t) for s, r, t in members],
+                    )
                 conn.executemany(
-                    "INSERT INTO writes (write_id, content_hash, ts, store,"
-                    " agent_id, session_id, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO writes (write_id, content_hash, ts, store, agent_id,"
+                    " session_id, source, context_set) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     write_rows,
                 )
-                conn.executemany("INSERT INTO parents VALUES (?, ?, ?, ?)", parent_rows)
+                conn.executemany("INSERT INTO direct_parents VALUES (?, ?, ?, ?)", parent_rows)
                 conn.executemany("INSERT INTO bindings VALUES (?, ?, ?, ?)", binding_rows)
                 conn.executemany(
                     "INSERT INTO tombstones (store, record_id, ts, reason, write_id,"

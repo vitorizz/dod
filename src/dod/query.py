@@ -3,7 +3,9 @@
 A parent edge names a memory item ``(store, record_id)``; ``bindings`` map it
 to the write(s) that produced it, so walks cross stores. An item bound to
 several writes resolves to all of them (over-include rather than miss a
-parent).
+parent). Edges are read from the ledger's ``parents`` view, which expands each
+write's context set and direct parents into one row per edge, so queries
+never see how they are stored.
 """
 
 from collections import Counter
