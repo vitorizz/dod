@@ -10,7 +10,7 @@ Scoping
     The context key and ``agent_task_scope`` live in ``dod.scope``, shared
     with every other integration (re-exported here). Outside any scope,
     recalls are not tracked, and a write is recorded with zero parents and a
-    one-time warning.
+    warning, once per method per memory.
 
     In a crew run, call ``install_task_scopes()`` once. It registers crewai
     ``PRE_STEP``/``POST_STEP`` interception hooks, which ``Task._execute_core``
@@ -21,7 +21,18 @@ Scoping
     runs after the task, too late. A key's context is cleared when its scope
     ends, so finished tasks hold no memory. If a task raises, ``POST_STEP`` is
     not dispatched: that task's key stays current in its thread, and its
-    context stays held, until the next task starts.
+    context stays held, until the next task starts in that thread. Its
+    ``PRE_STEP`` sees that the raised task's ``end_time`` changed since its
+    scope was entered (crewai sets it on failure; a running task's is
+    untouched), then leaves that scope and clears its context before entering
+    its own, so the raised task's retrievals never become another task's
+    parents.
+
+    Clearing a key clears it in every ``Capture`` that ``instrument`` was
+    called with (and is still alive), by design: one key is one unit of work
+    across every store, so when it ends its context is done in all of them.
+    Other keys are never touched, and a ``Capture`` no memory was
+    instrumented with is never cleared by a scope.
 
 Edge tags
     Recall results are ``retrieved_in_scope`` unless the caller (looked up a
@@ -35,6 +46,12 @@ Edge tags
 
     Those are tagged ``in_prompt``. Other callers (user code, ``Flow.recall``,
     human-feedback lessons) stay ``retrieved_in_scope``.
+
+Storage
+    Capture relies on crewai 1.15.22's ``StorageBackend`` signatures for
+    ``search``, ``save``, ``update`` and ``delete``. ``instrument`` checks
+    them first and raises ``TypeError`` if they differ, before wrapping
+    anything.
 
 Compaction
     crewai 1.15.22 consolidates on save: ``EncodingFlow`` searches for similar
@@ -106,6 +123,7 @@ import functools
 import inspect
 import logging
 import sys
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from dod import scope as _scope
@@ -128,8 +146,9 @@ _MARK = "_dod_instrumented"
 _observed: "contextvars.ContextVar[Optional[_Consolidation]]" = contextvars.ContextVar(
     "dod_crewai_consolidation", default=None
 )
-# (key, previous key) per task scope entered by the PRE_STEP hook.
-_hook_stack: "contextvars.ContextVar[Tuple[Tuple[Key, Optional[Key]], ...]]" = (
+# (key, previous key, task, task.end_time at entry) per task scope entered by
+# the PRE_STEP hook.
+_hook_stack: "contextvars.ContextVar[Tuple[Tuple[Key, Optional[Key], Any, Any], ...]]" = (
     contextvars.ContextVar("dod_crewai_hook_stack", default=())
 )
 _pending_batch: "contextvars.ContextVar[Optional[_Batch]]" = contextvars.ContextVar(
@@ -146,6 +165,16 @@ _in_prompt_callers: set = set()
 # Frames above the wrapper to search: covers MemoryScope/MemorySlice and
 # arecall delegating to recall.
 _CALLER_DEPTH = 4
+
+# Leading parameters of the storage methods capture observes, as in crewai
+# 1.15.22's StorageBackend: the observers read these by position or name.
+_STORAGE_PARAMS = {
+    "search": ("query_embedding",),
+    "save": ("records",),
+    "update": ("record",),
+    "delete": ("scope_prefix", "categories", "record_ids", "older_than", "metadata_filter"),
+}
+
 
 class _Consolidation:
     """Storage calls observed during one ``remember``."""
@@ -183,6 +212,7 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
     storage = getattr(memory, "_storage", None)
     if storage is None:
         raise TypeError(f"{type(memory).__name__} has no _storage to observe")
+    _check_storage(storage)
     if type(memory).__module__.startswith("crewai."):
         _load_in_prompt_callers()
     _observe_storage(storage)
@@ -197,7 +227,8 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
         raise TypeError(
             f"{type(memory).__name__} has no _background_encode_batch to observe"
         )
-    warned = []
+    warned: set = set()  # methods that logged the out-of-scope warning
+    warned_lock = threading.Lock()
     quarantine = QuarantineCache(capture._ledger)
 
     @functools.wraps(orig_recall)
@@ -222,11 +253,14 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
         key = _key.get()
         if key is not None:
             return key, key[0], key[1]
-        if not warned:
-            warned.append(True)
-            logger.warning(
-                "dod: %s() outside agent_task_scope; recorded with no parents", method
-            )
+        if method not in warned:
+            with warned_lock:
+                first = method not in warned
+                warned.add(method)
+            if first:
+                logger.warning(
+                    "dod: %s() outside agent_task_scope; recorded with no parents", method
+                )
         # A fresh key has no context, and no other write can share it.
         return object(), None, None
 
@@ -399,9 +433,15 @@ def _enter_task_scope(ctx: Any) -> None:
     agent, task = getattr(ctx, "agent", None), getattr(ctx, "task", None)
     if getattr(ctx, "kind", None) != "task" or agent is None or task is None:
         return None
+    # Leave the scopes of tasks that raised (no POST_STEP) since entering them.
+    stack, previous = _hook_stack.get(), _key.get()
+    while stack and getattr(stack[-1][2], "end_time", None) != stack[-1][3]:
+        stale, previous = stack[-1][0], stack[-1][1]
+        stack = stack[:-1]
+        _scope.reset(stale)
     key = (str(agent.id), str(task.id))
     _scope.reset(key)
-    _hook_stack.set(_hook_stack.get() + ((key, _key.get()),))
+    _hook_stack.set(stack + ((key, previous, task, getattr(task, "end_time", None)),))
     _key.set(key)
     return None  # a non-None return would replace the step's payload
 
@@ -412,7 +452,7 @@ def _exit_task_scope(ctx: Any) -> None:
         return None
     stack, task_id = _hook_stack.get(), str(task.id)
     for i in range(len(stack) - 1, -1, -1):
-        key, previous = stack[i]
+        key, previous, _task, _end = stack[i]
         if key[1] == task_id:
             _key.set(previous)
             _hook_stack.set(stack[:i])
@@ -454,6 +494,24 @@ def _load_in_prompt_callers() -> None:
         RecallMemoryTool._run,
     ):
         _in_prompt_callers.add(inspect.unwrap(fn).__code__)
+
+
+def _check_storage(storage: Any) -> None:
+    """Raise ``TypeError`` unless ``storage``'s observed methods take the
+    leading parameters in ``_STORAGE_PARAMS``."""
+    for name, expected in _STORAGE_PARAMS.items():
+        method = getattr(storage, name, None)
+        try:
+            params = list(inspect.signature(method).parameters)
+        except (TypeError, ValueError):
+            params = None
+        if params is None or tuple(params[:len(expected)]) != expected:
+            raise TypeError(
+                f"{type(storage).__name__}.{name} must take {expected} as its leading"
+                f" parameters, as crewai 1.15.22's StorageBackend does; found"
+                f" {tuple(params) if params is not None else 'no inspectable method'}."
+                " dod can't observe this storage."
+            )
 
 
 def _observe_storage(storage: Any) -> None:

@@ -265,6 +265,27 @@ def test_signatures_and_return_values_unchanged(cap):
     assert m._storage.records[rec.id] is rec
 
 
+class _OldDelete(StubStorage):
+    def delete(self, record_ids=None, scope_prefix=None):  # reordered
+        return 0
+
+
+class _NoUpdate(StubStorage):
+    update = None
+
+
+@pytest.mark.parametrize("storage", [_OldDelete, _NoUpdate])
+def test_instrument_rejects_unexpected_storage_signatures(cap, storage):
+    m = StubMemory()
+    m._storage = storage()
+    before = {n: getattr(m._storage, n) for n in integ._STORAGE_PARAMS}
+    with pytest.raises(TypeError, match=r"crewai 1\.15\.22's StorageBackend"):
+        instrument(m, cap)
+    # Nothing was wrapped.
+    assert {n: getattr(m._storage, n) for n in integ._STORAGE_PARAMS} == before
+    assert not getattr(m.recall, "_dod_instrumented", False)
+
+
 def test_instrument_twice_is_noop(path, cap):
     m = StubMemory()
     assert instrument(m, cap) is m
@@ -514,6 +535,38 @@ def test_write_outside_scope_has_no_parents_and_warns_once(path, mem, caplog):
     assert len([r for r in caplog.records if "outside agent_task_scope" in r.message]) == 1
 
 
+def _scope_warnings(caplog):
+    return sorted(r.getMessage().split("(")[0] for r in caplog.records
+                  if "outside agent_task_scope" in r.getMessage())
+
+
+def test_out_of_scope_warning_once_per_method(path, mem, caplog):
+    (a,) = mem.add("A")
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        for _ in range(2):
+            mem.remember("C")
+            mem.remember_many(["D"])
+            mem.update(a.id, "A2")
+        mem.drain_writes()
+    assert _scope_warnings(caplog) == ["dod: remember", "dod: remember_many", "dod: update"]
+
+
+def test_out_of_scope_warning_once_under_concurrent_first_calls(path, cap, caplog):
+    m = instrument(StubMemory(pool=False), cap)
+    n = 16
+    barrier = threading.Barrier(n)
+
+    def call(_):
+        barrier.wait()
+        m.remember("C")
+
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            list(ex.map(call, range(n)))
+    assert _scope_warnings(caplog) == ["dod: remember"]
+    assert len(writes(path)) == n
+
+
 class _Obj:
     def __init__(self, **kw):
         self.__dict__.update(kw)
@@ -540,6 +593,81 @@ def test_finished_scopes_hold_no_context(cap, mem):
     integ._exit_task_scope(_Obj(kind="task", task=outer))
     assert integ._key.get() is None
     assert cap._context == {}
+
+
+def test_scope_clears_its_key_in_every_instrumented_capture_only(tmp_path):
+    # A key is one unit of work across every store, so ending (or re-entering)
+    # it clears it in every Capture a memory was instrumented with. Other keys,
+    # and Captures no memory was instrumented with, are never touched.
+    with Ledger(tmp_path / "a.db") as la, Ledger(tmp_path / "b.db") as lb, \
+            Ledger(tmp_path / "c.db") as lc:
+        cap_a, cap_b, loose = Capture(la), Capture(lb), Capture(lc)
+        mem_a, mem_b = instrument(StubMemory(), cap_a), instrument(StubMemory(), cap_b)
+        (ra,), (rb,) = mem_a.add("A"), mem_b.add("B")
+        mem_a.results["q"], mem_b.results["q"] = [ra], [rb]
+        loose.on_retrieve(("agent", "t1"), [("x", "X")])
+        with agent_task_scope("agent", "t1"):
+            mem_a.recall("q")
+            mem_b.recall("q")
+            with agent_task_scope("agent", "t2"):
+                mem_b.recall("q")
+                assert set(cap_a._context) == {("agent", "t1")}
+                assert set(cap_b._context) == {("agent", "t1"), ("agent", "t2")}
+            # t2's exit cleared only t2, in both; t1 is intact in each.
+            assert set(cap_a._context) == set(cap_b._context) == {("agent", "t1")}
+            mem_a.remember("from a")
+            mem_b.remember("from b")
+        assert cap_a._context == cap_b._context == {}
+        assert loose._context == {("agent", "t1"): {("x", "X"): "retrieved_in_scope"}}
+    assert parents(tmp_path / "a.db", last_write(tmp_path / "a.db")) == {"A": "retrieved_in_scope"}
+    assert parents(tmp_path / "b.db", last_write(tmp_path / "b.db")) == {"B": "retrieved_in_scope"}
+
+
+def _task(id):
+    return _Obj(id=id, end_time=None)
+
+
+def test_raised_task_cleared_when_next_task_starts(path, cap, mem):
+    # A raising task gets no POST_STEP; crewai sets its end_time instead.
+    a, b = mem.add("A", "B")
+    mem.results.update(qa=[a], qb=[b])
+    agent, t1, t2 = _Obj(id="agent"), _task("t1"), _task("t2")
+    integ._enter_task_scope(_Obj(kind="task", agent=agent, task=t1))
+    mem.recall("qa")
+    t1.end_time = "raised"
+    assert set(cap._context) == {("agent", "t1")}  # held until the next task
+    integ._enter_task_scope(_Obj(kind="task", agent=agent, task=t2))
+    assert set(cap._context) == set()
+    assert integ._key.get() == ("agent", "t2")
+    mem.recall("qb")
+    mem.remember("C")
+    assert parents(path, last_write(path)) == {"B": "retrieved_in_scope"}
+    integ._exit_task_scope(_Obj(kind="task", task=t2))
+    # The raised task's key isn't restored as the previous one.
+    assert integ._key.get() is None and integ._hook_stack.get() == ()
+    assert cap._context == {}
+
+
+def test_raised_nested_task_cleared_outer_kept(path, cap, mem):
+    a, b, c = mem.add("A", "B", "C")
+    mem.results.update(qa=[a], qb=[b], qc=[c])
+    agent, outer, inner, nxt = _Obj(id="agent"), _task("outer"), _task("inner"), _task("next")
+    integ._enter_task_scope(_Obj(kind="task", agent=agent, task=outer))
+    mem.recall("qa")
+    integ._enter_task_scope(_Obj(kind="task", agent=agent, task=inner))
+    mem.recall("qb")
+    inner.end_time = "raised"  # caught by the outer task, which keeps running
+    integ._enter_task_scope(_Obj(kind="task", agent=agent, task=nxt))
+    assert set(cap._context) == {("agent", "outer")}
+    mem.recall("qc")
+    mem.remember("D")
+    assert parents(path, last_write(path)) == {"C": "retrieved_in_scope"}
+    integ._exit_task_scope(_Obj(kind="task", task=nxt))
+    assert integ._key.get() == ("agent", "outer")
+    mem.remember("E")
+    assert parents(path, last_write(path)) == {"A": "retrieved_in_scope"}
+    integ._exit_task_scope(_Obj(kind="task", task=outer))
+    assert integ._key.get() is None and cap._context == {}
 
 
 # --- Concurrency -------------------------------------------------------------
@@ -1077,6 +1205,12 @@ def test_stub_signatures_match_crewai():
 
     for name in ("recall", "remember", "remember_many", "update", "forget", "reset", "reset_all"):
         assert _params(getattr(StubMemory, name)) == _params(getattr(Memory, name)), name
+    # The storage signatures instrument() checks are crewai's own.
+    from crewai.memory.storage.backend import StorageBackend
+    from crewai.memory.storage.lancedb_storage import LanceDBStorage
+
+    for cls in (StorageBackend, LanceDBStorage, StubStorage, _MemStorage):
+        integ._check_storage(cls.__new__(cls))
     # remember_many's background save, wrapped to bind its writes.
     assert callable(getattr(Memory, "_background_encode_batch"))
     assert "self._background_encode_batch" in inspect.getsource(Memory.remember_many)
@@ -1377,3 +1511,45 @@ def test_install_task_scopes_enters_scope_in_real_task(path, cap):
     wid = last_write(path)
     assert parents(path, wid) == {a.id: "retrieved_in_scope"}
     assert writes(path)[-1][3:] == (str(agent.id), str(task.id))
+
+
+@pytest.mark.crewai
+def test_real_raised_task_cleared_when_next_task_starts(path, cap):
+    pytest.importorskip("crewai")
+    from crewai.agent.core import Agent
+    from crewai.hooks.dispatch import InterceptionPoint, unregister
+    from crewai.task import Task
+
+    m = instrument(_real_memory(embedder=_one_hot), cap)
+    with agent_task_scope("setup", "setup"):
+        a = _save(m, "A")
+    seen = []
+
+    class ProbeAgent(Agent):
+        def execute_task(self, task, context=None, tools=None):
+            seen.append((integ._key.get(), set(cap._context)))
+            if task.description == "fails":
+                m.recall("query", depth="shallow")
+                raise RuntimeError("task failed")
+            _save(m, "derived")
+            return "done"
+
+    integ.install_task_scopes()
+    try:
+        agent = ProbeAgent(role="r", goal="g", backstory="b", llm="gpt-4o-mini")
+        t1 = Task(description="fails", expected_output="x", agent=agent)
+        t2 = Task(description="works", expected_output="x", agent=agent)
+        with pytest.raises(RuntimeError, match="task failed"):
+            t1.execute_sync()
+        k1, k2 = (str(agent.id), str(t1.id)), (str(agent.id), str(t2.id))
+        # No POST_STEP: t1's scope and context are held until the next task.
+        assert integ._key.get() == k1 and set(cap._context) == {k1}
+        t2.execute_sync()
+    finally:
+        unregister(InterceptionPoint.PRE_STEP, integ._enter_task_scope)
+        unregister(InterceptionPoint.POST_STEP, integ._exit_task_scope)
+    assert seen == [(k1, set()), (k2, set())]  # t1's context gone when t2 starts
+    assert parents(path, last_write(path)) == {}  # not t1's recall of A
+    assert a.id in m._storage.records
+    assert integ._key.get() is None and integ._hook_stack.get() == ()
+    assert cap._context == {}
