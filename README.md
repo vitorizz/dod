@@ -105,7 +105,7 @@ Inside a crew, call `crewai.install_task_scopes()` once instead of entering scop
 ## Guarantees
 
 - **Content-free ledger.** The ledger stores IDs, content hashes, edges, and metadata only. Memory content stays in your stores. (`reason` and `actor` on quarantine are stored as you pass them; keep content out of them.)
-- **Append-only.** Writes, parents, bindings, and quarantine actions are only ever inserted; schema triggers reject updates, deletes, and `INSERT OR REPLACE`. Quarantine and release are new rows, so every action stays auditable.
+- **Append-only.** Writes, parents, bindings, deletions (tombstones), and quarantine actions are only ever inserted; schema triggers reject updates, deletes, and `INSERT OR REPLACE`. Quarantine and release are new rows, so every action stays auditable.
 - **No network calls home.** The library makes no telemetry or network calls. (Framework packages may have their own telemetry; the example turns off crewai's.)
 - **p99 < 1 ms capture overhead per write**, asserted by benchmarks in the test suite (`pytest -q tests/test_*_perf.py -s`).
 
@@ -119,7 +119,7 @@ What it does **not** do:
 
 Supported:
 
-- **CrewAI 1.15.22** `Memory`: `recall`, `remember`, `remember_many`, `update`, `forget(record_ids=...)`, and consolidation on save (recorded as compactions).
+- **CrewAI 1.15.22** `Memory`: `recall`, `remember`, `remember_many`, `update`, `forget`, `reset`, `reset_all`, and consolidation on save. Rewrites are recorded as compactions; every deleted record gets an append-only tombstone, so `trace` and `blast_radius` report what was deleted and why.
 - **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`).
 - `trace`, `blast_radius`, quarantine/release, across both stores through one ledger.
 
