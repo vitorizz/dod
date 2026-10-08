@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from dod.ledger import Ledger
+from dod.ledger import SCHEMA_VERSION, Ledger, LedgerSchemaError
 
 TABLES = (
     "writes", "direct_parents", "context_sets", "context_members", "bindings", "tombstones",
@@ -549,6 +549,78 @@ def test_reopen_keeps_data(path):
     assert conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM parents").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 1
+
+
+def user_version(path):
+    return raw(path).execute("PRAGMA user_version").fetchone()[0]
+
+
+def test_new_file_gets_schema_version(path, ledger):
+    assert user_version(path) == SCHEMA_VERSION
+
+
+def test_empty_file_gets_schema_version(path):
+    path.touch()
+    with Ledger(path):
+        pass
+    assert user_version(path) == SCHEMA_VERSION
+
+
+def test_reopen_at_same_version(path):
+    with Ledger(path) as led:
+        write(led)
+    with Ledger(path) as led:
+        write(led)
+    assert user_version(path) == SCHEMA_VERSION
+    assert count(path, "writes") == 2
+
+
+# The schema before context sets (#46): one parents row per edge, no version.
+PRE_46_SCHEMA = """
+CREATE TABLE writes (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, write_id TEXT NOT NULL UNIQUE,
+    content_hash TEXT NOT NULL, ts INTEGER NOT NULL, store TEXT NOT NULL,
+    agent_id TEXT, session_id TEXT, source TEXT NOT NULL
+);
+CREATE TABLE parents (
+    write_id TEXT NOT NULL REFERENCES writes (write_id),
+    parent_store TEXT NOT NULL, parent_record_id TEXT NOT NULL, tag TEXT NOT NULL,
+    PRIMARY KEY (write_id, parent_store, parent_record_id)
+);
+CREATE TABLE bindings (
+    write_id TEXT NOT NULL, store TEXT NOT NULL, record_id TEXT NOT NULL, ts INTEGER NOT NULL
+);
+INSERT INTO writes (write_id, content_hash, ts, store, source)
+    VALUES ('w1', 'h', 0, 'mem', 'user');
+INSERT INTO parents VALUES ('w1', 'mem', 'r0', 'in_prompt');
+"""
+
+
+def test_pre_46_ledger_raises_before_touching_file(path):
+    conn = raw(path)
+    conn.executescript(PRE_46_SCHEMA)
+    conn.close()
+    before = path.read_bytes()
+    with pytest.raises(LedgerSchemaError) as e:
+        Ledger(path)
+    msg = str(e.value)
+    assert "unversioned" in msg and f"version {SCHEMA_VERSION}" in msg and str(path) in msg
+    assert path.read_bytes() == before
+    tables = {r[0] for r in raw(path).execute("SELECT name FROM sqlite_master")}
+    assert "context_sets" not in tables
+    assert user_version(path) == 0
+
+
+def test_future_version_raises(path):
+    with Ledger(path):
+        pass
+    raw(path).execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+    with pytest.raises(LedgerSchemaError) as e:
+        Ledger(path)
+    msg = str(e.value)
+    assert f"schema version {SCHEMA_VERSION + 1}" in msg
+    assert f"uses version {SCHEMA_VERSION}" in msg
+    assert user_version(path) == SCHEMA_VERSION + 1
 
 
 def test_close_checkpoints_wal(path):
