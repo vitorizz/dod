@@ -55,7 +55,7 @@ Direct edits and deletions
     metadata-only update hashes the record's unchanged content. It is tagged
     ``agent_inference``: the method takes no source.
     ``forget``, ``reset`` and ``reset_all`` record a tombstone (reason
-    ``forget``, actor the current scope's agent and task, if any) for each
+    ``forget``, or ``excision`` when called by ``dod.excise``; actor the current scope's agent and task, if any) for each
     record they deleted. The storage API returns only a count, so the
     wrapped ``storage.delete``/``storage.reset`` lists the affected records
     before the call and records those gone after it: the given IDs for a
@@ -82,7 +82,13 @@ Quarantine
     the actions whose ``seq`` is past the last one applied
     (``Ledger.quarantine_log``), which covers quarantines from any
     connection. Each dropped result is counted per item; read the counts with
-    ``blocked_retrievals()``.
+    ``blocked_retrievals()`` (shared with every integration, in
+    ``dod.quarantine``).
+
+Excision
+    ``DeleteAdapter(memory)`` lets ``dod.excise`` delete records through the
+    instrumented ``forget(record_ids=[...])``, so each deletion is
+    tombstoned like any other ``forget``, with reason ``excision``.
 
 ``remember_many``
     Saves in the background and returns ``[]``. Each item is recorded as a
@@ -100,16 +106,20 @@ import functools
 import inspect
 import logging
 import sys
-import threading
-from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from dod import scope as _scope
 from dod.capture import Capture
-from dod.ledger import SOURCES, Item, Ledger
+from dod.excise import deletion_reason
+from dod.ledger import SOURCES
+from dod.quarantine import _blocked, blocked_retrievals, count_blocked  # noqa: F401
+from dod.quarantine import QuarantineCache
 from dod.scope import Key, _key, agent_task_scope
 
-__all__ = ["agent_task_scope", "blocked_retrievals", "install_task_scopes", "instrument"]
+__all__ = [
+    "DeleteAdapter", "agent_task_scope", "blocked_retrievals", "install_task_scopes",
+    "instrument",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -136,42 +146,6 @@ _in_prompt_callers: set = set()
 # Frames above the wrapper to search: covers MemoryScope/MemorySlice and
 # arecall delegating to recall.
 _CALLER_DEPTH = 4
-
-# (store, record_id) -> recall results dropped because it was quarantined.
-_blocked: "Counter[Item]" = Counter()
-_blocked_lock = threading.Lock()
-
-
-class _Quarantine:
-    """A ledger's quarantined set, updated when its quarantine ``seq`` moves.
-
-    Each call reads only the actions after the last ``seq`` applied (an
-    index seek; usually none), so a change costs its own rows, not a re-read
-    of every quarantined item.
-    """
-
-    __slots__ = ("ledger", "seq", "items", "lock")
-
-    def __init__(self, ledger: Ledger) -> None:
-        self.ledger = ledger
-        self.seq = 0
-        self.items: frozenset = frozenset()
-        self.lock = threading.Lock()
-
-    def current(self) -> frozenset:
-        with self.lock:
-            rows = self.ledger.quarantine_log(self.seq)
-            if rows:
-                items = set(self.items)
-                for _seq, store, record_id, action in rows:
-                    if action == "quarantine":
-                        items.add((store, record_id))
-                    else:
-                        items.discard((store, record_id))
-                self.items = frozenset(items)
-                self.seq = rows[-1][0]
-            return self.items
-
 
 class _Consolidation:
     """Storage calls observed during one ``remember``."""
@@ -224,7 +198,7 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
             f"{type(memory).__name__} has no _background_encode_batch to observe"
         )
     warned = []
-    quarantine = _Quarantine(capture._ledger)
+    quarantine = QuarantineCache(capture._ledger)
 
     @functools.wraps(orig_recall)
     def recall(*args, **kwargs):
@@ -235,8 +209,7 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
             if len(kept) != len(results):
                 dropped = [(store, m.record.id) for m in results
                            if (store, m.record.id) in blocked]
-                with _blocked_lock:
-                    _blocked.update(dropped)
+                count_blocked(dropped)
                 results = kept
         key = _key.get()
         if key is not None and results:
@@ -378,8 +351,8 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
                 if gone:
                     agent_id, session_id = _key.get() or (None, None)
                     try:
-                        capture.on_delete(store, gone, "forget", None, agent_id,
-                                          session_id)
+                        capture.on_delete(store, gone, deletion_reason(), None,
+                                          agent_id, session_id)
                     except Exception:
                         # The delete happened (or raised its own error, which
                         # must propagate unchanged): log, don't raise.
@@ -395,10 +368,18 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
     return memory
 
 
-def blocked_retrievals() -> Dict[Item, int]:
-    """Recall results dropped by quarantine since process start, per item."""
-    with _blocked_lock:
-        return dict(_blocked)
+class DeleteAdapter:
+    """Delete adapter for ``dod.excise``: deletes one record through the
+    instrumented ``forget``, which records its tombstone."""
+
+    def __init__(self, memory: Any) -> None:
+        if not getattr(getattr(memory, "forget", None), _MARK, False):
+            raise TypeError("memory must be instrumented with dod's crewai.instrument")
+        self.memory = memory
+
+    def delete(self, record_id: str) -> bool:
+        """Delete ``record_id``; return False if it wasn't in storage."""
+        return bool(self.memory.forget(record_ids=[record_id]))
 
 
 def install_task_scopes() -> None:
