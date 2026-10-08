@@ -41,6 +41,26 @@ labeled_for_conflict() {
         | .hit' > /dev/null
 }
 
+# Merge BASE into the PR branch in a temporary worktree (so .gitattributes merge
+# drivers apply) and push it. Same-repository branches only. Returns non-zero if
+# the merge or the push fails; leaves no worktree behind.
+merge_locally() {
+  local pr=$1 owner=$2 ref=$3 dir ok=1
+  [ "$owner" = "${REPO%%/*}" ] || { echo "#$pr is from a fork; not merging locally."; return 1; }
+  git fetch --quiet origin "pull/$pr/head" || return 1
+  dir=$(mktemp -d)
+  git worktree add --quiet --detach "$dir" FETCH_HEAD || { rm -rf "$dir"; return 1; }
+  if git -C "$dir" -c user.name="dod-update-branches" -c user.email="noreply@github.com" \
+       merge --quiet --no-edit "origin/$BASE" \
+     && git -C "$dir" push --quiet origin "HEAD:refs/heads/$ref"; then
+    ok=0
+  else
+    git -C "$dir" merge --abort 2>/dev/null || true
+  fi
+  git worktree remove --force "$dir"
+  return $ok
+}
+
 # Read PRs on fd 3 so gh calls in the loop can't consume the list from stdin.
 while IFS=$'\t' read -r -u 3 pr owner ref blocked; do
   # A conflict this workflow flagged may have been resolved since; clear the label if so.
@@ -68,10 +88,22 @@ while IFS=$'\t' read -r -u 3 pr owner ref blocked; do
     echo "#$pr is $behind behind but labeled needs-human; skipping."; continue
   fi
   echo "#$pr is $behind behind $BASE; updating."
-  if gh pr update-branch "$pr" --repo "$REPO"; then
+  if update_out=$(gh pr update-branch "$pr" --repo "$REPO" 2>&1); then
+    printf '%s\n' "$update_out"
     continue
   fi
+  printf '%s\n' "$update_out"
   check_conflicts "$pr"
+  if [ "$rc" -eq 0 ] && grep -qi 'conflict' <<< "$update_out"; then
+    # GitHub's server-side merge ignores .gitattributes merge drivers (union on
+    # docs/decisions.md), so it can report a conflict that a local merge resolves.
+    if merge_locally "$pr" "$owner" "$ref"; then
+      echo "#$pr merged with $BASE locally (GitHub's merge conflicted; .gitattributes resolved it)."
+      continue
+    fi
+    echo "::error::Updating #$pr failed, and merging it locally failed too; check the log above."
+    failed=1; continue
+  fi
   if [ "$rc" -ne 1 ]; then
     echo "::error::Updating #$pr failed, and it isn't a merge conflict; check the log above."
     failed=1; continue
