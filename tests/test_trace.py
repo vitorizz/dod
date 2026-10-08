@@ -348,3 +348,50 @@ def test_context_sets_query_like_per_write_edges(tmp_path, seed):
                     _norm_trace(trace(new, store, record_id, max_depth), new_idx)
                 assert _norm_blast(blast_radius(old, store, record_id, max_depth), old_idx) == \
                     _norm_blast(blast_radius(new, store, record_id, max_depth), new_idx)
+
+
+def test_shared_context_with_different_direct_parents_in_one_batch(tmp_path):
+    # Two writes in one batch share the context object but have their own
+    # direct parents, one overlapping the context with the other tag.
+    context = [("mem", "c1", "retrieved_in_scope"), ("pg", "c2", "in_prompt")]
+    batches = [
+        [dict(replaced=[], context=[], store="mem", record_id="c1")],  # write 0
+        [dict(replaced=[], context=[], store="pg", record_id="c2")],  # write 1
+        [
+            dict(  # write 2
+                replaced=[("mem", "c1", "in_prompt"), ("pg", "d0", "retrieved_in_scope")],
+                context=context, store="mem", record_id="a",
+            ),
+            dict(  # write 3
+                replaced=[("pg", "c2", "retrieved_in_scope"), ("mem", "d1", "in_prompt")],
+                context=context, store="pg", record_id="b",
+            ),
+        ],
+    ]
+    expected = [
+        # Write 2: c1 is in its direct parents as in_prompt, which beats the
+        # context's retrieved_in_scope.
+        (2, "mem", "c1", "in_prompt"),
+        (2, "pg", "c2", "in_prompt"),
+        (2, "pg", "d0", "retrieved_in_scope"),
+        # Write 3: c2 stays in_prompt from the context; c1 keeps the
+        # context's tag, unaffected by write 2's direct parent.
+        (3, "mem", "c1", "retrieved_in_scope"),
+        (3, "mem", "d1", "in_prompt"),
+        (3, "pg", "c2", "in_prompt"),
+    ]
+    with Ledger(tmp_path / "old.db") as old, Ledger(tmp_path / "new.db") as new:
+        old_idx = _build(old, batches, [], split=False)
+        new_idx = _build(new, batches, [], split=True)
+        assert _edges_by_write(old, old_idx) == expected
+        assert _edges_by_write(new, new_idx) == expected
+        assert (_count(new, "context_sets"), _count(new, "context_members")) == (1, 2)
+        assert _count(new, "direct_parents") == 4
+        for store, record_id in (("mem", "a"), ("pg", "b")):
+            r = trace(new, store, record_id)
+            assert _norm_trace(r, new_idx) == _norm_trace(trace(old, store, record_id), old_idx)
+            assert sorted(new_idx[w.write_id] for w in r.ancestors) == [0, 1]
+        for store, record_id in (("mem", "c1"), ("pg", "c2")):
+            r = blast_radius(new, store, record_id)
+            assert _norm_blast(r, new_idx) == _norm_blast(blast_radius(old, store, record_id), old_idx)
+            assert sorted(new_idx[w.write_id] for w in r.descendants) == [2, 3]

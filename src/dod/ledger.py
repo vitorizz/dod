@@ -373,7 +373,12 @@ class Ledger:
         tombstone_rows = [_tombstone_row(t, ts) for t in tombstones]
         with self._lock:
             conn = self._conn
-            conn.execute("BEGIN")
+            # IMMEDIATE takes the write lock up front (waiting via
+            # busy_timeout), so the context-set check below reads the latest
+            # state. A deferred BEGIN would read a snapshot, and if another
+            # connection committed the same set before our first INSERT, the
+            # upgrade fails with SQLITE_BUSY_SNAPSHOT, which is never retried.
+            conn.execute("BEGIN IMMEDIATE")
             try:
                 for set_hash, members in sets.items():
                     # Content-addressed and append-only: a set already

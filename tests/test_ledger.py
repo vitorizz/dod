@@ -616,3 +616,37 @@ def test_concurrent_appends(path, ledger):
     assert conn.execute("SELECT COUNT(*) FROM parents").fetchone()[0] == 4000
     seqs = [r[0] for r in conn.execute("SELECT seq FROM writes ORDER BY seq")]
     assert seqs == list(range(1, 4001))
+
+
+def test_two_ledgers_racing_on_the_same_new_context(path):
+    # Two connections on one file record the same new context set at once.
+    # Neither write may fail, and the set is stored once.
+    rounds = 200
+    barrier = threading.Barrier(2)
+    errors, wids = [], [[], []]
+
+    def context(i):
+        return [("mem", f"r{i}-a", "retrieved_in_scope"), ("pg", f"r{i}-b", "in_prompt")]
+
+    def worker(led, n):
+        try:
+            for i in range(rounds):
+                barrier.wait()
+                wids[n].append(write(led, context=context(i), agent_id=str(n)))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+            barrier.abort()
+
+    with Ledger(path) as a, Ledger(path) as b:
+        threads = [threading.Thread(target=worker, args=(led, n)) for n, led in enumerate((a, b))]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+    assert errors == []
+    assert count(path, "writes") == 2 * rounds
+    assert count(path, "context_sets") == rounds
+    assert count(path, "context_members") == 2 * rounds
+    for i, (wa, wb) in enumerate(zip(*wids)):
+        assert set_of(path, wa) == set_of(path, wb)
+        assert edges(path, wa) == edges(path, wb) == sorted(context(i))
