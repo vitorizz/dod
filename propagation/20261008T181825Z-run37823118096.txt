@@ -1,0 +1,41 @@
+model: anthropic/claude-sonnet-5-5  steps: 10  seeds: 1  code: 26950cf074f07cccb8b37d7f522b27003b4dc3bc
+ERROR:root:Anthropic API call failed: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'This API key is not scoped to a workspace, so this request must include the anthropic-workspace-id header with the ID of the workspace to use. Add the header, or use an API key that is scoped to a workspace.'}, 'request_id': None}
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/runner/work/dod/dod/experiments/propagation/run.py", line 196, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/runner/work/dod/dod/experiments/propagation/run.py", line 179, in main
+    runs = [run_one(c) for c in cfgs]
+            ^^^^^^^^^^
+  File "/home/runner/work/dod/dod/experiments/propagation/run.py", line 71, in run_one
+    r = scenario.run(cfg, d, ledger, agent)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/dod/dod/experiments/propagation/scenario.py", line 251, in run
+    value = agent.decide(topic, policy, [t for _, t in prompt])
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/dod/dod/experiments/propagation/scenario.py", line 175, in decide
+    reply = self.llm.call([{"role": "user", "content": (
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/crewai/llms/providers/anthropic/completion.py", line 437, in call
+    return self._handle_completion(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/crewai/llms/providers/anthropic/completion.py", line 1052, in _handle_completion
+    raise e from e
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/crewai/llms/providers/anthropic/completion.py", line 1046, in _handle_completion
+    response = self._get_sync_client().messages.create(**params)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/anthropic/_utils/_utils.py", line 294, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/anthropic/resources/messages/messages.py", line 1029, in create
+    return self._post(
+           ^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/anthropic/_base_client.py", line 1557, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/anthropic/_base_client.py", line 1222, in request
+    raise self._make_status_error_from_response(response) from None
+anthropic.BadRequestError: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'This API key is not scoped to a workspace, so this request must include the anthropic-workspace-id header with the ID of the workspace to use. Add the header, or use an API key that is scoped to a workspace.'}, 'request_id': None}
+llm mode: 1 run(s) x 10 steps = ~10 LLM calls to anthropic/claude-sonnet-5-5, one per step.
