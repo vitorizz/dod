@@ -348,6 +348,34 @@ def test_write_outside_scope_has_no_parents_and_warns_once(path, mem, caplog):
     assert len([r for r in caplog.records if "outside agent_task_scope" in r.message]) == 1
 
 
+class _Obj:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def test_finished_scopes_hold_no_context(cap, mem):
+    (a,) = mem.add("A")
+    mem.results["q"] = [a]
+    for i in range(3):
+        with agent_task_scope("agent", f"task-{i}"):
+            mem.recall("q")
+            assert cap._context
+    assert cap._context == {}
+    # Same through the PRE_STEP / POST_STEP hooks, including nested tasks.
+    agent = _Obj(id="agent")
+    outer, inner = _Obj(id="outer"), _Obj(id="inner")
+    integ._enter_task_scope(_Obj(kind="task", agent=agent, task=outer))
+    mem.recall("q")
+    integ._enter_task_scope(_Obj(kind="task", agent=agent, task=inner))
+    mem.recall("q")
+    integ._exit_task_scope(_Obj(kind="task", task=inner))
+    assert integ._key.get() == ("agent", "outer")
+    assert set(cap._context) == {("agent", "outer")}
+    integ._exit_task_scope(_Obj(kind="task", task=outer))
+    assert integ._key.get() is None
+    assert cap._context == {}
+
+
 # --- Concurrency -------------------------------------------------------------
 
 

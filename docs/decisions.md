@@ -43,4 +43,5 @@ Append new decisions at the bottom. One line of why each.
 - **CrewAI `remember_many` raises `NotImplementedError` until it is captured.** A loud failure beats a silent lineage gap. It means a crew's automatic post-task save (which crewai logs and swallows) doesn't run while instrumented. (2026-10-07, #13)
 - **CrewAI writes record `agent_id` = agent ID and `session_id` = task ID.** The task is the unit of context, and once the write has happened the IDs can't be reconstructed. (2026-10-07, #13)
 - **Blast radius scans the ledger once and walks in memory; no index added.** Without a parent→child index, a per-level query or recursive CTE rescans `parents` at every level, and a CTE without a visited set enumerates paths, which explodes on diamonds. One scan each of `bindings`, `parents` and `writes` is O(ledger), ~65–100 ms (hardware-dependent) for a root reaching all 10k writes. (2026-10-07, #15)
+- **CrewAI scopes clear their context on exit, not just on entry.** Task IDs are fresh UUIDs, so a key is never re-entered and an entry-only reset would hold every finished task's context for the life of the process. (2026-10-08, #13)
 

@@ -24,9 +24,10 @@ Scoping
     thread or coroutine, around ``agent.execute_task``. A ``TaskStartedEvent``
     handler can't enter the scope: the event bus runs it in a thread pool on a
     copy of the context, so the key never reaches the agent. A task callback
-    runs after the task, too late. If a task raises, ``POST_STEP`` is not
-    dispatched and that task's key stays current in its thread until the next
-    task starts.
+    runs after the task, too late. A key's context is cleared when its scope
+    ends, so finished tasks hold no memory. If a task raises, ``POST_STEP`` is
+    not dispatched: that task's key stays current in its thread, and its
+    context stays held, until the next task starts.
 
 Edge tags
     Recall results are ``retrieved_in_scope`` unless the caller (looked up a
@@ -82,8 +83,8 @@ _key: "contextvars.ContextVar[Optional[Key]]" = contextvars.ContextVar(
 _observed: "contextvars.ContextVar[Optional[_Consolidation]]" = contextvars.ContextVar(
     "dod_crewai_consolidation", default=None
 )
-# (task_id, previous key) per task scope entered by the PRE_STEP hook.
-_hook_stack: "contextvars.ContextVar[Tuple[Tuple[str, Optional[Key]], ...]]" = (
+# (key, previous key) per task scope entered by the PRE_STEP hook.
+_hook_stack: "contextvars.ContextVar[Tuple[Tuple[Key, Optional[Key]], ...]]" = (
     contextvars.ContextVar("dod_crewai_hook_stack", default=())
 )
 
@@ -194,8 +195,8 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
 def agent_task_scope(agent_id: Any, task_id: Any) -> Iterator[Key]:
     """Make ``(agent_id, task_id)`` the current context key.
 
-    Resets the key's context on entry and restores the previous key on exit,
-    so scopes nest.
+    Resets the key's context on entry and on exit, so a finished scope holds
+    no memory, and restores the previous key on exit, so scopes nest.
     """
     key = (str(agent_id), str(task_id))
     _reset(key)
@@ -204,6 +205,7 @@ def agent_task_scope(agent_id: Any, task_id: Any) -> Iterator[Key]:
         yield key
     finally:
         _key.reset(token)
+        _reset(key)
 
 
 def install_task_scopes() -> None:
@@ -225,7 +227,7 @@ def _enter_task_scope(ctx: Any) -> None:
         return None
     key = (str(agent.id), str(task.id))
     _reset(key)
-    _hook_stack.set(_hook_stack.get() + ((key[1], _key.get()),))
+    _hook_stack.set(_hook_stack.get() + ((key, _key.get()),))
     _key.set(key)
     return None  # a non-None return would replace the step's payload
 
@@ -236,9 +238,11 @@ def _exit_task_scope(ctx: Any) -> None:
         return None
     stack, task_id = _hook_stack.get(), str(task.id)
     for i in range(len(stack) - 1, -1, -1):
-        if stack[i][0] == task_id:
-            _key.set(stack[i][1])
+        key, previous = stack[i]
+        if key[1] == task_id:
+            _key.set(previous)
             _hook_stack.set(stack[:i])
+            _reset(key)  # the task is done; free its context
             break
     return None
 
