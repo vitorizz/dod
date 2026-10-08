@@ -83,6 +83,13 @@ Quarantine
 Excision
     ``DeleteAdapter(tool)`` lets ``dod.excise`` delete files through the
     instrumented ``execute``, so each deletion is tombstoned.
+
+Reconciliation
+    ``ReconcileAdapter(tool)`` lets ``dod.reconcile`` list every file under
+    ``/memories`` through the tool's own ``view``. It checks existence only
+    (the recorded hash is a command's payload, not the file), so a file
+    edited outside capture is not detected; one created or deleted outside
+    it is.
 """
 
 import asyncio
@@ -216,6 +223,76 @@ class DeleteAdapter:
             return False
         await self.tool.execute(_delete_command(record_id))
         return True
+
+
+class ReconcileAdapter:
+    """Store adapter for ``dod.reconcile``: lists every memory file through
+    the tool's own (uninstrumented) ``view``, so nothing is recorded as a
+    retrieval and quarantined files are seen too.
+
+    Existence only: the hash capture records for a file is the payload of
+    the command that wrote it, not the file, so file content can't be
+    compared with the ledger, and ``modified`` is never reported here.
+    Unlike capture's probes, any error other than the tool's not-found
+    ``ToolError`` propagates: a store that can't be read is never reported
+    as empty. An async tool runs each listing in a new event loop
+    (``asyncio.run``), so it can't be used from inside a running loop.
+    """
+
+    def __init__(self, tool: Any) -> None:
+        if not isinstance(tool, (BetaAbstractMemoryTool, BetaAsyncAbstractMemoryTool)):
+            raise TypeError("tool must be an anthropic memory tool")
+        self.tool = tool
+
+    def scan(self) -> List[Tuple[str, None]]:
+        if isinstance(self.tool, BetaAsyncAbstractMemoryTool):
+            files = asyncio.run(self._ascan())
+        else:
+            files = self._walk(lambda p: _strict_view(self.tool.view, p))
+        return [(f, None) for f in files]
+
+    async def _ascan(self) -> List[str]:
+        out: List[str] = []
+        todo, seen = [_ROOT], set()
+        while todo:
+            p = todo.pop()
+            if p not in seen:
+                seen.add(p)
+                todo += _expand(p, await _astrict_view(self.tool.view, p), True, out)
+        return list(dict.fromkeys(out))
+
+    @staticmethod
+    def _walk(view: Callable) -> List[str]:
+        out: List[str] = []
+        todo, seen = [_ROOT], set()
+        while todo:
+            p = todo.pop()
+            if p not in seen:
+                seen.add(p)
+                todo += _expand(p, view(p), True, out)
+        return list(dict.fromkeys(out))
+
+    def get(self, record_id: str) -> Tuple[bool, None]:
+        if isinstance(self.tool, BetaAsyncAbstractMemoryTool):
+            result = asyncio.run(_astrict_view(self.tool.view, record_id))
+        else:
+            result = _strict_view(self.tool.view, record_id)
+        return _classify(record_id, result)[0] == "file", None
+
+
+def _strict_view(view: Callable, path: str) -> Any:
+    """``view`` of ``path``, or None if the tool says it doesn't exist."""
+    try:
+        return view(_view_command(path))
+    except ToolError:
+        return None
+
+
+async def _astrict_view(view: Callable, path: str) -> Any:
+    try:
+        return await view(_view_command(path))
+    except ToolError:
+        return None
 
 
 class _Recorder:
