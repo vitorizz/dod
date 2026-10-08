@@ -14,6 +14,12 @@ view joins both into one row per edge, ``(write_id, parent_store,
 parent_record_id, tag)``; where an item is in both, the direct row carries
 the merged tag and the context row is hidden.
 
+``child_edges`` is the same edges keyed by parent item, for walking forward.
+It is derived, never written on the append path: the background thread fills
+it after the fact, and ``child_edges_filled`` records how far (the highest
+write ``seq`` indexed). Queries read writes past that watermark from the
+source tables.
+
 A file records its schema version (``PRAGMA user_version``); opening one at
 another version, or an unversioned file with tables, raises
 ``LedgerSchemaError`` before anything is read or written.
@@ -37,7 +43,7 @@ Parent = Tuple[str, str, str]
 # Stored in the file's ``PRAGMA user_version``. Bump it on any change to
 # tables, columns, triggers or views, and ship a migration (or a "recreate"
 # note in docs/decisions.md) with the bump.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: child_edges + child_edges_filled (#34)
 
 
 class LedgerSchemaError(Exception):
@@ -45,8 +51,37 @@ class LedgerSchemaError(Exception):
 
 _TABLES = (
     "writes", "direct_parents", "context_sets", "context_members", "bindings",
-    "tombstones", "quarantine",
+    "tombstones", "quarantine", "child_edges", "child_edges_filled",
 )
+
+# The parents view's edges for writes with lo < seq <= hi, as
+# (parent_store, parent_record_id, seq, write_id, tag). Spelled out per branch
+# so both seek writes by seq.
+_EDGES_BETWEEN = """
+SELECT d.parent_store, d.parent_record_id, w.seq, w.write_id, d.tag
+FROM writes w JOIN direct_parents d ON d.write_id = w.write_id
+WHERE w.seq > :lo AND w.seq <= :hi
+UNION ALL
+SELECT m.store, m.record_id, w.seq, w.write_id, m.tag
+FROM writes w JOIN context_members m ON m.set_hash = w.context_set
+WHERE w.seq > :lo AND w.seq <= :hi AND NOT EXISTS (
+    SELECT 1 FROM direct_parents d
+    WHERE d.write_id = w.write_id AND d.parent_store = m.store
+        AND d.parent_record_id = m.record_id
+)
+"""
+
+# Most edges and writes one fill transaction indexes.
+_FILL_MAX = 500
+# Each edge lands on a random leaf of child_edges, so a 500-edge fill holds
+# the write lock for milliseconds. The background fill sizes its batches to
+# hold it about _FILL_TARGET seconds, so an append that arrives mid-fill waits
+# well under the 1 ms bar.
+_FILL_TARGET = 0.0002
+# Pause between fill transactions: at least _FILL_MIN_PAUSE seconds, and
+# while writes are arriving, _FILL_BUSY_FACTOR times the last one's lock time.
+_FILL_MIN_PAUSE = 0.0005
+_FILL_BUSY_FACTOR = 100
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS writes (
@@ -119,6 +154,19 @@ CREATE TABLE IF NOT EXISTS quarantine (
     reason    TEXT,
     actor     TEXT
 );
+CREATE TABLE IF NOT EXISTS child_edges (
+    parent_store     TEXT NOT NULL,
+    parent_record_id TEXT NOT NULL,
+    seq              INTEGER NOT NULL,
+    write_id         TEXT NOT NULL,
+    tag              TEXT NOT NULL
+        CHECK (tag IN ('in_prompt', 'retrieved_in_scope')),
+    PRIMARY KEY (parent_store, parent_record_id, seq)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS child_edges_filled (
+    upto INTEGER PRIMARY KEY,
+    ts   INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS bindings_by_write ON bindings (write_id);
 CREATE INDEX IF NOT EXISTS bindings_by_record ON bindings (store, record_id);
 CREATE INDEX IF NOT EXISTS tombstones_by_record ON tombstones (store, record_id);
@@ -158,8 +206,14 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
         ("bindings", ""),
         ("tombstones", ""),
         ("quarantine", ""),
+        ("child_edges_filled", ""),
     )
-)
+) + """
+CREATE TRIGGER IF NOT EXISTS child_edges_no_replace BEFORE INSERT ON child_edges
+WHEN EXISTS (SELECT 1 FROM child_edges WHERE parent_store = NEW.parent_store
+    AND parent_record_id = NEW.parent_record_id AND seq = NEW.seq)
+BEGIN SELECT RAISE(ABORT, 'child_edges is append-only'); END;
+"""
 
 
 # The last write ID issued in this process. Taken inside a Ledger's _lock
@@ -274,6 +328,11 @@ class Ledger:
     checkpoint on its own connection every ``checkpoint_interval`` seconds.
     ``close()`` stops it and runs a final checkpoint.
 
+    The same thread fills ``child_edges`` in short transactions sized to hold
+    the write lock ~0.2 ms each. While writes are arriving it pauses ~100x
+    that between them, so appends rarely wait behind one; when they stop, it
+    catches up at full speed.
+
     Safe to share across threads: appends are serialized with a lock.
     Quarantine reads use a third connection, so they never wait behind an
     append's commit (WAL readers don't block on the writer).
@@ -318,6 +377,7 @@ class Ledger:
             str(path), isolation_level=None, check_same_thread=False
         )
         self._ckpt_conn.execute("PRAGMA busy_timeout=5000")
+        self._ckpt_lock = threading.Lock()
         self._stop = threading.Event()
         self._ckpt_thread = threading.Thread(
             target=self._checkpoint_loop,
@@ -328,11 +388,92 @@ class Ledger:
         self._ckpt_thread.start()
 
     def _checkpoint_loop(self, interval: float) -> None:
-        while not self._stop.wait(interval):
+        next_ckpt = time.monotonic() + interval
+        pause = interval
+        last_seq = None
+        limit = 16
+        while not self._stop.wait(pause):
+            now = time.monotonic()
+            if now >= next_ckpt:
+                next_ckpt = now + interval
+                try:
+                    with self._ckpt_lock:
+                        self._ckpt_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass  # retried next interval
+            seq = last_seq
             try:
-                self._ckpt_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                with self._ckpt_lock:
+                    seq = self._ckpt_conn.execute("SELECT max(seq) FROM writes").fetchone()[0]
+                held = self._fill_child_edges(limit)
             except sqlite3.Error:
-                pass  # retried next interval
+                held = None  # retried next interval
+            if held is None:
+                pause = max(0.0, next_ckpt - time.monotonic())
+            else:
+                fit = int(limit * _FILL_TARGET / max(held, 1e-6))
+                limit = max(1, min(_FILL_MAX, 2 * limit, fit))
+                # While writes are arriving, hold the write lock a small
+                # fraction of the time, so few appends ever wait behind a
+                # fill; when they stop, catch up at full speed.
+                busy = last_seq is not None and seq != last_seq
+                pause = max(_FILL_MIN_PAUSE, held * (_FILL_BUSY_FACTOR if busy else 1))
+            last_seq = seq
+
+    def _fill_child_edges(self, limit: int = _FILL_MAX) -> Optional[float]:
+        """Index the next writes past the watermark into ``child_edges``.
+
+        At most ``limit`` writes and (unless one write has more) ``limit``
+        edges, in one short transaction that also appends the new watermark.
+        Idempotent across connections and processes: the transaction
+        re-reads the watermark under the write lock and does nothing if
+        another connection moved it first. Returns the seconds the write
+        lock was held, or ``None`` if every write is already indexed.
+        """
+        with self._ckpt_lock:
+            conn = self._ckpt_conn
+            (wm,) = conn.execute(
+                "SELECT coalesce(max(upto), 0) FROM child_edges_filled"
+            ).fetchone()
+            # Upper bound on each write's edges (a direct parent that is
+            # also in the context set is one edge, counted twice here).
+            rows = conn.execute(
+                "SELECT w.seq,"
+                " (SELECT count(*) FROM direct_parents d WHERE d.write_id = w.write_id)"
+                " + coalesce((SELECT size FROM context_sets s"
+                " WHERE s.set_hash = w.context_set), 0)"
+                " FROM writes w WHERE w.seq > ? ORDER BY w.seq LIMIT ?",
+                (wm, limit),
+            ).fetchall()
+        if not rows:
+            return None
+        hi, total = rows[0][0], 0
+        for seq, n in rows:
+            if total and total + n > limit:
+                break
+            hi, total = seq, total + n
+        with self._lock:
+            start = time.perf_counter()
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                (now_wm,) = conn.execute(
+                    "SELECT coalesce(max(upto), 0) FROM child_edges_filled"
+                ).fetchone()
+                if now_wm != wm:
+                    conn.execute("ROLLBACK")  # filled by another connection
+                    return time.perf_counter() - start
+                conn.execute(
+                    f"INSERT INTO child_edges {_EDGES_BETWEEN}", {"lo": wm, "hi": hi}
+                )
+                conn.execute(
+                    "INSERT INTO child_edges_filled VALUES (?, ?)", (hi, time.time_ns())
+                )
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+            return time.perf_counter() - start
 
     def append_write(
         self,

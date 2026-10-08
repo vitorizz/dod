@@ -3,16 +3,17 @@
 A parent edge names a memory item ``(store, record_id)``; ``bindings`` map it
 to the write(s) that produced it, so walks cross stores. An item bound to
 several writes resolves to all of them (over-include rather than miss a
-parent). Edges are read from the ledger's ``parents`` view, which expands each
-write's context set and direct parents into one row per edge, so queries
-never see how they are stored.
+parent). ``trace`` reads edges from the ledger's ``parents`` view, which
+expands each write's context set and direct parents into one row per edge, so
+queries never see how they are stored. ``blast_radius`` reads the same edges
+by parent from ``child_edges`` plus the not-yet-indexed tail.
 """
 
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
-from .ledger import TAGS, Ledger
+from .ledger import _EDGES_BETWEEN, TAGS, Ledger
 
 # Stay under SQLITE_MAX_VARIABLE_NUMBER on old builds (999).
 _CHUNK = 900
@@ -294,35 +295,79 @@ def blast_radius(
     appears once at its minimum depth and cycles terminate. ``max_depth``
     (``None`` for no limit) bounds descendant depth; 1 is direct children.
 
-    There is no parent->child index (kept off the append path), so
-    ``bindings``, ``parents``, ``writes`` and ``tombstones`` are each read in
-    one scan and the walk runs in memory, rather than rescanning ``parents``
-    at every level. A deleted item is still walked: its tombstone is reported
-    in ``deleted``, and what was derived from it stays in the result.
+    Breadth-first over the ledger's ``child_edges`` index, one indexed query
+    per level over the current frontier, so only the reached subgraph is
+    read. The ledger's background thread fills that index; writes it hasn't
+    reached yet (past its watermark) are read from the source tables once,
+    in memory, and merged, so results are always current. A deleted item is
+    still walked: its tombstone is reported in ``deleted``, and what was
+    derived from it stays in the result.
 
     Raises ``KeyError`` if the item has no binding in the ledger.
     """
     if max_depth is not None and max_depth < 0:
         raise ValueError("max_depth must be >= 0")
 
-    start_ids: List[str] = []
-    items_of: Dict[str, List[Tuple[str, str]]] = {}
-    for wid, s, r in _run(ledger, "SELECT write_id, store, record_id FROM bindings", ()):
-        bound = items_of.setdefault(wid, [])
-        if (s, r) in bound:
-            continue  # the same binding appended twice
-        bound.append((s, r))
-        if s == store and r == record_id:
-            start_ids.append(wid)
+    start_ids = sorted(
+        {r[0] for r in _run(
+            ledger,
+            "SELECT write_id FROM bindings WHERE store = ? AND record_id = ?",
+            (store, record_id),
+        )}
+    )
     if not start_ids:
         raise KeyError((store, record_id))
-    start_ids.sort()
 
-    children: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
-    for child, pstore, prec, tag in _run(
-        ledger, "SELECT write_id, parent_store, parent_record_id, tag FROM parents", ()
+    # Edges at or below the watermark come from child_edges, the rest from
+    # the tail, so a fill committing mid-walk changes nothing.
+    ((wm,),) = _run(ledger, "SELECT coalesce(max(upto), 0) FROM child_edges_filled", ())
+    tail: Dict[Item, List[Tuple[int, str, str]]] = {}
+    for pstore, prec, seq, child, tag in _run(
+        ledger, _EDGES_BETWEEN, {"lo": wm, "hi": 2**63 - 1}
     ):
-        children.setdefault((pstore, prec), []).append((child, tag))
+        tail.setdefault((pstore, prec), []).append((seq, child, tag))
+    for edges_of in tail.values():
+        edges_of.sort()
+
+    items_of: Dict[str, List[Item]] = {}
+    # Each item's (child write_id, tag), in child seq order: indexed edges
+    # first, then the tail, whose seqs are all above the watermark.
+    children: Dict[Item, List[Tuple[str, str]]] = {}
+
+    def expand(write_ids: List[str]) -> None:
+        """Load the bindings of ``write_ids`` and their items' children."""
+        new = [w for w in write_ids if w not in items_of]
+        for w in new:
+            items_of[w] = []
+        for chunk in _chunks(new):
+            for wid, s, r in _run(
+                ledger,
+                "SELECT write_id, store, record_id FROM bindings"
+                f" WHERE write_id IN ({_marks(len(chunk))}) ORDER BY rowid",
+                chunk,
+            ):
+                if (s, r) not in items_of[wid]:  # the same binding appended twice
+                    items_of[wid].append((s, r))
+        by_store: Dict[str, Set[str]] = {}
+        fresh: List[Item] = []
+        for w in new:
+            for item in items_of[w]:
+                if item not in children:
+                    children[item] = []
+                    by_store.setdefault(item[0], set()).add(item[1])
+                    fresh.append(item)
+        for s, ids in sorted(by_store.items()):
+            for chunk in _chunks(sorted(ids)):
+                for prec, child, tag in _run(
+                    ledger,
+                    "SELECT parent_record_id, write_id, tag FROM child_edges"
+                    f" WHERE parent_store = ? AND parent_record_id IN ({_marks(len(chunk))})"
+                    " AND seq <= ? ORDER BY parent_record_id, seq",
+                    [s, *chunk, wm],
+                ):
+                    children[(s, prec)].append((child, tag))
+        for item in fresh:
+            children[item] += [(child, tag) for _, child, tag in tail.get(item, ())]
 
     seen: Dict[str, int] = dict.fromkeys(start_ids, 0)
     edges: List[Edge] = []
@@ -331,10 +376,11 @@ def blast_radius(
 
     while frontier and (max_depth is None or depth < max_depth):
         depth += 1
+        expand(frontier)
         nxt: List[str] = []
         for wid in frontier:
-            for item in items_of.get(wid, ()):
-                for child, tag in children.get(item, ()):
+            for item in items_of[wid]:
+                for child, tag in children[item]:
                     edges.append(Edge(child, item[0], item[1], tag, wid))
                     if child not in seen:
                         seen[child] = depth
@@ -343,24 +389,27 @@ def blast_radius(
 
     # Stopped by max_depth: the last level wasn't expanded, so check whether
     # it has children the walk hasn't reached.
+    expand(frontier)
     truncated = any(
         child not in seen
         for wid in frontier
-        for item in items_of.get(wid, ())
-        for child, _ in children.get(item, ())
+        for item in items_of[wid]
+        for child, _ in children[item]
     )
-    reached = [
-        TracedWrite(r[1], seen[r[1]], r[0], *r[2:])
-        for r in _run(ledger, f"SELECT {_WRITE_COLS} FROM writes ORDER BY seq", ())
-        if r[1] in seen
-    ]
-    descendants = sorted((w for w in reached if w.depth), key=lambda w: w.depth)
-    bindings = {w: sorted(items_of.get(w, ())) for w in seen}
-    in_result = {(store, record_id)}.union(*bindings.values())
-    deleted = _group(
-        r for r in _run(ledger, f"SELECT {_TOMBSTONE_COLS} FROM tombstones", ())
-        if (r[1], r[2]) in in_result
-    )
+    reached = []
+    for chunk in _chunks(list(seen)):
+        reached += [
+            TracedWrite(r[1], seen[r[1]], r[0], *r[2:])
+            for r in _run(
+                ledger,
+                f"SELECT {_WRITE_COLS} FROM writes WHERE write_id IN ({_marks(len(chunk))})",
+                chunk,
+            )
+        ]
+    reached.sort(key=lambda w: (w.depth, w.seq))
+    descendants = [w for w in reached if w.depth]
+    bindings = {w: sorted(items_of[w]) for w in seen}
+    deleted = _tombstones(ledger, {(store, record_id)}.union(*bindings.values()))
     return BlastResult(
         store=store,
         record_id=record_id,
