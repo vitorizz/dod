@@ -10,14 +10,15 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 SOURCES = ("user", "tool", "document", "agent_inference")
 TAGS = ("in_prompt", "retrieved_in_scope")
 
+Item = Tuple[str, str]
 Parent = Tuple[str, str, str]
 
-_TABLES = ("writes", "parents", "bindings")
+_TABLES = ("writes", "parents", "bindings", "quarantine")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS writes (
@@ -44,6 +45,15 @@ CREATE TABLE IF NOT EXISTS bindings (
     store     TEXT NOT NULL,
     record_id TEXT NOT NULL,
     ts        INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarantine (
+    seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        INTEGER NOT NULL,
+    store     TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    action    TEXT NOT NULL CHECK (action IN ('quarantine', 'release')),
+    reason    TEXT,
+    actor     TEXT
 );
 CREATE INDEX IF NOT EXISTS bindings_by_write ON bindings (write_id);
 CREATE INDEX IF NOT EXISTS bindings_by_record ON bindings (store, record_id);
@@ -72,6 +82,7 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
             " AND parent_record_id = NEW.parent_record_id)",
         ),
         ("bindings", ""),
+        ("quarantine", ""),
     )
 )
 
@@ -138,6 +149,8 @@ class Ledger:
     ``close()`` stops it and runs a final checkpoint.
 
     Safe to share across threads: appends are serialized with a lock.
+    Quarantine reads use a third connection, so they never wait behind an
+    append's commit (WAL readers don't block on the writer).
     """
 
     def __init__(self, path: Union[str, os.PathLike], checkpoint_interval: float = 1.0):
@@ -152,6 +165,12 @@ class Ledger:
         self._conn.execute("PRAGMA recursive_triggers=ON")
         self._conn.execute("PRAGMA wal_autocheckpoint=0")
         self._conn.executescript(_SCHEMA)
+
+        self._read_lock = threading.Lock()
+        self._read_conn = sqlite3.connect(
+            str(path), isolation_level=None, check_same_thread=False
+        )
+        self._read_conn.execute("PRAGMA busy_timeout=5000")
 
         self._ckpt_conn = sqlite3.connect(
             str(path), isolation_level=None, check_same_thread=False
@@ -263,12 +282,81 @@ class Ledger:
                 (write_id, store, record_id, time.time_ns()),
             )
 
+    def quarantine(
+        self, items: Iterable[Item], reason: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> None:
+        """Quarantine ``(store, record_id)`` items in one transaction.
+
+        Nothing is deleted: instrumented stores stop returning the items until
+        they are released. ``reason`` and ``actor`` are stored as given; keep
+        memory content out of them.
+        """
+        self._append_quarantine(items, "quarantine", reason, actor)
+
+    def release(
+        self, items: Iterable[Item], reason: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> None:
+        """Release quarantined ``(store, record_id)`` items in one transaction."""
+        self._append_quarantine(items, "release", reason, actor)
+
+    def quarantined(self) -> Set[Item]:
+        """Items whose latest quarantine action, by ``seq``, is ``quarantine``."""
+        with self._read_lock:
+            # SQLite takes bare columns from the row max() picked.
+            rows = self._read_conn.execute(
+                "SELECT store, record_id, action, max(seq) FROM quarantine"
+                " GROUP BY store, record_id"
+            ).fetchall()
+        return {(s, r) for s, r, action, _ in rows if action == "quarantine"}
+
+    def quarantine_log(self, after: int = 0) -> List[Tuple[int, str, str, str]]:
+        """Quarantine actions with ``seq > after``, as ``(seq, store,
+        record_id, action)`` in ``seq`` order.
+
+        Lets a cache of ``quarantined()`` catch up on what changed since the
+        last ``seq`` it saw, from any connection, without re-reading the table.
+        """
+        with self._read_lock:
+            return self._read_conn.execute(
+                "SELECT seq, store, record_id, action FROM quarantine"
+                " WHERE seq > ? ORDER BY seq",
+                (after,),
+            ).fetchall()
+
+    def _append_quarantine(self, items, action, reason, actor) -> None:
+        ts = time.time_ns()
+        rows = []
+        for item in items:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                raise ValueError(f"item must be (store, record_id), got {item!r}")
+            store, record_id = item
+            rows.append((ts, store, record_id, action, reason, actor))
+        if not rows:
+            return
+        with self._lock:
+            conn = self._conn
+            conn.execute("BEGIN")
+            try:
+                conn.executemany(
+                    "INSERT INTO quarantine (ts, store, record_id, action, reason, actor)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+
     def close(self) -> None:
         if self._stop.is_set():
             return
         self._stop.set()
         self._ckpt_thread.join()
         self._ckpt_conn.close()
+        with self._read_lock:
+            self._read_conn.close()
         with self._lock:
             self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             self._conn.close()

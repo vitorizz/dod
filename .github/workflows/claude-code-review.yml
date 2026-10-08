@@ -63,4 +63,4 @@ jobs:
             Post specific issues as inline comments with `mcp__github_inline_comment__create_inline_comment`,
             then one summary with `gh pr comment` listing blocking vs. non-blocking findings.
             If there are no issues, say so explicitly and state what you checked.
-          claude_args: '--model claude-sonnet-5 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(pip install *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *)"'
+          claude_args: '--model claude-sonnet-5-5 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(pip install *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *)"'
