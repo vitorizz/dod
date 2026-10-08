@@ -78,7 +78,8 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 
 ## Test commands
 ```bash
-pip install -e ".[dev]"              # install package + test deps
+pip install -e ".[dev,crewai,langgraph]"   # what CI runs: package, test deps, real integrations
+pip install -e ".[dev]"              # core only (CI also runs this, as test-core)
 pytest -q                            # full suite, including p99 < 1 ms capture benchmarks
 pytest -q tests/test_*_perf.py -s    # benchmarks only, printing p50/p99
 pip install -e ".[dev,crewai]"       # add the real CrewAI dependency
@@ -87,7 +88,7 @@ pip install -e ".[dev,langgraph]"    # add LangGraph (InMemoryStore needs no ser
 pytest -q -m langgraph               # LangGraph + cross-store tests (skipped without langgraph)
 ```
 In agent runs, use these exact forms. Don't create a venv or call pip through `python -m`: they are not in the allowed tools and get denied. (`python -m pytest` is allowed.)
-CrewAI unit tests use a stub mirroring the pinned `Memory` signatures, so CI doesn't need crewai. Tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore`, are marked `langgraph`, and skip without it.
+CI's `test` job installs both integrations, so every test runs; `test-core` runs without them to keep the core dependency-free. CrewAI unit tests use a stub mirroring the pinned `Memory` signatures; tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore`, are marked `langgraph`, and skip without it.
 
 ## Workflow
 1. Every change starts as an issue using the agent-task template (Goal / Acceptance criteria / Files involved), sized for one PR. New issues go on the board as Backlog with Priority and Size.
