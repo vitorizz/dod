@@ -235,35 +235,59 @@ def test_deleted_items_reported_and_still_walked(ledger):
     assert blast_radius(ledger, "mem", "c").deleted == {}
 
 
-def test_blast_radius_10k_ledger_from_root_under_100ms(path):
+def build_10k(ledger):
     rng = random.Random(10_000)
-    with Ledger(path) as ledger:
-        put(ledger, "mem", "r0", source="user")
-        for i in range(1, 10_000):
-            parents = {
-                ("mem" if j % 2 == 0 else "pg", f"r{j}", "in_prompt")
-                for j in rng.sample(range(max(0, i - 200), i), min(i, 2))
-            }
-            put(ledger, "mem" if i % 2 == 0 else "pg", f"r{i}", parents)
+    put(ledger, "mem", "r0", source="user")
+    for i in range(1, 10_000):
+        parents = {
+            ("mem" if j % 2 == 0 else "pg", f"r{j}", "in_prompt")
+            for j in rng.sample(range(max(0, i - 200), i), min(i, 2))
+        }
+        put(ledger, "mem" if i % 2 == 0 else "pg", f"r{i}", parents)
 
-        blast_radius(ledger, "mem", "r0")  # warm the page cache
-        # Best of several runs: the walk is O(ledger), so the minimum is its
-        # cost and the rest is scheduler noise. The background fill catches up
-        # once the appends stop, so the best run walks the lineage index:
-        # measured min ~50-85 ms on a dev machine (~150 ms with nothing
-        # indexed, all from the source tables).
-        samples = []
-        for _ in range(5):
-            start = time.perf_counter()
-            r = blast_radius(ledger, "mem", "r0")
-            samples.append((time.perf_counter() - start) * 1e3)
-        elapsed_ms = min(samples)
-        print(
-            f"blast radius from root over 10k writes: {len(r.descendants)} descendants, "
-            f"min {elapsed_ms:.2f} ms, median {sorted(samples)[2]:.2f} ms"
-        )
+
+def best_of_5(ledger):
+    """Min and median ms of five root walks (after one to warm the cache).
+    The walk is O(ledger), so the minimum is its cost and the rest is
+    scheduler noise."""
+    blast_radius(ledger, "mem", "r0")
+    samples = []
+    for _ in range(5):
+        start = time.perf_counter()
+        r = blast_radius(ledger, "mem", "r0")
+        samples.append((time.perf_counter() - start) * 1e3)
+    return min(samples), sorted(samples)[2], r
+
+
+def test_blast_radius_10k_ledger_from_root_under_100ms(path):
+    with Ledger(path) as ledger:
+        build_10k(ledger)
+        # The background fill catches up once the appends stop.
+        deadline = time.monotonic() + 10
+        while watermark(path) < max_seq(path) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        caught_up = 10 - (deadline - time.monotonic())
+        assert watermark(path) == max_seq(path)
+        elapsed_ms, median, r = best_of_5(ledger)
+        print(f"blast radius from root over 10k writes: {len(r.descendants)} descendants,"
+              f" min {elapsed_ms:.2f} ms, median {median:.2f} ms (indexed {caught_up:.2f} s"
+              " after the last append)")
     assert len(r.descendants) > 9_000
+    # Measured min ~50-85 ms on a dev machine.
     assert elapsed_ms < 100 * SCALE
+
+
+def test_blast_radius_10k_ledger_unindexed_under_250ms(path):
+    # Nothing indexed: the whole walk reads the source tables (what a walk
+    # sees of writes the background fill hasn't reached yet).
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        build_10k(ledger)
+        elapsed_ms, median, r = best_of_5(ledger)
+        print(f"blast radius from root over 10k unindexed writes: min {elapsed_ms:.2f} ms,"
+              f" median {median:.2f} ms")
+    assert len(r.descendants) > 9_000
+    # Measured min ~150-160 ms on a dev machine and on CI.
+    assert elapsed_ms < 250 * SCALE
 
 
 # --- Indexed walk (integer lineage index) ---------------------------------

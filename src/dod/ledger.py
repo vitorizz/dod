@@ -770,6 +770,9 @@ class Ledger:
         next_ckpt = time.monotonic() + interval
         pause = min(interval, _FILL_IDLE_POLL) if index else interval
         last_change, seen = -1e9, None
+        # While writes are arriving, the next fill waits until this time, so
+        # fills take at most _FILL_BUSY_SHARE of the time.
+        rest_until = 0.0
         while not self._stop.wait(pause):
             if time.monotonic() >= next_ckpt:
                 next_ckpt = time.monotonic() + interval
@@ -793,20 +796,26 @@ class Ledger:
                         last_change = time.monotonic()
                     seen = now
                 busy = time.monotonic() - last_change < _FILL_QUIET
+                if busy and time.monotonic() < rest_until:
+                    # Resting, but look again within _FILL_QUIET: once writes
+                    # stop, catch up right away instead of resting it out.
+                    pause = min(rest_until - time.monotonic(), _FILL_QUIET, until_ckpt)
+                    continue
                 limit = _FILL_BUSY_MAX if busy else _FILL_MAX
                 began = time.monotonic()
                 filled = self._fill_index(limit)
                 spent = time.monotonic() - began
             except sqlite3.Error:
-                busy, filled = False, None  # retried next round
+                busy, filled, spent = False, None, 0.0  # retried next round
             if busy:
-                # Writes are arriving: stay under _FILL_BUSY_SHARE of the time.
-                pause = spent * (1 / _FILL_BUSY_SHARE - 1) if filled else _FILL_IDLE_POLL
+                rest_until = time.monotonic() + spent * (1 / _FILL_BUSY_SHARE - 1)
+                pause = min(rest_until - time.monotonic(), _FILL_QUIET) if filled else (
+                    _FILL_IDLE_POLL)
             elif filled and filled >= limit:
                 pause = 0.0  # idle and a full batch behind: catch up
             else:
                 pause = _FILL_IDLE_POLL
-            pause = min(pause, until_ckpt)
+            pause = max(0.0, min(pause, until_ckpt))
 
     def _index_watermarks(self, conn: sqlite3.Connection) -> Tuple[int, int, int]:
         """``(writes_upto, sets_upto, bindings_upto)``: the last write
