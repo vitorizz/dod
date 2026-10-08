@@ -1,0 +1,96 @@
+name: Propagation experiment
+
+# Runs experiments/propagation with a real model. Manual only: it spends API
+# credits. The key comes from the ANTHROPIC_API_KEY repository secret and
+# only this job's run step sees it. Results (JSON plus the printed table)
+# are committed to the experiment-results branch, one file pair per run.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "LiteLLM model string"
+        required: true
+        default: "anthropic/claude-sonnet-5-5"
+      steps:
+        description: "Steps per run (one model call each)"
+        required: true
+        default: "60"
+      seeds:
+        description: "Runs, with seeds 0..N-1"
+        required: true
+        default: "3"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: propagation-experiment
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check inputs and secret
+        env:
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          STEPS: ${{ inputs.steps }}
+          SEEDS: ${{ inputs.seeds }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error::Add the ANTHROPIC_API_KEY repository secret first."
+            exit 1
+          fi
+          [[ "$STEPS" =~ ^[0-9]+$ && "$STEPS" -ge 1 && "$STEPS" -le 500 ]] \
+            || { echo "::error::steps must be 1..500"; exit 1; }
+          [[ "$SEEDS" =~ ^[0-9]+$ && "$SEEDS" -ge 1 && "$SEEDS" -le 10 ]] \
+            || { echo "::error::seeds must be 1..10"; exit 1; }
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[crewai,langgraph]"
+
+      - name: Run the experiment
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CREWAI_DISABLE_TELEMETRY: "true"
+          OTEL_SDK_DISABLED: "true"
+          MODEL: ${{ inputs.model }}
+          STEPS: ${{ inputs.steps }}
+          SEEDS: ${{ inputs.seeds }}
+        run: |
+          name="$(date -u +%Y%m%dT%H%M%SZ)-run${GITHUB_RUN_ID}"
+          mkdir -p "$RUNNER_TEMP/out"
+          {
+            echo "model: $MODEL  steps: $STEPS  seeds: $SEEDS  code: $GITHUB_SHA"
+            python -m experiments.propagation.run --mode llm --model "$MODEL" \
+              --steps "$STEPS" --sweep --sweep-seeds "$SEEDS" --yes \
+              --out "$RUNNER_TEMP/out/$name.json"
+          } 2>&1 | tee "$RUNNER_TEMP/out/$name.txt"
+          echo "RUN_NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Commit results to experiment-results
+        env:
+          MODEL: ${{ inputs.model }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch origin experiment-results; then
+            git checkout -B experiment-results FETCH_HEAD
+          else
+            git checkout --orphan experiment-results
+            git rm -rfq .
+          fi
+          mkdir -p propagation
+          cp "$RUNNER_TEMP/out/$RUN_NAME".* propagation/
+          git add propagation
+          git commit -qm "Propagation experiment $RUN_NAME ($MODEL, code $GITHUB_SHA)"
+          git push origin experiment-results
