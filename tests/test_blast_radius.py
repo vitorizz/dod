@@ -5,9 +5,10 @@ import time
 from collections import Counter
 
 import pytest
+from perf import SCALE
 
 from dod.ledger import Ledger
-from dod.query import Edge, blast_radius, trace
+from dod.query import Edge, TracedWrite, blast_radius, trace
 
 
 @pytest.fixture
@@ -91,6 +92,35 @@ def test_unknown_item_raises_keyerror(ledger):
         blast_radius(ledger, "mem", "missing")
     with pytest.raises(KeyError):
         blast_radius(ledger, "other", "a")
+
+
+def test_results_are_named_tuples(ledger):
+    # Rows become Edge and TracedWrite in C, without their generated __new__.
+    a = put(ledger, "mem", "a", source="user")
+    b = put(ledger, "pg", "b", [("mem", "a", "in_prompt")])
+    r = blast_radius(ledger, "mem", "a")
+    (edge,) = r.edges
+    assert type(edge) is Edge and edge.child_write_id == b and edge.parent_write_id == a
+    w = r.descendants[0]
+    assert type(w) is TracedWrite
+    assert (w.write_id, w.depth, w.store, w.source) == (b, 1, "pg", "agent_inference")
+
+
+@pytest.mark.parametrize("where", [":memory:", ""])
+def test_in_memory_ledger_walks_on_its_connection(where):
+    # No file to open a second connection on: the walk holds the ledger's
+    # lock, and drops its temp tables so the next walk (and append) works.
+    with Ledger(where) as led:
+        a = put(led, "mem", "a", source="user")
+        b = put(led, "pg", "b", [("mem", "a", "in_prompt")])
+        c = put(led, "mem", "c", [("pg", "b", "in_prompt")])
+        with pytest.raises(KeyError):
+            blast_radius(led, "mem", "missing")
+        assert depths(blast_radius(led, "mem", "a")) == {b: 1, c: 2}
+        r = blast_radius(led, "mem", "a", max_depth=1)
+        assert depths(r) == {b: 1} and r.truncated
+        d = put(led, "pg", "d", [("mem", "c", "in_prompt")])
+        assert depths(blast_radius(led, "mem", "a")) == {b: 1, c: 2, d: 3}
 
 
 def test_item_nothing_derives_from_is_empty(ledger):
@@ -216,7 +246,9 @@ def test_blast_radius_10k_ledger_from_root_under_250ms(path):
 
         blast_radius(ledger, "mem", "r0")  # warm the page cache
         # Best of several runs: the walk is O(ledger), so the minimum is its
-        # cost and the rest is scheduler noise. Measured ~65-100 ms by hardware.
+        # cost and the rest is scheduler noise. Measured min under 100 to ~130 ms on CI,
+        # ~125-185 ms on dev machines. The index fill lags a burst of appends,
+        # so most of this walk reads the not-yet-indexed tail.
         samples = []
         for _ in range(5):
             start = time.perf_counter()
@@ -228,7 +260,7 @@ def test_blast_radius_10k_ledger_from_root_under_250ms(path):
             f"min {elapsed_ms:.2f} ms, median {sorted(samples)[2]:.2f} ms"
         )
     assert len(r.descendants) > 9_000
-    assert elapsed_ms < 250
+    assert elapsed_ms < 250 * SCALE
 
 
 # --- Indexed walk (child_edges) -------------------------------------------
@@ -540,5 +572,8 @@ def test_blast_radius_100k_ledger_indexed(path):
               f" full scan min {scan_ms:.0f} ms")
         assert len(r.descendants) == 100_000
         assert comparable(r) == expected
-    assert small_ms < 50
+    assert small_ms < 50 * SCALE
+    # Measured min ~1.1-1.4 s on CI, ~1.35-1.5 s on dev machines, ~0.65-0.75x
+    # the full scan.
+    assert root_ms < 2_500 * SCALE
     assert root_ms < 2 * scan_ms

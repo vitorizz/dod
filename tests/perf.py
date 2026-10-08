@@ -1,6 +1,30 @@
-"""Shared benchmark helpers for capture-path overhead tests."""
+"""Shared benchmark helpers for capture-path overhead tests.
 
+The bars are set for CI. On a slower machine, ``DOD_PERF_SCALE=2 pytest -q``
+divides every measured time by 2 before the test compares it to its bar,
+which is the same as doubling every bar. CI never sets it.
+"""
+
+import math
+import os
 import time
+
+
+def _scale():
+    raw = os.environ.get("DOD_PERF_SCALE", "").strip()
+    if not raw:
+        return 1.0
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not (0 < value < math.inf):
+        raise ValueError(f"DOD_PERF_SCALE must be a positive number, got {raw!r}")
+    return value
+
+
+SCALE = _scale()
+"""``DOD_PERF_SCALE``, default 1.0: multiplies every benchmark bar."""
 
 
 def _rounds(fn, n, warmup, pause_s, rounds, inner):
@@ -27,7 +51,8 @@ def _p50_p99(samples):
 
 def _report(name, r, rounds, n, p50, p99):
     tag = f" round {r + 1}/{rounds}" if rounds > 1 else ""
-    print(f"{name}{tag}: p50={p50:.4f} ms p99={p99:.4f} ms (n={n})")
+    scaled = f", p99/DOD_PERF_SCALE={p99 / SCALE:.4f} ms" if SCALE != 1 else ""
+    print(f"{name}{tag}: p50={p50:.4f} ms p99={p99:.4f} ms (n={n}{scaled})")
 
 
 def p99_ms(fn, n=10_000, warmup=1_000, label=None, pause_s=0.0, rounds=1):
@@ -41,7 +66,8 @@ def p99_ms(fn, n=10_000, warmup=1_000, label=None, pause_s=0.0, rounds=1):
     one round hit by a burst of disk or scheduler noise on a shared CI runner
     doesn't decide the result.
 
-    Prints p50 and p99 (visible with ``pytest -s``) and returns p99 in ms.
+    Prints p50 and p99 (visible with ``pytest -s``) and returns p99 in ms,
+    divided by ``SCALE``.
     """
     name = label or getattr(fn, "__name__", "fn")
     p99s = []
@@ -49,7 +75,7 @@ def p99_ms(fn, n=10_000, warmup=1_000, label=None, pause_s=0.0, rounds=1):
         p50, p99 = _p50_p99(samples)
         _report(name, r, rounds, n, p50, p99)
         p99s.append(p99)
-    return sorted(p99s)[rounds // 2]
+    return sorted(p99s)[rounds // 2] / SCALE
 
 
 def split_p99_ms(fn, inner, n=10_000, warmup=1_000, labels=("outer", "inner"),
@@ -58,7 +84,8 @@ def split_p99_ms(fn, inner, n=10_000, warmup=1_000, labels=("outer", "inner"),
 
     ``fn`` must append to the list ``inner`` the nanoseconds spent in one
     nested part of each call, exactly once per call. Returns the median
-    round's p99 of the rest of the call and of the nested part, in ms.
+    round's p99 of the rest of the call and of the nested part, in ms,
+    each divided by ``SCALE``.
     """
     outer_p99s, inner_p99s = [], []
     for r, samples in enumerate(_rounds(fn, n, warmup, pause_s, rounds, inner)):
@@ -68,4 +95,4 @@ def split_p99_ms(fn, inner, n=10_000, warmup=1_000, labels=("outer", "inner"),
             p50, p99 = _p50_p99(part)
             _report(label, r, rounds, n, p50, p99)
             p99s.append(p99)
-    return sorted(outer_p99s)[rounds // 2], sorted(inner_p99s)[rounds // 2]
+    return sorted(outer_p99s)[rounds // 2] / SCALE, sorted(inner_p99s)[rounds // 2] / SCALE
