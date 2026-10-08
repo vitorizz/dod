@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+import dod.ledger as ledger_mod
 from dod.ledger import TAGS, Ledger
 from dod.query import Edge, UnrecordedAncestor, blast_radius, trace
 
@@ -395,3 +396,64 @@ def test_shared_context_with_different_direct_parents_in_one_batch(tmp_path):
             r = blast_radius(new, store, record_id)
             assert _norm_blast(r, new_idx) == _norm_blast(blast_radius(old, store, record_id), old_idx)
             assert sorted(new_idx[w.write_id] for w in r.descendants) == [2, 3]
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_delta_context_sets_query_like_per_write_edges(tmp_path, seed, monkeypatch):
+    # Scopes as Capture keeps them (insertion order, in_prompt upgrading a
+    # tag in place), each with its own agent, so contexts grow as deltas.
+    # A short chain makes them restart with full sets mid-scope too.
+    monkeypatch.setattr(ledger_mod, "_CHAIN_STEPS", 8)
+    rng = random.Random(seed)
+    scopes = [{} for _ in range(4)]
+    batches = []
+    for _ in range(150):
+        n = rng.randrange(len(scopes))
+        ctx = scopes[n]
+        if rng.random() < 0.05:
+            ctx.clear()
+        for _ in range(rng.choice([0, 1, 1, 2, 4])):
+            key, tag = (rng.choice(STORES), f"r{rng.randrange(80)}"), rng.choice(TAGS)
+            if ctx.get(key) != "in_prompt":
+                ctx[key] = tag
+        shared = [(s, r, t) for (s, r), t in ctx.items()]
+        batches.append([
+            dict(
+                replaced=[(rng.choice(STORES), f"r{rng.randrange(80)}", "in_prompt")
+                          for _ in range(rng.choice([0, 0, 0, 1]))],
+                context=shared, store=rng.choice(STORES), agent_id=f"a{n}",
+                record_id=None if rng.random() < 0.1 else f"r{rng.randrange(80)}",
+            )
+            for _ in range(rng.choice([1, 1, 2]))
+        ])
+
+    def build(ledger, split):
+        ids = []
+        for batch in batches:
+            ids += ledger.append_batch([
+                dict(
+                    content=str(len(ids) + i), store=w["store"], source="agent_inference",
+                    agent_id=w["agent_id"], record_id=w["record_id"],
+                    parents=w["replaced"] if split else w["replaced"] + w["context"],
+                    context=w["context"] if split else (),
+                )
+                for i, w in enumerate(batch)
+            ])
+        return {wid: i for i, wid in enumerate(ids)}
+
+    with Ledger(tmp_path / "old.db") as old, Ledger(tmp_path / "new.db") as new:
+        old_idx, new_idx = build(old, split=False), build(new, split=True)
+        deltas, upgraded = new._conn.execute(
+            "SELECT SUM(base IS NOT NULL), SUM(upgrades) FROM context_sets"
+        ).fetchone()
+        assert deltas > 0 and upgraded > 0
+        assert _edges_by_write(old, old_idx) == _edges_by_write(new, new_idx)
+        while new._fill_child_edges() is not None:  # blast_radius through child_edges
+            pass
+        bound = sorted({(w["store"], w["record_id"]) for b in batches for w in b
+                        if w["record_id"] is not None})
+        for store, record_id in rng.sample(bound, 20):
+            assert _norm_trace(trace(old, store, record_id), old_idx) == \
+                _norm_trace(trace(new, store, record_id), new_idx)
+            assert _norm_blast(blast_radius(old, store, record_id), old_idx) == \
+                _norm_blast(blast_radius(new, store, record_id), new_idx)

@@ -30,25 +30,37 @@ def test_append_write_p99_under_1ms(tmp_path, n_parents, as_):
     assert p99 < 1.0
 
 
-def test_append_write_growing_context_p99_under_1ms(tmp_path):
-    # Worst case for context sets: the context grows before every write, so
-    # each write stores a new set of ~50 members (as many rows as before
-    # context sets). Retrievals keep it at 50 by sliding the window.
+def _growing_context_p99(tmp_path, size):
+    # A long session that retrieves before every write: the context grows by
+    # one item per write, so each write references a new set. At ``size``
+    # items the scope ends and the next one starts empty.
     counter = iter(range(10**9))
+    context = []
     with Ledger(tmp_path / "ledger.db") as ledger:
 
         def append():
-            i = next(counter)
+            if len(context) == size:
+                context.clear()
+            context.append(("mem", f"rec-{next(counter)}", "retrieved_in_scope"))
             ledger.append_write(
                 content="the user prefers window seats",
                 store="mem",
                 source="agent_inference",
-                context=[("mem", f"rec-{j}", "retrieved_in_scope") for j in range(i, i + 50)],
+                agent_id="a1",
+                session_id="s1",
+                context=list(context),
             )
 
-        p99 = p99_ms(append, n=5_000, rounds=3,
-                     label="append_write (50 context, new set every write, on-disk)")
-    assert p99 < 1.0
+        return p99_ms(append, n=5_000, rounds=3,
+                      label=f"append_write (context growing to {size}, new set every write)")
+
+
+def test_append_write_growing_context_p99_under_half_ms(tmp_path):
+    assert _growing_context_p99(tmp_path, 50) < 0.5
+
+
+def test_append_write_growing_500_context_p99_under_1ms(tmp_path):
+    assert _growing_context_p99(tmp_path, 500) < 1.0
 
 
 @pytest.mark.parametrize("as_", ["parents", "context"])

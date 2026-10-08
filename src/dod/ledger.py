@@ -14,6 +14,13 @@ view joins both into one row per edge, ``(write_id, parent_store,
 parent_record_id, tag)``; where an item is in both, the direct row carries
 the merged tag and the context row is hidden.
 
+A context that grew is stored as a delta: a base set plus the members added
+or upgraded to ``in_prompt`` since it. ``context_chain`` lists, per set, the
+sets whose ``context_members`` rows make it up (itself included). Bases are
+picked Fenwick-style by ``step`` (deltas since the last full set), so a chain
+has at most ``log2(_CHAIN_STEPS) + 1`` parts and a full set is re-stored
+every ``_CHAIN_STEPS`` steps.
+
 ``child_edges`` is the same edges keyed by parent item, for walking forward.
 It is derived, never written on the append path: the background thread fills
 it after the fact, and ``child_edges_filled`` records how far (the highest
@@ -26,11 +33,13 @@ another version, or an unversioned file with tables, raises
 """
 
 import hashlib
+import itertools
 import json
 import os
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 SOURCES = ("user", "tool", "document", "agent_inference")
@@ -43,32 +52,51 @@ Parent = Tuple[str, str, str]
 # Stored in the file's ``PRAGMA user_version``. Bump it on any change to
 # tables, columns, triggers or views, and ship a migration (or a "recreate"
 # note in docs/decisions.md) with the bump.
-SCHEMA_VERSION = 2  # 2: child_edges + child_edges_filled (#34)
+SCHEMA_VERSION = 3  # 3: delta context sets (#52); 2: child_edges (#34)
+
+# A context set's chain restarts with a full set every _CHAIN_STEPS steps, so
+# chains have at most log2(_CHAIN_STEPS) + 1 = 13 parts.
+_CHAIN_STEPS = 4096
+# Recent context sets kept in memory per (agent_id, session_id), as bases for
+# the next grown context. Each holds its members, so this bounds memory.
+_CHAIN_HINTS = 256
 
 
 class LedgerSchemaError(Exception):
     """A ledger file's schema version differs from this library's."""
 
 _TABLES = (
-    "writes", "direct_parents", "context_sets", "context_members", "bindings",
-    "tombstones", "quarantine", "child_edges", "child_edges_filled",
+    "writes", "direct_parents", "context_sets", "context_members", "context_chain",
+    "bindings", "tombstones", "quarantine", "child_edges", "child_edges_filled",
 )
+
+# Context edges of writes ``w``: every member row of every part of the
+# write's set, except a direct parent's (which carries the merged tag) and a
+# retrieved_in_scope row that a later part upgraded to in_prompt.
+_CONTEXT_EDGES = """
+FROM writes w JOIN context_sets s ON s.set_hash = w.context_set
+JOIN context_chain c ON c.set_hash = w.context_set
+JOIN context_members m ON m.set_hash = c.part
+WHERE NOT EXISTS (
+    SELECT 1 FROM direct_parents d
+    WHERE d.write_id = w.write_id AND d.parent_store = m.store
+        AND d.parent_record_id = m.record_id
+) AND (m.tag = 'in_prompt' OR s.upgrades = 0 OR NOT EXISTS (
+    SELECT 1 FROM context_chain c2 JOIN context_members m2 ON m2.set_hash = c2.part
+    WHERE c2.set_hash = w.context_set AND m2.store = m.store
+        AND m2.record_id = m.record_id AND m2.tag = 'in_prompt'
+))"""
 
 # The parents view's edges for writes with lo < seq <= hi, as
 # (parent_store, parent_record_id, seq, write_id, tag). Spelled out per branch
 # so both seek writes by seq.
-_EDGES_BETWEEN = """
+_EDGES_BETWEEN = f"""
 SELECT d.parent_store, d.parent_record_id, w.seq, w.write_id, d.tag
 FROM writes w JOIN direct_parents d ON d.write_id = w.write_id
 WHERE w.seq > :lo AND w.seq <= :hi
 UNION ALL
-SELECT m.store, m.record_id, w.seq, w.write_id, m.tag
-FROM writes w JOIN context_members m ON m.set_hash = w.context_set
-WHERE w.seq > :lo AND w.seq <= :hi AND NOT EXISTS (
-    SELECT 1 FROM direct_parents d
-    WHERE d.write_id = w.write_id AND d.parent_store = m.store
-        AND d.parent_record_id = m.record_id
-)
+SELECT m.store, m.record_id, w.seq, w.write_id, m.tag{_CONTEXT_EDGES}
+    AND w.seq > :lo AND w.seq <= :hi
 """
 
 # Most edges and writes one fill transaction indexes.
@@ -100,8 +128,16 @@ CREATE TABLE IF NOT EXISTS context_sets (
     seq      INTEGER PRIMARY KEY AUTOINCREMENT,
     set_hash TEXT NOT NULL UNIQUE,
     size     INTEGER NOT NULL,
-    ts       INTEGER NOT NULL
+    ts       INTEGER NOT NULL,
+    base     TEXT REFERENCES context_sets (set_hash),
+    step     INTEGER NOT NULL,
+    upgrades INTEGER NOT NULL CHECK (upgrades IN (0, 1))
 );
+CREATE TABLE IF NOT EXISTS context_chain (
+    set_hash TEXT NOT NULL REFERENCES context_sets (set_hash),
+    part     TEXT NOT NULL REFERENCES context_sets (set_hash),
+    PRIMARY KEY (set_hash, part)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS context_members (
     set_hash  TEXT NOT NULL REFERENCES context_sets (set_hash),
     store     TEXT NOT NULL,
@@ -121,13 +157,7 @@ CREATE TABLE IF NOT EXISTS direct_parents (
 CREATE VIEW IF NOT EXISTS parents (write_id, parent_store, parent_record_id, tag) AS
 SELECT write_id, parent_store, parent_record_id, tag FROM direct_parents
 UNION ALL
-SELECT w.write_id, m.store, m.record_id, m.tag
-FROM writes w JOIN context_members m ON m.set_hash = w.context_set
-WHERE NOT EXISTS (
-    SELECT 1 FROM direct_parents d
-    WHERE d.write_id = w.write_id AND d.parent_store = m.store
-        AND d.parent_record_id = m.record_id
-);
+SELECT w.write_id, m.store, m.record_id, m.tag""" + _CONTEXT_EDGES + """;
 CREATE TABLE IF NOT EXISTS bindings (
     write_id  TEXT NOT NULL REFERENCES writes (write_id),
     store     TEXT NOT NULL,
@@ -213,6 +243,10 @@ CREATE TRIGGER IF NOT EXISTS child_edges_no_replace BEFORE INSERT ON child_edges
 WHEN EXISTS (SELECT 1 FROM child_edges WHERE parent_store = NEW.parent_store
     AND parent_record_id = NEW.parent_record_id AND seq = NEW.seq)
 BEGIN SELECT RAISE(ABORT, 'child_edges is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS context_chain_no_replace BEFORE INSERT ON context_chain
+WHEN EXISTS (SELECT 1 FROM context_chain WHERE set_hash = NEW.set_hash
+    AND part = NEW.part)
+BEGIN SELECT RAISE(ABORT, 'context_chain is append-only'); END;
 """
 
 
@@ -287,20 +321,106 @@ def _dedupe_parents(parents: Iterable[Parent]) -> list:
     return [(s, r, t) for (s, r), t in merged.items()]
 
 
-def _context_set(context: Iterable[Parent]) -> Tuple[Optional[str], list]:
+# A read context: (the input as a list, or None if it can't be reused;
+# set_hash; members as {(store, record_id): tag}; sorted member keys).
+_Read = Tuple[Optional[list], Optional[str], dict, list]
+
+
+def _context_set(context: Iterable[Parent], prev: Optional[_Read] = None) -> _Read:
     """Deduped ``context`` members and their content address.
 
     The address is the sha256 of the sorted members, tags included, so the
-    same context always maps to the same set, and a grown or re-tagged
-    context to a new one. An empty context has no set (``None``).
+    same context always maps to the same set (however it is stored), and a
+    grown or re-tagged context to a new one. An empty context has no set
+    (``None``).
+
+    A scope's context grows by appending, so when ``context`` starts with
+    ``prev``'s input only the rest is read. Inputs with a non-str ID aren't
+    reused, since an equal ID of another type (``1`` and ``1.0``) is stored
+    as a different string.
     """
-    # Keyed as stored: the TEXT columns store a non-str ID as its str().
-    members = sorted(_dedupe_parents(context), key=lambda m: (str(m[0]), str(m[1])))
-    if not members:
-        return None, []
-    key = [(str(s), str(r), t) for s, r, t in members]
-    digest = hashlib.sha256(json.dumps(key, separators=(",", ":")).encode("utf-8"))
-    return digest.hexdigest(), members
+    items = list(context)
+    reusable = prev is not None and prev[0] is not None
+    n = len(prev[0]) if reusable else 0
+    if reusable and len(items) >= n and items[:n] == prev[0]:
+        if len(items) == n:
+            return prev
+        _, _, merged, keys = prev
+        merged, tail = merged.copy(), items[n:]
+    else:
+        merged, keys, tail = {}, [], items
+    added = []
+    for p in tail:
+        if p.__class__ is not tuple and not isinstance(p, (tuple, list)) or len(p) != 3:
+            raise ValueError(f"parent must be (store, record_id, tag), got {p!r}")
+        s, r, t = p
+        if t not in TAGS:
+            raise ValueError(f"unknown parent tag {t!r}; expected one of {TAGS}")
+        if s.__class__ is not str or r.__class__ is not str:
+            # Keyed as stored: the TEXT columns store a non-str ID as its str().
+            s, r, items = str(s), str(r), None
+        key = (s, r)
+        if key not in merged:
+            added.append(key)
+            merged[key] = t
+        elif t == "in_prompt":
+            merged[key] = t
+    if not merged:
+        return items, None, {}, []
+    if added:
+        keys = sorted(keys + added)
+    tags = [merged[k] for k in keys]
+    # Fields joined by NUL: unambiguous when no ID contains one, which the
+    # count proves; otherwise JSON.
+    blob = "\0".join(itertools.chain.from_iterable(keys))
+    if blob.count("\0") == 2 * len(keys) - 1:
+        blob = "\0" + blob + "\0" + "\0".join(tags)
+    else:
+        blob = _ENCODER.encode([keys, tags])
+    return items, hashlib.sha256(blob.encode("utf-8")).hexdigest(), merged, keys
+
+
+_ENCODER = json.JSONEncoder(separators=(",", ":"), check_circular=False)
+
+# A chain of context sets, oldest first: (step, set_hash, members it stores,
+# whether the chain upgrades any member). The first is a full set at step 0;
+# each later one is a delta over the last earlier one at its Fenwick base step.
+_Chain = Tuple[Tuple[int, str, dict, bool], ...]
+
+
+def _covers(members: dict, last: dict) -> bool:
+    """Whether ``members`` hold every member of ``last``, with the same tag
+    or upgraded to ``in_prompt``."""
+    if last.items() <= members.items():
+        return True
+    return all(members.get(k) in (t, "in_prompt") for k, t in last.items())
+
+
+def _grow(hint: Optional[Tuple[_Chain, dict]], set_hash: str, members: dict) -> _Chain:
+    """The chain storing new set ``set_hash`` (``members``): a delta over the
+    hint's chain (and its last set's members) where those are a subset, else
+    a full set.
+
+    The base of step ``n`` is step ``n & (n - 1)`` (``n`` with its lowest set
+    bit cleared), so a set's chain has one part per set bit of its step, and
+    step ``n`` stores the members added in the last ``n & -n`` steps.
+    """
+    if hint:
+        chain, last = hint
+        step = chain[-1][0] + 1
+        if step < _CHAIN_STEPS and _covers(members, last):
+            prefix = tuple(part for part in chain if part[0] <= step & (step - 1))
+            base: dict = {}
+            for _, _, stored, _ in prefix:
+                base.update(stored)  # a later part only upgrades a tag
+            # Added members, and members whose tag was upgraded.
+            delta = {k: members[k] for k in members.keys() - base.keys()}
+            upgrades = prefix[-1][3]
+            if not base.items() <= members.items():
+                upgrades = True
+                delta.update((k, "in_prompt") for k, t in base.items() if members[k] != t)
+            return prefix + ((step, set_hash, delta, upgrades),)
+    return ((0, set_hash, members, False),)
 
 
 def _tombstone_row(t: dict, ts: int) -> tuple:
@@ -340,6 +460,13 @@ class Ledger:
 
     def __init__(self, path: Union[str, os.PathLike], checkpoint_interval: float = 1.0):
         self._lock = threading.Lock()
+        # (agent_id, session_id) -> (chain, members) of the last context set
+        # this Ledger stored for it, most recently used last. Guarded by _lock.
+        self._chains: "OrderedDict[tuple, Tuple[_Chain, dict]]" = OrderedDict()
+        # (agent_id, session_id) -> the last context read for it, so a grown
+        # context reads only its new items.
+        self._reads_lock = threading.Lock()
+        self._reads: "OrderedDict[tuple, _Read]" = OrderedDict()
         self._conn = conn = sqlite3.connect(
             str(path), isolation_level=None, check_same_thread=False
         )
@@ -531,10 +658,11 @@ class Ledger:
         """
         # Everything but the write IDs is prepared outside the lock.
         prepared, binding_rows = [], []
-        # id(context) -> (context, set_hash, members, tags): writes in one
-        # batch usually pass the same context object, so hash it once.
+        # id(context) -> (context, set_hash, members): writes in one batch
+        # usually pass the same context object, so hash it once.
         contexts = {}
-        sets = {}  # set_hash -> members, for sets this batch references
+        # set_hash -> (members, chain hint key), for sets this batch references
+        sets = {}
         ts = time.time_ns()
         for w in writes:
             source = w["source"]
@@ -544,13 +672,21 @@ class Ledger:
             if isinstance(content, str):
                 content = content.encode("utf-8")
             context = w.get("context", ())
+            key = (w.get("agent_id"), w.get("session_id"))
             if id(context) not in contexts:
-                set_hash, members = _context_set(context)
-                tags = {(str(s), str(r)): t for s, r, t in members}
-                contexts[id(context)] = (context, set_hash, members, tags)
-            _, set_hash, members, tags = contexts[id(context)]
-            if set_hash is not None:
-                sets[set_hash] = members
+                with self._reads_lock:
+                    prev = self._reads.get(key)
+                read = _context_set(context, prev)
+                if read[0] is not None:
+                    with self._reads_lock:
+                        self._reads[key] = read
+                        self._reads.move_to_end(key)
+                        if len(self._reads) > _CHAIN_HINTS:
+                            self._reads.popitem(last=False)
+                contexts[id(context)] = (context, read[1], read[2])
+            _, set_hash, tags = contexts[id(context)]
+            if set_hash is not None and set_hash not in sets:
+                sets[set_hash] = (tags, key)
             row = (
                 hashlib.sha256(content).hexdigest(), ts, w["store"],
                 w.get("agent_id"), w.get("session_id"), source, set_hash,
@@ -588,38 +724,58 @@ class Ledger:
             # connection committed the same set before our first INSERT, the
             # upgrade fails with SQLITE_BUSY_SNAPSHOT, which is never retried.
             conn.execute("BEGIN IMMEDIATE")
+            hints = {}  # chains this batch stored, by hint key
             try:
-                for set_hash, members in sets.items():
+                for set_hash, (members, key) in sets.items():
                     # Content-addressed and append-only: a set already
                     # recorded (by any connection) is referenced, not rewritten.
                     if conn.execute(
                         "SELECT 1 FROM context_sets WHERE set_hash = ?", (set_hash,)
                     ).fetchone():
                         continue
+                    # Only chains this Ledger stored are hints, so the parts
+                    # in memory are exactly the parts in the file.
+                    chain = _grow(hints.get(key) or self._chains.get(key), set_hash, members)
+                    hints[key] = (chain, members)
+                    step, _, stored, upgrades = chain[-1]
                     conn.execute(
-                        "INSERT INTO context_sets (set_hash, size, ts) VALUES (?, ?, ?)",
-                        (set_hash, len(members), ts),
+                        "INSERT INTO context_sets (set_hash, size, ts, base, step, upgrades)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (set_hash, len(members), ts, chain[-2][1] if step else None,
+                         step, int(upgrades)),
                     )
                     conn.executemany(
                         "INSERT INTO context_members VALUES (?, ?, ?, ?)",
-                        [(set_hash, s, r, t) for s, r, t in members],
+                        [(set_hash, s, r, t) for (s, r), t in stored.items()],
+                    )
+                    conn.executemany(
+                        "INSERT INTO context_chain VALUES (?, ?)",
+                        [(set_hash, part[1]) for part in chain],
                     )
                 conn.executemany(
                     "INSERT INTO writes (write_id, content_hash, ts, store, agent_id,"
                     " session_id, source, context_set) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     write_rows,
                 )
-                conn.executemany("INSERT INTO direct_parents VALUES (?, ?, ?, ?)", parent_rows)
-                conn.executemany("INSERT INTO bindings VALUES (?, ?, ?, ?)", binding_rows)
-                conn.executemany(
-                    "INSERT INTO tombstones (store, record_id, ts, reason, write_id,"
-                    " agent_id, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    tombstone_rows,
-                )
+                if parent_rows:
+                    conn.executemany("INSERT INTO direct_parents VALUES (?, ?, ?, ?)", parent_rows)
+                if binding_rows:
+                    conn.executemany("INSERT INTO bindings VALUES (?, ?, ?, ?)", binding_rows)
+                if tombstone_rows:
+                    conn.executemany(
+                        "INSERT INTO tombstones (store, record_id, ts, reason, write_id,"
+                        " agent_id, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        tombstone_rows,
+                    )
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
+            for key, hint in hints.items():
+                self._chains[key] = hint
+                self._chains.move_to_end(key)
+                if len(self._chains) > _CHAIN_HINTS:
+                    self._chains.popitem(last=False)
         return write_ids
 
     def append_tombstones(self, tombstones: Iterable[dict]) -> None:
