@@ -1,0 +1,72 @@
+name: Update PR branches
+
+# After every push to main, merge main into open PRs that are behind so CI and review
+# rerun on current code. Uses PAT_TOKEN: pushes made with GITHUB_TOKEN don't trigger CI.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: update-branches
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update behind PRs
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.ref_name }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::PAT_TOKEN secret is not set"; exit 1
+          fi
+          git fetch --quiet origin "$BASE"
+          failed=0
+          prs=$(gh pr list --repo "$REPO" --base "$BASE" --state open --limit 100 \
+            --json number,headRefName,headRepositoryOwner,labels \
+            --jq '.[] | [.number, .headRepositoryOwner.login, .headRefName, ([.labels[].name] | index("needs-human") != null)] | @tsv')
+          [ -n "$prs" ] || { echo "No open PRs against $BASE."; exit 0; }
+          # Read PRs on fd 3 so gh calls in the loop can't consume the list from stdin.
+          while IFS=$'\t' read -r -u 3 pr owner ref blocked; do
+            if ! behind=$(gh api "repos/$REPO/compare/$BASE...$owner:$ref" --jq '.behind_by'); then
+              echo "::error::Couldn't compare #$pr with $BASE."; failed=1; continue
+            fi
+            if [ "$behind" = "0" ]; then
+              echo "#$pr is up to date."; continue
+            fi
+            # Already handed to a human (e.g. an earlier conflict); don't re-comment on every push.
+            if [ "$blocked" = "true" ]; then
+              echo "#$pr is $behind behind but labeled needs-human; skipping."; continue
+            fi
+            echo "#$pr is $behind behind $BASE; updating."
+            if gh pr update-branch "$pr" --repo "$REPO"; then
+              continue
+            fi
+            git fetch --quiet origin "pull/$pr/head"
+            # merge-tree exits 0 = clean, 1 = conflicts (file names after the tree OID), >1 = error.
+            rc=0
+            conflicts=$(git merge-tree --write-tree --name-only --no-messages "origin/$BASE" FETCH_HEAD) || rc=$?
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::Updating #$pr failed, and it isn't a merge conflict; check the log above."
+              failed=1; continue
+            fi
+            files=$(printf '%s\n' "$conflicts" | tail -n +2 | sed '/^$/d' | sort -u | sed 's/^/- `/; s/$/`/')
+            body="Couldn't update this branch with \`$BASE\`: merge conflict in:
+
+          $files
+
+          Resolve the conflicts (merge \`$BASE\` into this branch) and push; CI and review will rerun."
+            gh pr comment "$pr" --repo "$REPO" --body "$body"
+            gh pr edit "$pr" --repo "$REPO" --add-label needs-human
+          done 3<<< "$prs"
+          exit $failed

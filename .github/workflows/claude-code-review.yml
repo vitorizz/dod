@@ -25,6 +25,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Comments created before this point belong to earlier reviews.
+      - name: Record review start time
+        id: start
+        run: echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
@@ -63,4 +68,39 @@ jobs:
             Post specific issues as inline comments with `mcp__github_inline_comment__create_inline_comment`,
             then one summary with `gh pr comment` listing blocking vs. non-blocking findings.
             If there are no issues, say so explicitly and state what you checked.
+            The summary comment must end with a final line of exactly `BLOCKING: <count>`, where <count> is the
+            number of blocking findings (`BLOCKING: 0` if none). Automation reads this line.
           claude_args: '--model claude-sonnet-5 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(pip install *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *)"'
+
+      # Reads the BLOCKING line from this run's summary and asks Claude to fix blocking items.
+      # Capped at 3 automated fix rounds per PR, then hands off via needs-human.
+      # Uses PAT_TOKEN: comments made with GITHUB_TOKEN don't trigger claude.yml.
+      - name: Request fixes for blocking findings
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.ts }}
+          FIX_MSG: "@claude fix the blocking items in the latest review"
+          MAX_ROUNDS: 3
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::PAT_TOKEN secret is not set"; exit 1
+          fi
+          bodies=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.user.type == \"Bot\" and .created_at >= \"$SINCE\") | .body")
+          count=$(printf '%s\n' "$bodies" | tr -d '\r' | grep -oE '^BLOCKING: [0-9]+$' | tail -n 1 | cut -d' ' -f2)
+          if [ -z "$count" ]; then
+            echo "::warning::No 'BLOCKING: <count>' line in this review's summary; skipping auto-fix."; exit 0
+          fi
+          echo "Blocking findings: $count"
+          [ "$count" -gt 0 ] || exit 0
+          rounds=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" --jq '.[].body' \
+            | tr -d '\r' | grep -cxF "$FIX_MSG" || true)
+          echo "Previous automated fix rounds: $rounds"
+          if [ "$rounds" -ge "$MAX_ROUNDS" ]; then
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Review still reports $count blocking finding(s) after $MAX_ROUNDS automated fix rounds. Handing off to a human."
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-human
+            exit 0
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$FIX_MSG"
