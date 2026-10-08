@@ -69,6 +69,18 @@ Direct edits and deletions
     otherwise every record in the store. The listing runs inside crewai's
     call, after ``reset`` has drained pending saves, so it covers them.
 
+    Capture never changes the delete. If the listing fails (a backend without
+    ``get_record``/``count``/``list_records``, or one that raises), a warning
+    is logged, nothing is recorded, and the delete runs as it would
+    uninstrumented. A failing post-delete listing or tombstone commit is
+    logged too: the delete's own result or exception is what the caller gets.
+
+    Limit: the before/after diff can't tell who deleted a record. A record
+    deleted concurrently by another caller (another agent's consolidation, a
+    concurrent ``forget``) during a filter delete is tombstoned as this
+    call's ``forget``, and a record added during the call and deleted by it
+    is missed.
+
 Quarantine
     ``recall`` drops results whose ``(store, record.id)`` the ledger has
     quarantined, before they reach the caller or the context, so they never
@@ -369,7 +381,7 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
         if orig is None:
             continue
 
-        def delete(*args, _orig=orig, **kwargs):
+        def delete(*args, _orig=orig, _name=name, **kwargs):
             # The wrapped storage.delete/reset fills in what it deleted.
             gone: List[str] = []
             token = _deleting.set(gone)
@@ -379,7 +391,14 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
                 _deleting.reset(token)
                 if gone:
                     agent_id, session_id = _key.get() or (None, None)
-                    capture.on_delete(store, gone, "forget", None, agent_id, session_id)
+                    try:
+                        capture.on_delete(store, gone, "forget", None, agent_id,
+                                          session_id)
+                    except Exception:
+                        # The delete happened (or raised its own error, which
+                        # must propagate unchanged): log, don't raise.
+                        logger.warning("dod: couldn't record %d tombstones for %s()",
+                                       len(gone), _name, exc_info=True)
 
         wrapped.append((name, functools.update_wrapper(delete, orig)))
 
@@ -552,19 +571,38 @@ def _observe_deletes(storage: Any) -> None:
             # crewai's backends delete exactly the given IDs when no other
             # filter is set (scope is ignored); otherwise list everything.
             ids = list(dict.fromkeys(ids)) if ids and not filtered else None
-            before = _existing(storage, ids)
             # A backend's reset may call its own delete: list only once.
             token = _deleting.set(None)
             try:
-                return _orig(*args, **kwargs)
+                before = _snapshot(storage, ids, _name)
+                try:
+                    return _orig(*args, **kwargs)
+                finally:
+                    # Also on failure: whatever it deleted before failing is gone.
+                    after = None if before is None else _snapshot(storage, ids, _name)
+                    if after is not None:
+                        gone.extend(sorted(before - after))
             finally:
                 _deleting.reset(token)
-                # Also on failure: whatever it deleted before failing is gone.
-                gone.extend(sorted(before - _existing(storage, ids)))
 
         functools.update_wrapper(wrapper, orig)
         setattr(wrapper, _DELETE_MARK, True)
         object.__setattr__(storage, name, wrapper)
+
+
+def _snapshot(storage: Any, ids: Optional[List[str]], name: str) -> Optional[set]:
+    """``_existing``, or None (logged) if the backend can't list its records.
+
+    Capture never stops or changes the delete: it runs, and records nothing.
+    """
+    try:
+        return _existing(storage, ids)
+    except Exception:
+        logger.warning(
+            "dod: couldn't list records around storage.%s(); its deletions are "
+            "not recorded", name, exc_info=True,
+        )
+        return None
 
 
 def _existing(storage: Any, ids: Optional[List[str]]) -> set:

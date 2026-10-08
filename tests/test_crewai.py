@@ -947,6 +947,122 @@ def test_failed_delete_with_nothing_deleted_records_nothing(path, mem):
     assert tombstones(path) == []
 
 
+class _NoListing(StubStorage):
+    """A backend without get_record/count/list_records."""
+
+    def __getattribute__(self, name):
+        if name in ("get_record", "count", "list_records"):
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+
+def _failing_listing(storage):
+    def boom(*args, **kwargs):
+        raise RuntimeError("listing down")
+
+    storage.get_record = storage.count = storage.list_records = boom
+    return storage
+
+
+_DELETES = [
+    (lambda m: m.forget(record_ids=["A"]), 1, {"B"}),
+    (lambda m: m.forget(scope="/"), 2, set()),
+    (lambda m: m.reset(), None, set()),
+    (lambda m: m.reset_all(), None, set()),
+]
+_DELETE_IDS = ["forget-ids", "forget-filter", "reset", "reset_all"]
+
+
+@pytest.mark.parametrize("storage", [_NoListing, lambda: _failing_listing(StubStorage())],
+                         ids=["missing", "raising"])
+@pytest.mark.parametrize("call, returned, left", _DELETES, ids=_DELETE_IDS)
+def test_delete_runs_unchanged_when_listing_fails(path, cap, caplog, storage, call,
+                                                  returned, left):
+    mem = StubMemory()
+    mem._storage = storage()
+    mem.add("A", "B")
+    instrument(mem, cap)
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        with agent_task_scope("agent", "task"):
+            assert call(mem) == returned
+    assert set(mem._storage.records) == left
+    assert tombstones(path) == []
+    assert any("not recorded" in r.getMessage() for r in caplog.records)
+
+
+def _delete_then_fail(mem, err):
+    """storage.delete deletes "A", then raises ``err``; every later listing
+    raises too."""
+    orig = mem._storage.delete
+
+    def partial(*args, **kwargs):
+        orig(record_ids=["A"])
+        _failing_listing(mem._storage)
+        raise err
+
+    mem._storage.delete = partial
+    integ._observe_deletes(mem._storage)
+
+
+@pytest.mark.parametrize("call", [lambda m: m.forget(record_ids=["A"]),
+                                  lambda m: m.forget(scope="/")],
+                         ids=["forget-ids", "forget-filter"])
+def test_failed_delete_reraises_its_exception_when_listing_after_fails(path, mem,
+                                                                        caplog, call):
+    mem.add("A", "B")
+    err = RuntimeError("store down")
+    _delete_then_fail(mem, err)
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        with agent_task_scope("agent", "task"), pytest.raises(RuntimeError) as exc:
+            call(mem)
+    assert exc.value is err
+    assert set(mem._storage.records) == {"B"}
+    assert tombstones(path) == []
+    assert any("not recorded" in r.getMessage() for r in caplog.records)
+
+
+def _failing_on_delete(cap):
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("ledger down")
+
+    cap.on_delete = boom
+
+
+def test_failed_delete_reraises_its_exception_when_tombstones_fail(path, cap, mem,
+                                                                    caplog):
+    mem.add("A", "B")
+    orig = mem._storage.delete
+    err = RuntimeError("store down")
+
+    def partial(*args, **kwargs):
+        orig(record_ids=["A"])
+        raise err
+
+    mem._storage.delete = partial
+    integ._observe_deletes(mem._storage)
+    _failing_on_delete(cap)
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        with agent_task_scope("agent", "task"), pytest.raises(RuntimeError) as exc:
+            mem.forget(scope="/")
+    assert exc.value is err
+    assert any("couldn't record 1 tombstones" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("call, returned", [(lambda m: m.forget(record_ids=["A"]), 1),
+                                            (lambda m: m.reset(), None)],
+                         ids=["forget-ids", "reset"])
+def test_tombstone_failure_after_successful_delete_is_logged_not_raised(
+        path, cap, mem, caplog, call, returned):
+    mem.add("A")
+    _failing_on_delete(cap)
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        with agent_task_scope("agent", "task"):
+            assert call(mem) == returned
+    assert mem._storage.records == {}
+    assert tombstones(path) == []
+    assert any("couldn't record 1 tombstones" in r.getMessage() for r in caplog.records)
+
+
 # --- Real crewai 1.15.22 -----------------------------------------------------
 
 
