@@ -95,6 +95,58 @@ def test_bind_appends(path, ledger):
     assert rows == [("mem", "rec-1"), ("mem", "rec-2")]
 
 
+def _batch_row(**kw):
+    row = dict(content="x", store="mem", source="user")
+    row.update(kw)
+    return row
+
+
+def test_append_batch_records_writes_and_bindings(path, ledger):
+    earlier = write(ledger)
+    w1, w2 = ledger.append_batch(
+        [
+            _batch_row(content="a", parents=[("mem", "p", "in_prompt")], record_id="rec-a"),
+            _batch_row(content="b", agent_id="a1", session_id="s1", source="tool"),
+        ],
+        [(earlier, "mem", "rec-0")],
+    )
+    conn = raw(path)
+    rows = conn.execute(
+        "SELECT write_id, content_hash, agent_id, session_id, source FROM writes ORDER BY seq"
+    ).fetchall()
+    assert rows[1:] == [
+        (w1, hashlib.sha256(b"a").hexdigest(), None, None, "user"),
+        (w2, hashlib.sha256(b"b").hexdigest(), "a1", "s1", "tool"),
+    ]
+    assert conn.execute("SELECT * FROM parents WHERE write_id=?", (w1,)).fetchall() == [
+        (w1, "mem", "p", "in_prompt")
+    ]
+    assert conn.execute("SELECT write_id, store, record_id FROM bindings ORDER BY record_id").fetchall() == [
+        (earlier, "mem", "rec-0"), (w1, "mem", "rec-a"),
+    ]
+
+
+def test_append_batch_is_one_transaction(ledger):
+    commits = []
+    ledger._conn.set_trace_callback(lambda sql: sql == "COMMIT" and commits.append(sql))
+    ledger.append_batch([_batch_row(record_id=f"r{i}") for i in range(5)])
+    ledger._conn.set_trace_callback(None)
+    assert commits == ["COMMIT"]
+
+
+@pytest.mark.parametrize("bad", [
+    {"writes": [_batch_row(), _batch_row(source="nope")]},
+    {"writes": [_batch_row(), _batch_row(parents=[("mem", "p", "bad-tag")])]},
+    {"writes": [_batch_row()], "bindings": [("no-such-write", "mem", "r")]},
+])
+def test_append_batch_is_all_or_nothing(path, ledger, bad):
+    with pytest.raises((ValueError, sqlite3.IntegrityError)):
+        ledger.append_batch(**bad)
+    conn = raw(path)
+    for table in ("writes", "parents", "bindings"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+
+
 def test_bind_unknown_write_raises(ledger):
     with pytest.raises(sqlite3.IntegrityError):
         ledger.bind("nope", "mem", "rec-1")
@@ -228,6 +280,26 @@ def test_seq_orders_writes_even_if_clock_steps_back(path, ledger, monkeypatch):
     assert [r[0] for r in rows] == wids
     assert [r[1] for r in rows] == [1, 2, 3]
     assert [r[2] for r in rows] == [3_000, 2_000, 1_000]
+
+
+def test_write_ids_sort_by_creation(path, ledger):
+    # Singles and a batch: many share a millisecond, and a batch shares a ts.
+    wids = [write(ledger) for _ in range(200)]
+    wids += ledger.append_batch([dict(content=str(i), store="s", source="user") for i in range(50)])
+    wids += [write(ledger) for _ in range(200)]
+    assert wids == sorted(wids) and len(set(wids)) == len(wids)
+    assert all(len(w) == 32 and w[12] == "7" for w in wids)  # UUIDv7 layout
+    ms = int(wids[0][:12], 16)
+    assert abs(ms - time.time_ns() // 1_000_000) < 60_000
+    rows = raw(path).execute("SELECT write_id FROM writes ORDER BY seq").fetchall()
+    assert [r[0] for r in rows] == wids
+
+
+def test_write_ids_keep_increasing_if_clock_steps_back(ledger, monkeypatch):
+    clock = iter([3_000_000_000, 2_000_000_000, 1_000_000_000])
+    monkeypatch.setattr("dod.ledger.time.time_ns", lambda: next(clock))
+    wids = [write(ledger) for _ in range(3)]
+    assert wids == sorted(wids) and len(set(wids)) == 3
 
 
 def test_seq_continues_after_reopen(path):

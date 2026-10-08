@@ -11,6 +11,10 @@ requires-python = ">=3.9"
 
 [project.optional-dependencies]
 dev = ["pytest"]
+crewai = ["crewai==1.15.22"]
+
+[tool.pytest.ini_options]
+markers = ["crewai: needs the real crewai package (pip install -e \".[crewai]\")"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dod"]

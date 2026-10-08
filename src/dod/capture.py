@@ -11,8 +11,9 @@ compactions, and bindings do.
 
 In-memory state and its lifecycle:
 
-- Pending writes. ``on_write`` and ``on_compaction`` remember each write's
-  store until ``bind(write_id, record_id)`` succeeds; a failed ``bind`` keeps
+- Pending writes. ``on_write``, ``on_compaction`` and unbound ``on_batch``
+  writes remember each write's store until ``bind(write_id, record_id)`` (or
+  an ``on_batch`` bind) succeeds; a failed ``bind`` keeps
   the entry so the caller can retry. At most ``max_pending`` writes are held;
   past that, the oldest unbound write is evicted and can no longer be bound
   through this ``Capture``. Evicted writes, and writes whose store call failed
@@ -25,7 +26,7 @@ In-memory state and its lifecycle:
 
 import threading
 from collections import OrderedDict
-from typing import Dict, Hashable, Iterable, Optional, Set, Tuple, Union
+from typing import Dict, Hashable, Iterable, List, Optional, Set, Tuple, Union
 
 from dod.ledger import TAGS, Ledger
 
@@ -94,6 +95,76 @@ class Capture:
         """
         replaced = [(s, r, "in_prompt") for s, r in replaced]
         return self._append(key, replaced, content, store, source, agent_id, session_id)
+
+    def on_batch(
+        self,
+        key: Hashable,
+        store: str,
+        writes: Iterable[Tuple[Iterable[Item], Union[str, bytes], str, Optional[str]]] = (),
+        binds: Iterable[Tuple[str, str]] = (),
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> List[str]:
+        """Record several writes and binds in one ledger transaction.
+
+        Each of ``writes`` is ``(replaced, content, source, record_id)``: a
+        compaction of ``replaced`` as with ``on_compaction`` (a plain write if
+        ``replaced`` is empty), bound to ``record_id`` in the same transaction
+        unless it is None. ``binds`` are ``(write_id, record_id)`` for writes
+        recorded earlier, with ``bind``'s rules. All or nothing: if the ledger
+        call raises, nothing is recorded and every write in ``binds`` stays
+        pending. Returns the new write IDs in order.
+        """
+        writes = [(list(r), c, s, rid) for r, c, s, rid in writes]
+        binds = list(binds)
+        with self._lock:
+            ctx = self._context.get(key)
+            parents = [(s, r, t) for (s, r), t in ctx.items()] if ctx else []
+            ids = [w for w, _ in binds]
+            if len(set(ids)) != len(ids) or any(w in self._binding for w in ids):
+                raise KeyError(f"bind already in progress for one of {ids!r}")
+            bindings = [(w, self._pending[w], r) for w, r in binds]
+            self._binding.update(ids)
+        rows = [
+            dict(
+                content=content,
+                store=store,
+                source=source,
+                agent_id=agent_id,
+                session_id=session_id,
+                parents=[(s, r, "in_prompt") for s, r in replaced] + parents,
+                record_id=record_id,
+            )
+            for replaced, content, source, record_id in writes
+        ]
+        write_ids = None
+        try:
+            write_ids = self._ledger.append_batch(rows, bindings)
+        finally:
+            with self._lock:
+                self._binding.difference_update(ids)
+                if write_ids is not None:
+                    for w in ids:
+                        self._pending.pop(w, None)
+                    for w, (*_, record_id) in zip(write_ids, writes):
+                        if record_id is None:
+                            self._pending[w] = store
+                    while len(self._pending) > self._max_pending:
+                        self._pending.popitem(last=False)
+        return write_ids
+
+    def snapshot(self, key: Hashable) -> Hashable:
+        """Return a new key whose context is a copy of ``key``'s.
+
+        For work that runs after ``key``'s scope may have ended. ``reset`` the
+        returned key when done.
+        """
+        snap = object()
+        with self._lock:
+            ctx = self._context.get(key)
+            if ctx:
+                self._context[snap] = dict(ctx)
+        return snap
 
     def bind(self, write_id: str, record_id: str) -> None:
         """Bind a write to the record ID its store assigned.

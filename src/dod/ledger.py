@@ -10,8 +10,7 @@ import os
 import sqlite3
 import threading
 import time
-import uuid
-from typing import Iterable, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 SOURCES = ("user", "tool", "document", "agent_inference")
 TAGS = ("in_prompt", "retrieved_in_scope")
@@ -75,6 +74,38 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
         ("bindings", ""),
     )
 )
+
+
+_id_lock = threading.Lock()
+_last_id = 0
+
+
+def _write_id(ts: int) -> str:
+    """A UUIDv7-layout ID: 48-bit Unix ms, then random bits.
+
+    Time-ordered, so a new write's entries in the ``write_id`` indexes land on
+    the rightmost B-tree leaf instead of a random one. With random IDs every
+    write in a commit dirtied its own leaf in each index, and the extra WAL
+    pages dominated a multi-write commit.
+
+    IDs from one process are strictly increasing: within a millisecond, or if
+    the clock steps back, the next ID is the previous one plus one.
+    """
+    global _last_id
+    ms = max(ts, 0) // 1_000_000
+    rand = int.from_bytes(os.urandom(10), "big")
+    value = (
+        (ms & (2**48 - 1)) << 80
+        | 0x7 << 76
+        | (rand >> 68) << 64
+        | 0b10 << 62
+        | rand & (2**62 - 1)
+    )
+    with _id_lock:
+        if value <= _last_id:
+            value = _last_id + 1
+        _last_id = value
+    return f"{value:032x}"
 
 
 def _dedupe_parents(parents: Iterable[Parent]) -> list:
@@ -161,32 +192,68 @@ class Ledger:
         Each write gets a strictly increasing ``seq``; order writes by ``seq``.
         ``ts`` is wall-clock time for display only, since clocks can step back.
         """
-        if source not in SOURCES:
-            raise ValueError(f"unknown source {source!r}; expected one of {SOURCES}")
-        rows = _dedupe_parents(parents)
-        if isinstance(content, str):
-            content = content.encode("utf-8")
-        content_hash = hashlib.sha256(content).hexdigest()
-        write_id = uuid.uuid4().hex
+        (write_id,) = self.append_batch(
+            [
+                dict(
+                    content=content,
+                    store=store,
+                    source=source,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    parents=parents,
+                )
+            ]
+        )
+        return write_id
+
+    def append_batch(
+        self,
+        writes: Iterable[dict] = (),
+        bindings: Iterable[Tuple[str, str, str]] = (),
+    ) -> List[str]:
+        """Record several writes and bindings in one transaction.
+
+        Each of ``writes`` is a dict of ``append_write``'s keyword arguments,
+        plus an optional ``record_id`` that binds the new write in the same
+        transaction. ``bindings`` are ``(write_id, store, record_id)`` tuples
+        for writes recorded earlier. Returns the new write IDs in order. All
+        or nothing: if anything is invalid or fails, nothing is recorded.
+        """
+        write_rows, parent_rows, binding_rows, write_ids = [], [], [], []
         ts = time.time_ns()
+        for w in writes:
+            source = w["source"]
+            if source not in SOURCES:
+                raise ValueError(f"unknown source {source!r}; expected one of {SOURCES}")
+            content = w["content"]
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            write_id = _write_id(ts)
+            write_rows.append((
+                write_id, hashlib.sha256(content).hexdigest(), ts, w["store"],
+                w.get("agent_id"), w.get("session_id"), source,
+            ))
+            parent_rows += [(write_id, s, r, t) for s, r, t in _dedupe_parents(w.get("parents", ()))]
+            if w.get("record_id") is not None:
+                binding_rows.append((write_id, w["store"], w["record_id"], ts))
+            write_ids.append(write_id)
+        binding_rows += [(wid, s, r, ts) for wid, s, r in bindings]
         with self._lock:
             conn = self._conn
             conn.execute("BEGIN")
             try:
-                conn.execute(
+                conn.executemany(
                     "INSERT INTO writes (write_id, content_hash, ts, store,"
                     " agent_id, session_id, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (write_id, content_hash, ts, store, agent_id, session_id, source),
+                    write_rows,
                 )
-                conn.executemany(
-                    "INSERT INTO parents VALUES (?, ?, ?, ?)",
-                    [(write_id, s, r, t) for s, r, t in rows],
-                )
+                conn.executemany("INSERT INTO parents VALUES (?, ?, ?, ?)", parent_rows)
+                conn.executemany("INSERT INTO bindings VALUES (?, ?, ?, ?)", binding_rows)
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
-        return write_id
+        return write_ids
 
     def bind(self, write_id: str, store: str, record_id: str) -> None:
         """Append a binding from a write to the record ID its store assigned."""
