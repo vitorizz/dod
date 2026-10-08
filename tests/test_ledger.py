@@ -6,10 +6,12 @@ import time
 
 import pytest
 
+import dod.ledger as ledger_mod
 from dod.ledger import SCHEMA_VERSION, Ledger, LedgerSchemaError
 
 TABLES = (
-    "writes", "direct_parents", "context_sets", "context_members", "bindings", "tombstones",
+    "writes", "direct_parents", "context_sets", "context_members", "context_chain",
+    "bindings", "tombstones",
 )
 CONTEXT = [("mem", "c1", "retrieved_in_scope"), ("pg", "c2", "in_prompt")]
 
@@ -185,6 +187,8 @@ def test_bind_unknown_write_raises(ledger):
         "DELETE FROM context_sets",
         "UPDATE context_members SET tag='in_prompt'",
         "DELETE FROM context_members",
+        "UPDATE context_chain SET part='other'",
+        "DELETE FROM context_chain",
         "UPDATE bindings SET record_id='other'",
         "DELETE FROM bindings",
         "UPDATE tombstones SET reason='other'",
@@ -221,6 +225,7 @@ def test_update_and_delete_are_rejected(path, ledger, sql):
         " SELECT set_hash, store, record_id, 'in_prompt' FROM context_members",
         "INSERT OR REPLACE INTO context_members (rowid, set_hash, store, record_id, tag)"
         " SELECT 1, set_hash, 'other', 'other', 'in_prompt' FROM context_members LIMIT 1",
+        "REPLACE INTO context_chain SELECT set_hash, part FROM context_chain",
         "INSERT OR REPLACE INTO bindings (rowid, write_id, store, record_id, ts)"
         " VALUES (1, :wid, 'other', 'other', 0)",
         "INSERT INTO direct_parents VALUES (:wid, 'mem', 'r1', 'in_prompt')"
@@ -238,10 +243,12 @@ def test_replace_cannot_alter_or_remove_rows(path, ledger, sql, recursive_trigge
     conn = raw(path)
     # A connection that never enabled recursive_triggers must be blocked too.
     conn.execute(f"PRAGMA recursive_triggers={'ON' if recursive_triggers else 'OFF'}")
-    snapshot = [conn.execute(f"SELECT rowid, * FROM {t}").fetchall() for t in TABLES]
+    # context_chain is WITHOUT ROWID; its primary key is the whole row.
+    queries = [f"SELECT {'' if t == 'context_chain' else 'rowid, '}* FROM {t}" for t in TABLES]
+    snapshot = [conn.execute(q).fetchall() for q in queries]
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute(sql, {"wid": wid})
-    assert [conn.execute(f"SELECT rowid, * FROM {t}").fetchall() for t in TABLES] == snapshot
+    assert [conn.execute(q).fetchall() for q in queries] == snapshot
 
 
 def test_append_tombstones_records_rows(path, ledger, monkeypatch):
@@ -388,9 +395,140 @@ def test_grown_or_retagged_context_is_a_new_set(path, ledger):
     w4 = write(ledger, context=base)
     assert len({set_of(path, w) for w in (w1, w2, w3)}) == 3
     assert set_of(path, w4) == set_of(path, w1)
-    rows = raw(path).execute("SELECT seq, size FROM context_sets ORDER BY seq").fetchall()
-    assert rows == [(1, 1), (2, 2), (3, 2)]
-    assert count(path, "context_members") == 5
+    rows = raw(path).execute(
+        "SELECT seq, size, base IS NOT NULL, step, upgrades FROM context_sets ORDER BY seq"
+    ).fetchall()
+    # w2 stores only b over w1's set; w3 (step 2, based on step 0) stores b
+    # and the upgraded a.
+    assert rows == [(1, 1, 0, 0, 0), (2, 2, 1, 1, 0), (3, 2, 1, 2, 1)]
+    assert count(path, "context_members") == 4
+    assert edges(path, w3) == [("mem", "a", "in_prompt"), ("mem", "b", "retrieved_in_scope")]
+    assert edges(path, w2) == [("mem", "a", "retrieved_in_scope"), ("mem", "b", "retrieved_in_scope")]
+
+
+def members_of(path, write_id):
+    return raw(path).execute(
+        "SELECT store, record_id, tag FROM context_members WHERE set_hash=?",
+        (set_of(path, write_id),),
+    ).fetchall()
+
+
+def test_grown_context_stores_only_new_members(path, ledger):
+    context, wids = [], []
+    for i in range(20):
+        context.append(("mem", f"c{i}", "retrieved_in_scope"))
+        wids.append(write(ledger, context=list(context), agent_id="a", session_id="s"))
+    # Step n stores the members added in the last (n & -n) steps.
+    for n, w in enumerate(wids):
+        assert len(members_of(path, w)) == (n & -n if n else 1)
+        assert edges(path, w) == sorted(context[: n + 1])
+    assert count(path, "context_members") < 20 * 21 // 2
+    chain = raw(path).execute(
+        "SELECT COUNT(*) FROM context_chain WHERE set_hash=?", (set_of(path, wids[-1]),)
+    ).fetchone()[0]
+    assert chain == bin(19).count("1") + 1  # step 19 = 0b10011: 3 deltas + the full set
+
+
+def test_delta_set_matches_the_same_context_stored_full(path, ledger):
+    # Built by growth here, in one go in another ledger: same address, same edges.
+    context = []
+    for i in range(10):
+        context.append(("mem", f"c{i}", "in_prompt" if i % 3 else "retrieved_in_scope"))
+        wid = write(ledger, context=list(context), agent_id="a")
+    assert len(members_of(path, wid)) < len(context)
+    with Ledger(path.with_name("full.db")) as full:
+        other = write(full, context=list(context))
+    assert set_of(path.with_name("full.db"), other) == set_of(path, wid)
+    assert edges(path.with_name("full.db"), other) == edges(path, wid) == sorted(context)
+    # Referencing it again, from another session, stores nothing new.
+    before = count(path, "context_members")
+    write(ledger, context=list(reversed(context)), agent_id="b")
+    assert count(path, "context_members") == before
+
+
+def test_upgraded_member_is_one_in_prompt_edge(path, ledger):
+    ctx = {f"c{i}": "retrieved_in_scope" for i in range(8)}
+    wids = []
+    for step, upgrade in enumerate(["c0", None, "c3", None, "c5", "c1", None]):
+        if upgrade:
+            ctx[upgrade] = "in_prompt"
+        ctx[f"n{step}"] = "retrieved_in_scope"
+        wids.append((write(ledger, context=[("mem", r, t) for r, t in ctx.items()],
+                           agent_id="a"), dict(ctx)))
+    for wid, expected in wids:
+        assert edges(path, wid) == sorted(("mem", r, t) for r, t in expected.items())
+
+
+def test_shrunk_or_downgraded_context_is_stored_full(path, ledger):
+    a = [("mem", "a", "in_prompt"), ("mem", "b", "retrieved_in_scope")]
+    write(ledger, context=a, agent_id="x")
+    w2 = write(ledger, context=[("mem", "a", "retrieved_in_scope"), ("mem", "c", "in_prompt"),
+                                ("mem", "b", "retrieved_in_scope")], agent_id="x")
+    w3 = write(ledger, context=[("mem", "c", "in_prompt")], agent_id="x")
+    for w in (w2, w3):
+        assert raw(path).execute(
+            "SELECT base, step FROM context_sets WHERE set_hash=?", (set_of(path, w),)
+        ).fetchone() == (None, 0)
+    assert edges(path, w2) == [("mem", "a", "retrieved_in_scope"), ("mem", "b", "retrieved_in_scope"),
+                               ("mem", "c", "in_prompt")]
+    assert edges(path, w3) == [("mem", "c", "in_prompt")]
+
+
+def test_chain_restarts_full_every_chain_steps(path, ledger, monkeypatch):
+    monkeypatch.setattr(ledger_mod, "_CHAIN_STEPS", 8)
+    context = []
+    for i in range(20):
+        context.append(("mem", f"c{i}", "retrieved_in_scope"))
+        wid = write(ledger, context=list(context), agent_id="a")
+        assert edges(path, wid) == sorted(context)
+    steps = [r[0] for r in raw(path).execute("SELECT step FROM context_sets ORDER BY seq")]
+    assert steps == [i % 8 for i in range(20)]
+    assert max(r[0] for r in raw(path).execute(
+        "SELECT COUNT(*) FROM context_chain GROUP BY set_hash")) == 4  # log2(8) + 1
+
+
+def test_context_list_mutated_in_place_between_writes(path, ledger):
+    # The ledger reads only a grown context's new items; a caller reusing
+    # (and editing) one list must not make it skip or keep stale items.
+    ctx = [("mem", "a", "retrieved_in_scope")]
+    w1 = write(ledger, context=ctx, agent_id="a")
+    ctx.append(("mem", "b", "retrieved_in_scope"))
+    w2 = write(ledger, context=ctx, agent_id="a")
+    ctx[0] = ("mem", "a", "in_prompt")
+    w3 = write(ledger, context=ctx, agent_id="a")
+    del ctx[1]
+    w4 = write(ledger, context=ctx, agent_id="a")
+    assert edges(path, w1) == [("mem", "a", "retrieved_in_scope")]
+    assert edges(path, w2) == [("mem", "a", "retrieved_in_scope"), ("mem", "b", "retrieved_in_scope")]
+    assert edges(path, w3) == [("mem", "a", "in_prompt"), ("mem", "b", "retrieved_in_scope")]
+    assert edges(path, w4) == [("mem", "a", "in_prompt")]
+
+
+def test_non_str_ids_are_never_reused_as_equal_ids(path, ledger):
+    # 1 == 1.0, but they are stored as "1" and "1.0".
+    w1 = write(ledger, context=[("mem", 1, "retrieved_in_scope")], agent_id="a")
+    w2 = write(ledger, context=[("mem", 1.0, "retrieved_in_scope"),
+                                ("mem", "b", "retrieved_in_scope")], agent_id="a")
+    assert edges(path, w1) == [("mem", "1", "retrieved_in_scope")]
+    assert edges(path, w2) == [("mem", "1.0", "retrieved_in_scope"), ("mem", "b", "retrieved_in_scope")]
+
+
+def test_id_with_nul_still_content_addressed(path, ledger):
+    # ("a\0b", "c") and ("a", "b\0c") must not hash alike.
+    w1 = write(ledger, context=[("a\0b", "c", "in_prompt")])
+    w2 = write(ledger, context=[("a", "b\0c", "in_prompt")])
+    assert set_of(path, w1) != set_of(path, w2)
+    assert edges(path, w2) == [("a", "b\0c", "in_prompt")]
+
+
+def test_rolled_back_batch_leaves_no_chain_hint(path, ledger):
+    write(ledger, context=[("mem", "a", "retrieved_in_scope")], agent_id="a")
+    grown = [("mem", "a", "retrieved_in_scope"), ("mem", "b", "retrieved_in_scope")]
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.append_batch([_batch_row(context=grown, agent_id="a")], [("no-such-write", "mem", "r")])
+    # The next growth is based on the committed set, not the rolled-back one.
+    w = write(ledger, context=grown + [("mem", "c", "retrieved_in_scope")], agent_id="a")
+    assert edges(path, w) == sorted(grown + [("mem", "c", "retrieved_in_scope")])
 
 
 def test_empty_context_has_no_set(path, ledger):
@@ -424,10 +562,11 @@ def test_item_in_direct_parents_and_context_is_one_edge(path, ledger, direct_tag
 
 def test_context_set_is_content_free(path, ledger):
     cols = {t: [r[1] for r in raw(path).execute(f"PRAGMA table_info({t})")]
-            for t in ("context_sets", "context_members")}
+            for t in ("context_sets", "context_members", "context_chain")}
     assert cols == {
-        "context_sets": ["seq", "set_hash", "size", "ts"],
+        "context_sets": ["seq", "set_hash", "size", "ts", "base", "step", "upgrades"],
         "context_members": ["set_hash", "store", "record_id", "tag"],
+        "context_chain": ["set_hash", "part"],
     }
     write(ledger, content="secret-memory-content", context=CONTEXT)
     assert b"secret-memory-content" not in path.read_bytes()
