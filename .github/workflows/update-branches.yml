@@ -20,6 +20,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # The script pushes local merges with PAT_TOKEN (set below); pushes made
+          # with the default token wouldn't trigger CI on the PR.
+          persist-credentials: false
+
+      - name: Use PAT_TOKEN for git
+        env:
+          PAT: ${{ secrets.PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: git remote set-url origin "https://x-access-token:${PAT}@github.com/${REPO}.git"
 
       - name: Update behind PRs
         env:
