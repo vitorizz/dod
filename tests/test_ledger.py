@@ -282,6 +282,26 @@ def test_seq_orders_writes_even_if_clock_steps_back(path, ledger, monkeypatch):
     assert [r[2] for r in rows] == [3_000, 2_000, 1_000]
 
 
+def test_write_ids_sort_by_creation(path, ledger):
+    # Singles and a batch: many share a millisecond, and a batch shares a ts.
+    wids = [write(ledger) for _ in range(200)]
+    wids += ledger.append_batch([dict(content=str(i), store="s", source="user") for i in range(50)])
+    wids += [write(ledger) for _ in range(200)]
+    assert wids == sorted(wids) and len(set(wids)) == len(wids)
+    assert all(len(w) == 32 and w[12] == "7" for w in wids)  # UUIDv7 layout
+    ms = int(wids[0][:12], 16)
+    assert abs(ms - time.time_ns() // 1_000_000) < 60_000
+    rows = raw(path).execute("SELECT write_id FROM writes ORDER BY seq").fetchall()
+    assert [r[0] for r in rows] == wids
+
+
+def test_write_ids_keep_increasing_if_clock_steps_back(ledger, monkeypatch):
+    clock = iter([3_000_000_000, 2_000_000_000, 1_000_000_000])
+    monkeypatch.setattr("dod.ledger.time.time_ns", lambda: next(clock))
+    wids = [write(ledger) for _ in range(3)]
+    assert wids == sorted(wids) and len(set(wids)) == 3
+
+
 def test_seq_continues_after_reopen(path):
     with Ledger(path) as led:
         write(led)

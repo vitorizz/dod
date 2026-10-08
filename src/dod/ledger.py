@@ -10,7 +10,6 @@ import os
 import sqlite3
 import threading
 import time
-import uuid
 from typing import Iterable, List, Optional, Tuple, Union
 
 SOURCES = ("user", "tool", "document", "agent_inference")
@@ -75,6 +74,38 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
         ("bindings", ""),
     )
 )
+
+
+_id_lock = threading.Lock()
+_last_id = 0
+
+
+def _write_id(ts: int) -> str:
+    """A UUIDv7-layout ID: 48-bit Unix ms, then random bits.
+
+    Time-ordered, so a new write's entries in the ``write_id`` indexes land on
+    the rightmost B-tree leaf instead of a random one. With random IDs every
+    write in a commit dirtied its own leaf in each index, and the extra WAL
+    pages dominated a multi-write commit.
+
+    IDs from one process are strictly increasing: within a millisecond, or if
+    the clock steps back, the next ID is the previous one plus one.
+    """
+    global _last_id
+    ms = max(ts, 0) // 1_000_000
+    rand = int.from_bytes(os.urandom(10), "big")
+    value = (
+        (ms & (2**48 - 1)) << 80
+        | 0x7 << 76
+        | (rand >> 68) << 64
+        | 0b10 << 62
+        | rand & (2**62 - 1)
+    )
+    with _id_lock:
+        if value <= _last_id:
+            value = _last_id + 1
+        _last_id = value
+    return f"{value:032x}"
 
 
 def _dedupe_parents(parents: Iterable[Parent]) -> list:
@@ -197,7 +228,7 @@ class Ledger:
             content = w["content"]
             if isinstance(content, str):
                 content = content.encode("utf-8")
-            write_id = uuid.uuid4().hex
+            write_id = _write_id(ts)
             write_rows.append((
                 write_id, hashlib.sha256(content).hexdigest(), ts, w["store"],
                 w.get("agent_id"), w.get("session_id"), source,

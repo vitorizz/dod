@@ -1,4 +1,6 @@
-from perf import p99_ms
+import time
+
+from perf import p99_ms, split_p99_ms
 from test_crewai import StubMemory
 
 from dod.capture import Capture
@@ -85,24 +87,41 @@ def test_update_p99_under_1ms(tmp_path):
 
 
 def test_remember_many_p99_under_1ms(tmp_path):
-    # No save pool: the timed call is both transactions, the writes at call
-    # time and the binds after the save. Each call writes ~80 KB of WAL; back
-    # to back that is ~200 MB/s and the kernel throttles writeback, so pause
-    # between calls (a real batch spends far longer embedding and in the LLM).
-    # Even paced, a shared CI runner's disk can stall one round past 1 ms, so
-    # take the median of three rounds' p99.
+    # The caller waits only for the call-time commit (the writes); the bind
+    # commit runs later on crewai's save pool. Time each on its own. No save
+    # pool here, so the background save runs inside the call: a shim around
+    # the instrumented _background_encode_batch times it, and the rest of the
+    # call is the call-time part. Each call writes ~80 KB of WAL; back to back
+    # that is ~200 MB/s and the kernel throttles writeback, so pause between
+    # calls (a real batch spends far longer embedding and in the LLM).
     items = [f"fact {i}" for i in range(5)]
     mem = StubMemory(pool=False)
     mem.results["q"] = mem.add(*(f"rec-{i}" for i in range(10)))
     with Ledger(tmp_path / "ledger.db") as ledger:
         instrument(mem, Capture(ledger))
+        background, inner = mem._background_encode_batch, []
+        clock = time.perf_counter_ns
+
+        def timed_background(contents):
+            start = clock()
+            try:
+                return background(contents)
+            finally:
+                inner.append(clock() - start)
+
+        mem._background_encode_batch = timed_background
         with agent_task_scope("agent", "task"):
             mem.recall("q")
-            p99 = p99_ms(
+            call_p99, bind_p99 = split_p99_ms(
                 lambda: mem.remember_many(items),
+                inner,
                 n=2_000,
                 pause_s=0.002,
                 rounds=3,
-                label="instrumented remember_many (5 items, 10 parents, on-disk)",
+                labels=(
+                    "instrumented remember_many call-time commit (5 items, 10 parents, on-disk)",
+                    "instrumented remember_many background bind commit (5 items, on-disk)",
+                ),
             )
-    assert p99 < 1.0
+    assert call_p99 < 1.0
+    assert bind_p99 < 1.0
