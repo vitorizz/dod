@@ -1,8 +1,9 @@
-"""Append-only SQLite ledger of memory writes and their parent edges.
+"""Append-only SQLite ledger of memory writes, their parent edges, and deletions.
 
 A memory item is identified by ``(store, record_id)``, so edges can cross
-stores. The ledger never stores memory content: only IDs, content hashes,
-edges, and metadata.
+stores. A deleted item gets a tombstone row; nothing is ever removed. The
+ledger never stores memory content: only IDs, content hashes, edges, and
+metadata.
 """
 
 import hashlib
@@ -14,10 +15,11 @@ from typing import Iterable, List, Optional, Tuple, Union
 
 SOURCES = ("user", "tool", "document", "agent_inference")
 TAGS = ("in_prompt", "retrieved_in_scope")
+REASONS = ("consolidation", "excision", "forget", "other")
 
 Parent = Tuple[str, str, str]
 
-_TABLES = ("writes", "parents", "bindings")
+_TABLES = ("writes", "parents", "bindings", "tombstones")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS writes (
@@ -45,8 +47,20 @@ CREATE TABLE IF NOT EXISTS bindings (
     record_id TEXT NOT NULL,
     ts        INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tombstones (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    store      TEXT NOT NULL,
+    record_id  TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    reason     TEXT NOT NULL
+        CHECK (reason IN ('consolidation', 'excision', 'forget', 'other')),
+    write_id   TEXT REFERENCES writes (write_id),
+    agent_id   TEXT,
+    session_id TEXT
+);
 CREATE INDEX IF NOT EXISTS bindings_by_write ON bindings (write_id);
 CREATE INDEX IF NOT EXISTS bindings_by_record ON bindings (store, record_id);
+CREATE INDEX IF NOT EXISTS tombstones_by_record ON tombstones (store, record_id);
 """ + "".join(
     f"""
 CREATE TRIGGER IF NOT EXISTS {t}_no_{op.lower()} BEFORE {op} ON {t}
@@ -72,6 +86,7 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
             " AND parent_record_id = NEW.parent_record_id)",
         ),
         ("bindings", ""),
+        ("tombstones", ""),
     )
 )
 
@@ -120,6 +135,16 @@ def _dedupe_parents(parents: Iterable[Parent]) -> list:
         if merged.get(key) != "in_prompt":
             merged[key] = tag
     return [(s, r, t) for (s, r), t in merged.items()]
+
+
+def _tombstone_row(t: dict, ts: int) -> tuple:
+    reason = t["reason"]
+    if reason not in REASONS:
+        raise ValueError(f"unknown tombstone reason {reason!r}; expected one of {REASONS}")
+    return (
+        t["store"], t["record_id"], ts, reason,
+        t.get("write_id"), t.get("agent_id"), t.get("session_id"),
+    )
 
 
 class Ledger:
@@ -210,14 +235,16 @@ class Ledger:
         self,
         writes: Iterable[dict] = (),
         bindings: Iterable[Tuple[str, str, str]] = (),
+        tombstones: Iterable[dict] = (),
     ) -> List[str]:
-        """Record several writes and bindings in one transaction.
+        """Record several writes, bindings and tombstones in one transaction.
 
         Each of ``writes`` is a dict of ``append_write``'s keyword arguments,
         plus an optional ``record_id`` that binds the new write in the same
         transaction. ``bindings`` are ``(write_id, store, record_id)`` tuples
-        for writes recorded earlier. Returns the new write IDs in order. All
-        or nothing: if anything is invalid or fails, nothing is recorded.
+        for writes recorded earlier. ``tombstones`` are dicts as for
+        ``append_tombstones``. Returns the new write IDs in order. All or
+        nothing: if anything is invalid or fails, nothing is recorded.
         """
         write_rows, parent_rows, binding_rows, write_ids = [], [], [], []
         ts = time.time_ns()
@@ -238,6 +265,7 @@ class Ledger:
                 binding_rows.append((write_id, w["store"], w["record_id"], ts))
             write_ids.append(write_id)
         binding_rows += [(wid, s, r, ts) for wid, s, r in bindings]
+        tombstone_rows = [_tombstone_row(t, ts) for t in tombstones]
         with self._lock:
             conn = self._conn
             conn.execute("BEGIN")
@@ -249,11 +277,28 @@ class Ledger:
                 )
                 conn.executemany("INSERT INTO parents VALUES (?, ?, ?, ?)", parent_rows)
                 conn.executemany("INSERT INTO bindings VALUES (?, ?, ?, ?)", binding_rows)
+                conn.executemany(
+                    "INSERT INTO tombstones (store, record_id, ts, reason, write_id,"
+                    " agent_id, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    tombstone_rows,
+                )
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
         return write_ids
+
+    def append_tombstones(self, tombstones: Iterable[dict]) -> None:
+        """Record that items were deleted from their store, in one transaction.
+
+        Each tombstone is a dict with ``store``, ``record_id`` and ``reason``
+        (one of ``REASONS``), plus what caused it: an optional ``write_id``
+        (a recorded write whose save deleted the item) and optional
+        ``agent_id`` / ``session_id``. Each gets its own strictly increasing
+        ``seq`` (separate from writes'). A tombstone never removes the
+        item's writes, edges or bindings; queries report it alongside them.
+        """
+        self.append_batch(tombstones=tombstones)
 
     def bind(self, write_id: str, store: str, record_id: str) -> None:
         """Append a binding from a write to the record ID its store assigned."""

@@ -32,9 +32,10 @@ os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
 
 class StubRecord:
-    def __init__(self, content, id=None):
+    def __init__(self, content, id=None, scope="/"):
         self.id = id or str(uuid.uuid4())
         self.content = content
+        self.scope = scope
 
 
 class StubMatch:
@@ -60,12 +61,29 @@ class StubStorage:
 
     def delete(self, scope_prefix=None, categories=None, record_ids=None,
                older_than=None, metadata_filter=None):
-        for rid in record_ids or ():
-            self.records.pop(rid, None)
-        return len(record_ids or ())
+        # Like crewai's backends: IDs alone delete exactly those (scope is
+        # ignored); otherwise filter by scope (other filters aren't modeled).
+        if record_ids and not (categories or older_than or metadata_filter):
+            doomed = [r for r in dict.fromkeys(record_ids) if r in self.records]
+        else:
+            doomed = [rid for rid, r in self.records.items()
+                      if r.scope.startswith(scope_prefix or "/")]
+        for rid in doomed:
+            del self.records[rid]
+        return len(doomed)
+
+    def reset(self, scope_prefix=None):
+        self.delete(scope_prefix=scope_prefix or "/")
 
     def get_record(self, record_id):
         return self.records.get(record_id)
+
+    def count(self, scope_prefix=None):
+        return len(self.records)
+
+    def list_records(self, scope_prefix=None, limit=200, offset=0):
+        records = [r for r in self.records.values() if r.scope.startswith(scope_prefix or "/")]
+        return records[offset:offset + limit]
 
 
 class StubMemory:
@@ -134,10 +152,12 @@ class StubMemory:
                                     metadata_filter=metadata_filter)
 
     def reset(self, scope=None):
-        self._storage.records.clear()
+        self.drain_writes()
+        self._storage.reset(scope_prefix=scope)
 
     def reset_all(self):
-        self._storage.records.clear()
+        self.drain_writes()
+        self._storage.reset(scope_prefix=None)
 
     def drain_writes(self):
         pending, self._pending = self._pending, []
@@ -218,6 +238,12 @@ def write_for(path, record_id):
 
 def last_write(path):
     return writes(path)[-1][0]
+
+
+def tombstones(path):
+    return raw(path).execute(
+        "SELECT record_id, reason, write_id, agent_id, session_id FROM tombstones ORDER BY seq"
+    ).fetchall()
 
 
 # --- Wrapping ----------------------------------------------------------------
@@ -649,6 +675,8 @@ def test_consolidation_recorded_as_compaction(path, mem):
     }
     assert bound(path, w_merge) == ["A"]
     assert src == "agent_inference"
+    # The deleted record gets a tombstone naming the write whose save caused it.
+    assert tombstones(path) == [("B", "consolidation", w_c, "agent", "task")]
 
 
 def test_delete_then_insert_is_compaction_of_new_record(path, mem):
@@ -662,20 +690,19 @@ def test_delete_then_insert_is_compaction_of_new_record(path, mem):
     assert parents(path, w_merge) == {"A": "in_prompt"}
     assert bound(path, w_merge) == [rec.id]
     assert src == "user"
+    assert tombstones(path) == [("A", "consolidation", w_c, "agent", "task")]
 
 
-def test_delete_only_is_compaction_bound_to_returned_record(path, mem):
+def test_delete_only_records_tombstones_not_compaction(path, mem):
     mem.add("A", "B")
     mem._storage.similar = ["A", "B"]
     mem.plan = {"delete": ["B"], "insert": False}
     with agent_task_scope("agent", "task"):
         rec = mem.remember("C")
     assert rec.id == "A" and "B" not in mem._storage.records
-    (w_c, *_), (w_del, _, src, *_) = writes(path)
+    ((w_c, *_),) = writes(path)
     assert bound(path, w_c) == ["A"]
-    assert parents(path, w_del) == {"A": "in_prompt", "B": "in_prompt"}
-    assert bound(path, w_del) == ["A"]
-    assert src == "agent_inference"
+    assert tombstones(path) == [("B", "consolidation", w_c, "agent", "task")]
 
 
 def test_delete_only_then_failure_still_recorded(path, mem):
@@ -685,9 +712,38 @@ def test_delete_only_then_failure_still_recorded(path, mem):
     mem.fail = RuntimeError("after delete")
     with agent_task_scope("agent", "task"), pytest.raises(RuntimeError):
         mem.remember("C")
-    (w_c, *_), (w_del, *_) = writes(path)
-    assert parents(path, w_del) == {"A": "in_prompt"}
-    assert bound(path, w_c) == [] and bound(path, w_del) == []
+    ((w_c, *_),) = writes(path)
+    assert bound(path, w_c) == []
+    assert tombstones(path) == [("A", "consolidation", w_c, "agent", "task")]
+
+
+def test_consolidation_tombstones_and_binds_in_one_commit(path, cap):
+    m = instrument(StubMemory(pool=False), cap)
+    m.add("A", "B")
+    m._storage.similar = ["A", "B"]
+    m.plan = {"delete": ["A", "B"], "insert": True}
+    commits = []
+    cap._ledger._conn.set_trace_callback(lambda sql: sql == "COMMIT" and commits.append(sql))
+    with agent_task_scope("agent", "task"):
+        m.remember("C")
+    cap._ledger._conn.set_trace_callback(None)
+    assert [r for r, *_ in tombstones(path)] == ["A", "B"]
+    assert len(commits) == 2  # the write before the save; the rest after it
+
+
+@pytest.mark.parametrize("items, caused", [(["C"], True), (["C", "D"], False)],
+                         ids=["one-item", "two-items"])
+def test_remember_many_consolidation_tombstones(path, mem, items, caused):
+    mem.add("A")
+    mem._storage.similar = ["A"]
+    mem.plan = {"delete": ["A"], "insert": True}
+    with agent_task_scope("agent", "task"):
+        mem.remember_many(items)
+    mem.drain_writes()
+    first = writes(path)[0][0]
+    # Which item's save deleted the record is only known for one item.
+    assert tombstones(path) == [("A", "consolidation", first if caused else None,
+                                 "agent", "task")]
 
 
 def test_consolidating_remember_commits_twice(path, cap):
@@ -731,7 +787,8 @@ def test_storage_calls_outside_remember_not_observed(path, mem):
     mem.add("A")
     mem._storage.update(StubRecord("direct", id="A"))
     mem._storage.delete(record_ids=["A"])
-    assert writes(path) == []
+    mem._storage.reset()
+    assert writes(path) == [] and tombstones(path) == []
 
 
 # --- Direct edits and deletions ----------------------------------------------
@@ -797,33 +854,97 @@ def test_read_only_update_records_nothing(path, cap):
     assert writes(path) == []
 
 
-def test_forget_by_ids_is_unbound_compaction(path, mem):
+def test_forget_by_ids_records_tombstones(path, mem):
     _, _, k = mem.add("A", "B", "K")
     mem.results["k"] = [k]
     with agent_task_scope("agent", "task"):
         mem.recall("k")
-        assert mem.forget(record_ids=["A", "B"]) == 2
-    assert "A" not in mem._storage.records
-    ((wid, _, src, *_),) = writes(path)
-    assert src == "agent_inference"
-    assert parents(path, wid) == {"A": "in_prompt", "B": "in_prompt", "K": "retrieved_in_scope"}
-    assert bound(path, wid) == []
+        # "nope" never existed and "A" is repeated: neither gets an extra tombstone.
+        assert mem.forget(record_ids=["A", "B", "nope", "A"]) == 2
+    assert set(mem._storage.records) == {"K"}
+    assert writes(path) == []
+    assert tombstones(path) == [
+        ("A", "forget", None, "agent", "task"), ("B", "forget", None, "agent", "task"),
+    ]
 
 
-@pytest.mark.parametrize("call", [
-    lambda m: m.forget(scope="/x"),
-    lambda m: m.forget(record_ids=[]),
-    lambda m: m.reset(),
-    lambda m: m.reset_all(),
-], ids=["forget-filter", "forget-empty-ids", "reset", "reset_all"])
-def test_filter_deletes_pass_through_and_warn_every_call(path, mem, caplog, call):
+def test_forget_by_ids_checks_only_those_ids(mem):
+    mem.add("A", "B")
+    mem._storage.list_records = None  # a full listing would fail
+    mem.forget(record_ids=["A"])
+    assert set(mem._storage.records) == {"B"}
+
+
+def _scoped(mem, *specs):
+    for rid, scope in specs:
+        mem._storage.records[rid] = StubRecord(f"content of {rid}", id=rid, scope=scope)
+
+
+@pytest.mark.parametrize("call, deleted", [
+    (lambda m: m.forget(scope="/x"), ["X1", "X2"]),
+    (lambda m: m.forget(record_ids=[]), ["R", "X1", "X2", "Y"]),
+    (lambda m: m.forget(record_ids=["Y"], categories=["c"]), ["R", "X1", "X2", "Y"]),
+    (lambda m: m.reset("/x"), ["X1", "X2"]),
+    (lambda m: m.reset(), ["R", "X1", "X2", "Y"]),
+    (lambda m: m.reset_all(), ["R", "X1", "X2", "Y"]),
+], ids=["forget-filter", "forget-empty-ids", "forget-ids-and-filter", "reset-scope",
+        "reset", "reset_all"])
+def test_filter_deletes_record_a_tombstone_per_deleted_record(path, mem, call, deleted):
+    _scoped(mem, ("R", "/"), ("X1", "/x"), ("X2", "/x/sub"), ("Y", "/y"))
+    with agent_task_scope("agent", "task"):
+        call(mem)
+        call(mem)  # nothing left to delete the second time
+    assert sorted(set(["R", "X1", "X2", "Y"]) - set(mem._storage.records)) == deleted
+    assert writes(path) == []
+    assert tombstones(path) == [(r, "forget", None, "agent", "task") for r in deleted]
+
+
+def test_delete_outside_scope_records_tombstone_without_actor(path, mem, caplog):
     mem.add("A")
     with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
-        with agent_task_scope("agent", "task"):
-            call(mem)
-            call(mem)
-    assert writes(path) == []
-    assert len([r for r in caplog.records if "deletes by filter" in r.message]) == 2
+        mem.reset_all()
+    assert tombstones(path) == [("A", "forget", None, None, None)]
+    assert caplog.records == []
+
+
+def test_reset_covers_saves_drained_inside_it(path, mem):
+    release = _hold_save_pool(mem)
+    with agent_task_scope("agent", "task"):
+        mem.remember_many(["C"])
+        threading.Timer(0.05, release.set).start()
+        mem.reset()  # drains the pending save, then deletes what it saved
+    assert mem._storage.records == {}
+    ((w_c, *_),) = writes(path)
+    (rid,) = bound(path, w_c)
+    assert tombstones(path) == [(rid, "forget", None, "agent", "task")]
+
+
+def test_failed_delete_records_what_was_deleted(path, mem):
+    mem.add("A", "B")
+    orig = mem._storage.delete
+
+    def partial(*args, **kwargs):
+        orig(record_ids=["A"])
+        raise RuntimeError("store down")
+
+    mem._storage.delete = partial
+    integ._observe_deletes(mem._storage)
+    with agent_task_scope("agent", "task"), pytest.raises(RuntimeError):
+        mem.forget(scope="/")
+    assert tombstones(path) == [("A", "forget", None, "agent", "task")]
+
+
+def test_failed_delete_with_nothing_deleted_records_nothing(path, mem):
+    mem.add("A")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("store down")
+
+    mem._storage.delete = boom
+    integ._observe_deletes(mem._storage)
+    with pytest.raises(RuntimeError):
+        mem.forget(record_ids=["A"])
+    assert tombstones(path) == []
 
 
 # --- Real crewai 1.15.22 -----------------------------------------------------
@@ -873,6 +994,12 @@ class _MemStorage:
 
     def get_record(self, record_id):
         return self.records.get(record_id)
+
+    def count(self, scope_prefix=None):
+        return len(self.records)
+
+    def list_records(self, scope_prefix=None, limit=200, offset=0):
+        return list(self.records.values())[offset:offset + limit]
 
     def reset(self, scope_prefix=None):
         for rid, r in list(self.records.items()):
@@ -957,25 +1084,54 @@ def test_real_memory_end_to_end(path, cap):
 
 
 @pytest.mark.crewai
-def test_real_update_and_forget_recorded(path, cap, caplog):
+def test_real_update_and_forget_recorded(path, cap):
     pytest.importorskip("crewai")
     m = instrument(_real_memory(embedder=_one_hot), cap)
     with agent_task_scope("setup", "setup"):
         a, b = _save(m, "A"), _save(m, "B")
+        e = m.remember("E", scope="/elsewhere", categories=[], importance=0.5)
     with agent_task_scope("agent", "task"):
         m.recall("anything", depth="shallow")
         rec = m.update(a.id, "corrected A")
         assert m.forget(record_ids=[b.id]) == 1
         # MemoryScope delegates to the instance, so its deletes are seen too.
-        with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
-            m.scope("/elsewhere").reset()
+        m.scope("/elsewhere").reset()
     assert m._storage.records[a.id].content == "corrected A"
-    w_upd, w_del = (w for w, *_ in writes(path)[2:])
+    assert set(m._storage.records) == {a.id}
+    (w_upd,) = (w for w, *_ in writes(path)[3:])
     assert bound(path, w_upd) == [rec.id] == [a.id]
-    assert parents(path, w_upd) == {a.id: "in_prompt", b.id: "retrieved_in_scope"}
-    assert bound(path, w_del) == []
-    assert parents(path, w_del) == {b.id: "in_prompt", a.id: "retrieved_in_scope"}
-    assert any("reset() deletes by filter" in r.message for r in caplog.records)
+    assert parents(path, w_upd) == {
+        a.id: "in_prompt", b.id: "retrieved_in_scope", e.id: "retrieved_in_scope",
+    }
+    assert tombstones(path) == [
+        (b.id, "forget", None, "agent", "task"), (e.id, "forget", None, "agent", "task"),
+    ]
+
+
+@pytest.mark.crewai
+def test_real_lancedb_filter_deletes_recorded(path, cap, tmp_path):
+    # crewai's default backend, so the listing and the deletes are its own.
+    pytest.importorskip("crewai")
+    from crewai.memory.storage.lancedb_storage import LanceDBStorage
+    from crewai.memory.unified_memory import Memory
+
+    m = instrument(Memory(
+        storage=LanceDBStorage(path=tmp_path / "lance", vector_dim=16),
+        llm=_NoLLM(), embedder=_one_hot, exploration_budget=0,
+    ), cap)
+    with agent_task_scope("setup", "setup"):
+        recs = {c: m.remember(c, scope=s, categories=[], importance=0.5)
+                for c, s in (("A", "/a"), ("B", "/b/x"), ("C", "/b"), ("D", "/d"))}
+    with agent_task_scope("agent", "task"):
+        m.forget(record_ids=[recs["A"].id])
+        m.reset(scope="/b")
+        m.reset_all()
+    actor = ("agent", "task")
+    assert tombstones(path)[0] == (recs["A"].id, "forget", None, *actor)
+    assert sorted(tombstones(path)[1:3]) == sorted(
+        (recs[c].id, "forget", None, *actor) for c in "BC"
+    )
+    assert tombstones(path)[3:] == [(recs["D"].id, "forget", None, *actor)]
 
 
 @pytest.mark.crewai
@@ -996,10 +1152,10 @@ def test_real_delete_only_consolidation(path, cap):
     with agent_task_scope("agent", "task"):
         rec = m.remember("C", scope="/", categories=[], importance=0.5)
     assert llm.calls == 1 and b.id not in m._storage.records
-    w_c, w_del = (w for w, *_ in writes(path)[2:])
-    # crewai returns the first similar record; the compaction is bound to it.
-    assert bound(path, w_c) == [rec.id] and bound(path, w_del) == [rec.id]
-    assert parents(path, w_del) == {a.id: "in_prompt", b.id: "in_prompt"}
+    (w_c,) = (w for w, *_ in writes(path)[2:])
+    # crewai returns the first similar record; the write is bound to it.
+    assert bound(path, w_c) == [rec.id]
+    assert tombstones(path) == [(b.id, "consolidation", w_c, "agent", "task")]
 
 
 @pytest.mark.crewai

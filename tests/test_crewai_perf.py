@@ -68,6 +68,27 @@ def test_consolidating_remember_p99_under_1ms(tmp_path):
     assert p99 < 1.0
 
 
+def test_filter_delete_1000_records(tmp_path):
+    # Not on the hot path, so exempt from the 1 ms bar: reset() lists the
+    # store before and after deleting, and tombstones all 1,000 records in
+    # one transaction. The ceiling only guards regressions.
+    mem = StubMemory(pool=False)
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        instrument(mem, Capture(ledger))
+        ids = [f"rec-{i}" for i in range(1_000)]
+
+        def reset():
+            mem.add(*ids)  # untimed setup would need a hook; it is ~1% of the call
+            mem.reset()
+
+        with agent_task_scope("agent", "task"):
+            p99 = p99_ms(reset, n=200, warmup=20, rounds=3,
+                         label="instrumented reset (1,000 records, on-disk)")
+        (count,) = ledger._conn.execute("SELECT COUNT(*) FROM tombstones").fetchone()
+    assert count == 1_000 * (200 * 3 + 20)
+    assert p99 < 50.0
+
+
 def test_update_p99_under_1ms(tmp_path):
     # Two commits, like remember: the compaction before the store write, the
     # bind after it.
