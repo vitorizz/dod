@@ -23,6 +23,21 @@ def test_append_write_p99_under_1ms(tmp_path, n_parents):
     assert p99 < 1.0
 
 
+def test_append_tombstone_p99_under_1ms(tmp_path):
+    counter = iter(range(100_000))
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        wid = ledger.append_write(content="x", store="mem", source="agent_inference")
+
+        def append():
+            ledger.append_tombstones([dict(
+                store="mem", record_id=f"rec-{next(counter)}", reason="consolidation",
+                write_id=wid, agent_id="a1", session_id="s1",
+            )])
+
+        p99 = p99_ms(append, label="append_tombstones (1 tombstone, on-disk)")
+    assert p99 < 1.0
+
+
 def test_bind_p99_under_1ms(tmp_path):
     n, warmup = 10_000, 1_000
     with Ledger(tmp_path / "ledger.db") as ledger:

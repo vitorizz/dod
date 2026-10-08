@@ -48,6 +48,23 @@ class Edge(NamedTuple):
     parent_write_id: Optional[str]
 
 
+class Tombstone(NamedTuple):
+    """A recorded deletion of ``(store, record_id)`` from its store."""
+
+    seq: int
+    store: str
+    record_id: str
+    ts: int
+    reason: str
+    write_id: Optional[str]
+    """The write whose save deleted the item, if any."""
+    agent_id: Optional[str]
+    session_id: Optional[str]
+
+
+Item = Tuple[str, str]
+
+
 @dataclass(frozen=True)
 class UnrecordedAncestor:
     """A parent item that was in context but has no binding in the ledger."""
@@ -71,9 +88,15 @@ class TraceResult:
     unrecorded: List[UnrecordedAncestor] = field(default_factory=list)
     truncated: bool = False
     """True if ``max_depth`` stopped the walk before every ancestor was reached."""
+    deleted: Dict[Item, List[Tombstone]] = field(default_factory=dict)
+    """Tombstones, ordered by seq, of the traced item and every parent item
+    walked, keyed by ``(store, record_id)``. Items never deleted are absent."""
 
     def edges_tagged(self, tag: str) -> List[Edge]:
         return _edges_tagged(self.edges, tag)
+
+    def is_deleted(self, store: str, record_id: str) -> bool:
+        return (store, record_id) in self.deleted
 
 
 @dataclass
@@ -92,9 +115,16 @@ class BlastResult:
     """Number of descendant writes per store."""
     truncated: bool = False
     """True if ``max_depth`` stopped the walk before every descendant was reached."""
+    deleted: Dict[Item, List[Tombstone]] = field(default_factory=dict)
+    """Tombstones, ordered by seq, of the queried item and every item bound
+    to a reached write, keyed by ``(store, record_id)``. Items never deleted
+    are absent."""
 
     def edges_tagged(self, tag: str) -> List[Edge]:
         return _edges_tagged(self.edges, tag)
+
+    def is_deleted(self, store: str, record_id: str) -> bool:
+        return (store, record_id) in self.deleted
 
 
 def _edges_tagged(edges: List[Edge], tag: str) -> List[Edge]:
@@ -131,6 +161,36 @@ def _load(ledger: Ledger, write_ids: List[str], depth: int) -> List[TracedWrite]
     return out
 
 
+_TOMBSTONE_COLS = "seq, store, record_id, ts, reason, write_id, agent_id, session_id"
+
+
+def _group(rows: Iterable[tuple]) -> Dict[Item, List[Tombstone]]:
+    out: Dict[Item, List[Tombstone]] = {}
+    for r in rows:
+        t = Tombstone(*r)
+        out.setdefault((t.store, t.record_id), []).append(t)
+    for ts in out.values():
+        ts.sort(key=lambda t: t.seq)
+    return out
+
+
+def _tombstones(ledger: Ledger, items: Iterable[Item]) -> Dict[Item, List[Tombstone]]:
+    """Tombstones of ``items``, one indexed query per store and chunk."""
+    by_store: Dict[str, Set[str]] = {}
+    for s, r in items:
+        by_store.setdefault(s, set()).add(r)
+    rows = []
+    for s, ids in sorted(by_store.items()):
+        for chunk in _chunks(sorted(ids)):
+            rows += _run(
+                ledger,
+                f"SELECT {_TOMBSTONE_COLS} FROM tombstones"
+                f" WHERE store = ? AND record_id IN ({_marks(len(chunk))})",
+                [s, *chunk],
+            )
+    return dict(sorted(_group(rows).items()))
+
+
 def trace(
     ledger: Ledger, store: str, record_id: str, max_depth: Optional[int] = None
 ) -> TraceResult:
@@ -139,7 +199,8 @@ def trace(
     Breadth-first, one indexed query per level over the current frontier, so
     only the reached subgraph is read. A visited set gives each write its
     minimum depth and makes cycles terminate. ``max_depth`` (``None`` for no
-    limit) bounds ancestor depth; 1 is direct parents.
+    limit) bounds ancestor depth; 1 is direct parents. Deleted items are
+    walked like any other; their tombstones are reported in ``deleted``.
 
     Raises ``KeyError`` if the item has no binding in the ledger.
     """
@@ -214,6 +275,9 @@ def trace(
             for (s, r), d in sorted(seen_unrecorded.items(), key=lambda kv: (kv[1], kv[0]))
         ],
         truncated=truncated,
+        deleted=_tombstones(
+            ledger, [(store, record_id)] + [(e.parent_store, e.parent_record_id) for e in edges]
+        ),
     )
 
 
@@ -229,8 +293,10 @@ def blast_radius(
     (``None`` for no limit) bounds descendant depth; 1 is direct children.
 
     There is no parent->child index (kept off the append path), so
-    ``bindings``, ``parents`` and ``writes`` are each read in one scan and the
-    walk runs in memory, rather than rescanning ``parents`` at every level.
+    ``bindings``, ``parents``, ``writes`` and ``tombstones`` are each read in
+    one scan and the walk runs in memory, rather than rescanning ``parents``
+    at every level. A deleted item is still walked: its tombstone is reported
+    in ``deleted``, and what was derived from it stays in the result.
 
     Raises ``KeyError`` if the item has no binding in the ledger.
     """
@@ -287,13 +353,20 @@ def blast_radius(
         if r[1] in seen
     ]
     descendants = sorted((w for w in reached if w.depth), key=lambda w: w.depth)
+    bindings = {w: sorted(items_of.get(w, ())) for w in seen}
+    in_result = {(store, record_id)}.union(*bindings.values())
+    deleted = _group(
+        r for r in _run(ledger, f"SELECT {_TOMBSTONE_COLS} FROM tombstones", ())
+        if (r[1], r[2]) in in_result
+    )
     return BlastResult(
         store=store,
         record_id=record_id,
         items=[w for w in reached if not w.depth],
         descendants=descendants,
         edges=edges,
-        bindings={w: sorted(items_of.get(w, ())) for w in seen},
+        bindings=bindings,
         store_counts=dict(sorted(Counter(w.store for w in descendants).items())),
         truncated=truncated,
+        deleted=dict(sorted(deleted.items())),
     )

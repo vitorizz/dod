@@ -185,6 +185,22 @@ def test_consistent_with_trace_on_random_dag(ledger):
     assert any(len(blast_radius(ledger, *r).store_counts) > 1 for r in items[:20])
 
 
+def test_deleted_items_reported_and_still_walked(ledger):
+    a = put(ledger, "mem", "a", source="user")
+    b = put(ledger, "pg", "b", [("mem", "a", "in_prompt")])
+    c = put(ledger, "mem", "c", [("pg", "b", "in_prompt")])
+    put(ledger, "mem", "unrelated")
+    for store, rid, reason in (("pg", "b", "consolidation"), ("mem", "a", "forget"),
+                               ("mem", "unrelated", "forget"), ("mem", "b", "forget")):
+        ledger.append_tombstones([dict(store=store, record_id=rid, reason=reason)])
+    r = blast_radius(ledger, "mem", "a")
+    assert depths(r) == {b: 1, c: 2}  # a deleted item's descendants are still reached
+    assert sorted(r.deleted) == [("mem", "a"), ("pg", "b")]
+    assert r.deleted[("pg", "b")][0].reason == "consolidation"
+    assert r.is_deleted("mem", "a") and not r.is_deleted("mem", "c")
+    assert blast_radius(ledger, "mem", "c").deleted == {}
+
+
 def test_blast_radius_10k_ledger_from_root_under_250ms(path):
     rng = random.Random(10_000)
     with Ledger(path) as ledger:

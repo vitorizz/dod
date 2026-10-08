@@ -8,7 +8,7 @@ import pytest
 
 from dod.ledger import Ledger
 
-TABLES = ("writes", "parents", "bindings")
+TABLES = ("writes", "parents", "bindings", "tombstones")
 
 
 @pytest.fixture
@@ -36,7 +36,7 @@ def write(ledger, parents=(), content="x", **kw):
 def test_creates_schema_with_wal(path, ledger):
     conn = raw(path)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"writes", "parents", "bindings"} <= tables
+    assert set(TABLES) <= tables
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
@@ -161,11 +161,14 @@ def test_bind_unknown_write_raises(ledger):
         "DELETE FROM parents",
         "UPDATE bindings SET record_id='other'",
         "DELETE FROM bindings",
+        "UPDATE tombstones SET reason='other'",
+        "DELETE FROM tombstones",
     ],
 )
 def test_update_and_delete_are_rejected(path, ledger, sql):
     wid = write(ledger, parents=[("mem", "r1", "retrieved_in_scope")])
     ledger.bind(wid, "mem", "rec-1")
+    ledger.append_tombstones([dict(store="mem", record_id="rec-1", reason="forget")])
     conn = raw(path)
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute(sql)
@@ -187,11 +190,16 @@ def test_update_and_delete_are_rejected(path, ledger, sql):
         " VALUES (1, :wid, 'other', 'other', 0)",
         "INSERT INTO parents VALUES (:wid, 'mem', 'r1', 'in_prompt')"
         " ON CONFLICT DO UPDATE SET tag = excluded.tag",
+        "INSERT OR REPLACE INTO tombstones (seq, store, record_id, ts, reason)"
+        " VALUES (1, 'other', 'other', 0, 'other')",
+        "INSERT INTO tombstones (seq, store, record_id, ts, reason)"
+        " VALUES (1, 'other', 'other', 0, 'other') ON CONFLICT DO UPDATE SET reason = 'other'",
     ],
 )
 def test_replace_cannot_alter_or_remove_rows(path, ledger, sql, recursive_triggers):
     wid = write(ledger, parents=[("mem", "r1", "retrieved_in_scope")])
     ledger.bind(wid, "mem", "rec-1")
+    ledger.append_tombstones([dict(store="mem", record_id="rec-1", reason="forget")])
     conn = raw(path)
     # A connection that never enabled recursive_triggers must be blocked too.
     conn.execute(f"PRAGMA recursive_triggers={'ON' if recursive_triggers else 'OFF'}")
@@ -199,6 +207,70 @@ def test_replace_cannot_alter_or_remove_rows(path, ledger, sql, recursive_trigge
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute(sql, {"wid": wid})
     assert [conn.execute(f"SELECT rowid, * FROM {t}").fetchall() for t in TABLES] == snapshot
+
+
+def test_append_tombstones_records_rows(path, ledger, monkeypatch):
+    wid = write(ledger)
+    monkeypatch.setattr(time, "time_ns", lambda: 123)
+    ledger.append_tombstones([
+        dict(store="mem", record_id="r1", reason="consolidation", write_id=wid,
+             agent_id="a1", session_id="s1"),
+        dict(store="pg", record_id="r2", reason="forget"),
+    ])
+    ledger.append_tombstones([dict(store="mem", record_id="r1", reason="excision")])
+    rows = raw(path).execute("SELECT * FROM tombstones ORDER BY seq").fetchall()
+    assert rows == [
+        (1, "mem", "r1", 123, "consolidation", wid, "a1", "s1"),
+        (2, "pg", "r2", 123, "forget", None, None, None),
+        (3, "mem", "r1", 123, "excision", None, None, None),
+    ]
+
+
+def test_tombstone_is_content_free(path, ledger):
+    # A tombstone has no content field, so nothing it is given can be stored.
+    cols = [r[1] for r in raw(path).execute("PRAGMA table_info(tombstones)")]
+    assert cols == ["seq", "store", "record_id", "ts", "reason", "write_id",
+                    "agent_id", "session_id"]
+    ledger.append_tombstones([dict(store="mem", record_id="r1", reason="forget",
+                                   content="secret-memory-content")])
+    assert b"secret-memory-content" not in path.read_bytes()
+    wal = path.with_name(path.name + "-wal")
+    if wal.exists():
+        assert b"secret-memory-content" not in wal.read_bytes()
+
+
+def test_append_batch_records_tombstones_in_same_transaction(path, ledger):
+    commits = []
+    ledger._conn.set_trace_callback(lambda sql: sql == "COMMIT" and commits.append(sql))
+    (wid,) = ledger.append_batch(
+        [_batch_row(record_id="r2")], (),
+        [dict(store="mem", record_id="r1", reason="consolidation")],
+    )
+    ledger._conn.set_trace_callback(None)
+    assert commits == ["COMMIT"]
+    assert raw(path).execute("SELECT record_id FROM tombstones").fetchall() == [("r1",)]
+
+
+@pytest.mark.parametrize("bad", [
+    dict(store="mem", record_id="r1", reason="rumor"),
+    dict(store="mem", record_id="r1", reason="forget", write_id="no-such-write"),
+    dict(store="mem", record_id="r1"),
+])
+def test_bad_tombstone_records_nothing(path, ledger, bad):
+    with pytest.raises((ValueError, KeyError, sqlite3.IntegrityError)):
+        ledger.append_batch(
+            [_batch_row()], (), [dict(store="mem", record_id="ok", reason="forget"), bad]
+        )
+    conn = raw(path)
+    for table in TABLES:
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+
+
+def test_db_rejects_hand_inserted_bad_reason(path, ledger):
+    with pytest.raises(sqlite3.IntegrityError):
+        raw(path).execute(
+            "INSERT INTO tombstones (store, record_id, ts, reason) VALUES ('m', 'r', 0, 'rumor')"
+        )
 
 
 def test_ledger_connection_enables_recursive_triggers(ledger):

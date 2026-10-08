@@ -68,6 +68,51 @@ def test_consolidating_remember_p99_under_1ms(tmp_path):
     assert p99 < 1.0
 
 
+def test_forget_one_record_p99_under_1ms(tmp_path):
+    # The common delete: get_record before and after, and one tombstone
+    # commit. Each call adds a fresh record (a dict insert) and forgets it.
+    mem = StubMemory(pool=False)
+    mem.add(*(f"rec-{i}" for i in range(100)))  # unrelated records stay put
+    ids = iter(range(10**9))
+
+    def forget():
+        rid = f"del-{next(ids)}"
+        mem.add(rid)
+        mem.forget(record_ids=[rid])
+
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        instrument(mem, Capture(ledger))
+        with agent_task_scope("agent", "task"):
+            p99 = p99_ms(forget, n=5_000, rounds=3,
+                         label="instrumented forget(record_ids=[x]) (on-disk)")
+        (count,) = ledger._conn.execute("SELECT COUNT(*) FROM tombstones").fetchone()
+    assert count == 1_000 + 5_000 * 3
+    assert len(mem._storage.records) == 100
+    assert p99 < 1.0
+
+
+def test_filter_delete_1000_records(tmp_path):
+    # Off the hot path, so held to a per-call ceiling instead of the 1 ms bar
+    # (docs/decisions.md): reset() lists the store before and after deleting,
+    # and tombstones all 1,000 records in one transaction. Measured ~54 ms on
+    # a dev machine; the ceiling only guards regressions.
+    mem = StubMemory(pool=False)
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        instrument(mem, Capture(ledger))
+        ids = [f"rec-{i}" for i in range(1_000)]
+
+        def reset():
+            mem.add(*ids)  # untimed setup would need a hook; it is ~1% of the call
+            mem.reset()
+
+        with agent_task_scope("agent", "task"):
+            p99 = p99_ms(reset, n=200, warmup=20, rounds=3,
+                         label="instrumented reset (1,000 records, on-disk)")
+        (count,) = ledger._conn.execute("SELECT COUNT(*) FROM tombstones").fetchone()
+    assert count == 1_000 * (200 * 3 + 20)
+    assert p99 < 100.0
+
+
 def test_update_p99_under_1ms(tmp_path):
     # Two commits, like remember: the compaction before the store write, the
     # bind after it.

@@ -225,6 +225,43 @@ def test_max_pending_must_be_positive(ledger):
         Capture(ledger, max_pending=0)
 
 
+def tombstones(path):
+    return raw(path).execute(
+        "SELECT store, record_id, reason, write_id, agent_id, session_id"
+        " FROM tombstones ORDER BY seq"
+    ).fetchall()
+
+
+def test_on_delete_records_tombstones(path, cap):
+    cap.on_retrieve("task", [("mem", "ctx")])
+    wid = cap.on_write("task", "x", "mem", "agent_inference")
+    cap.on_delete("mem", ["r1", "r2"], "consolidation", wid, "a1", "s1")
+    cap.on_delete("pg", ["r3"], "forget")
+    assert tombstones(path) == [
+        ("mem", "r1", "consolidation", wid, "a1", "s1"),
+        ("mem", "r2", "consolidation", wid, "a1", "s1"),
+        ("pg", "r3", "forget", None, None, None),
+    ]
+    assert n_writes(path) == 1  # a deletion is not a write
+    assert cap._context["task"] == {("mem", "ctx"): "retrieved_in_scope"}
+
+
+def test_on_delete_bad_reason_records_nothing(path, cap):
+    with pytest.raises(ValueError):
+        cap.on_delete("mem", ["r1", "r2"], "rumor")
+    assert tombstones(path) == []
+
+
+def test_on_batch_records_deletes_with_writes(path, cap):
+    wid = cap.on_write("task", "x", "mem", "agent_inference")
+    (cid,) = cap.on_batch(
+        "task", "mem", [([("mem", "r1")], "merged", "agent_inference", "r0")],
+        [(wid, "r0")], "a1", "s1", deletes=[("r1", "consolidation", wid)],
+    )
+    assert tombstones(path) == [("mem", "r1", "consolidation", wid, "a1", "s1")]
+    assert parents(path, cid) == {("mem", "r1"): "in_prompt"}
+
+
 def test_compaction_parents_and_trace(path, cap):
     # A, B, C are written and bound to their store IDs.
     for rid in ("A", "B", "C"):
