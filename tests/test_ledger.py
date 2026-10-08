@@ -8,7 +8,10 @@ import pytest
 
 from dod.ledger import Ledger
 
-TABLES = ("writes", "parents", "bindings", "tombstones")
+TABLES = (
+    "writes", "direct_parents", "context_sets", "context_members", "bindings", "tombstones",
+)
+CONTEXT = [("mem", "c1", "retrieved_in_scope"), ("pg", "c2", "in_prompt")]
 
 
 @pytest.fixture
@@ -27,6 +30,23 @@ def raw(path):
     return sqlite3.connect(str(path), isolation_level=None)
 
 
+def set_of(path, write_id):
+    return raw(path).execute(
+        "SELECT context_set FROM writes WHERE write_id=?", (write_id,)
+    ).fetchone()[0]
+
+
+def edges(path, write_id):
+    return raw(path).execute(
+        "SELECT parent_store, parent_record_id, tag FROM parents WHERE write_id=? ORDER BY 1, 2",
+        (write_id,),
+    ).fetchall()
+
+
+def count(path, table):
+    return raw(path).execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
 def write(ledger, parents=(), content="x", **kw):
     kw.setdefault("store", "mem")
     kw.setdefault("source", "user")
@@ -37,6 +57,8 @@ def test_creates_schema_with_wal(path, ledger):
     conn = raw(path)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert set(TABLES) <= tables
+    views = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='view'")}
+    assert views == {"parents"}
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
@@ -157,8 +179,12 @@ def test_bind_unknown_write_raises(ledger):
     [
         "UPDATE writes SET store='other'",
         "DELETE FROM writes",
-        "UPDATE parents SET tag='in_prompt'",
-        "DELETE FROM parents",
+        "UPDATE direct_parents SET tag='in_prompt'",
+        "DELETE FROM direct_parents",
+        "UPDATE context_sets SET size=0",
+        "DELETE FROM context_sets",
+        "UPDATE context_members SET tag='in_prompt'",
+        "DELETE FROM context_members",
         "UPDATE bindings SET record_id='other'",
         "DELETE FROM bindings",
         "UPDATE tombstones SET reason='other'",
@@ -166,7 +192,7 @@ def test_bind_unknown_write_raises(ledger):
     ],
 )
 def test_update_and_delete_are_rejected(path, ledger, sql):
-    wid = write(ledger, parents=[("mem", "r1", "retrieved_in_scope")])
+    wid = write(ledger, parents=[("mem", "r1", "retrieved_in_scope")], context=CONTEXT)
     ledger.bind(wid, "mem", "rec-1")
     ledger.append_tombstones([dict(store="mem", record_id="rec-1", reason="forget")])
     conn = raw(path)
@@ -183,12 +209,21 @@ def test_update_and_delete_are_rejected(path, ledger, sql):
         " VALUES (:wid, 'h', 0, 'other', 'user')",
         "INSERT OR REPLACE INTO writes (seq, write_id, content_hash, ts, store, source)"
         " VALUES (1, 'other', 'h', 0, 'other', 'user')",
-        "REPLACE INTO parents VALUES (:wid, 'mem', 'r1', 'in_prompt')",
-        "INSERT OR REPLACE INTO parents (rowid, write_id, parent_store, parent_record_id, tag)"
+        "REPLACE INTO direct_parents VALUES (:wid, 'mem', 'r1', 'in_prompt')",
+        "INSERT OR REPLACE INTO direct_parents"
+        " (rowid, write_id, parent_store, parent_record_id, tag)"
         " VALUES (1, :wid, 'other', 'other', 'in_prompt')",
+        "INSERT OR REPLACE INTO context_sets (set_hash, size, ts)"
+        " SELECT set_hash, 0, 0 FROM context_sets",
+        "INSERT OR REPLACE INTO context_sets (seq, set_hash, size, ts)"
+        " VALUES (1, 'other', 0, 0)",
+        "REPLACE INTO context_members"
+        " SELECT set_hash, store, record_id, 'in_prompt' FROM context_members",
+        "INSERT OR REPLACE INTO context_members (rowid, set_hash, store, record_id, tag)"
+        " SELECT 1, set_hash, 'other', 'other', 'in_prompt' FROM context_members LIMIT 1",
         "INSERT OR REPLACE INTO bindings (rowid, write_id, store, record_id, ts)"
         " VALUES (1, :wid, 'other', 'other', 0)",
-        "INSERT INTO parents VALUES (:wid, 'mem', 'r1', 'in_prompt')"
+        "INSERT INTO direct_parents VALUES (:wid, 'mem', 'r1', 'in_prompt')"
         " ON CONFLICT DO UPDATE SET tag = excluded.tag",
         "INSERT OR REPLACE INTO tombstones (seq, store, record_id, ts, reason)"
         " VALUES (1, 'other', 'other', 0, 'other')",
@@ -197,7 +232,7 @@ def test_update_and_delete_are_rejected(path, ledger, sql):
     ],
 )
 def test_replace_cannot_alter_or_remove_rows(path, ledger, sql, recursive_triggers):
-    wid = write(ledger, parents=[("mem", "r1", "retrieved_in_scope")])
+    wid = write(ledger, parents=[("mem", "r1", "retrieved_in_scope")], context=CONTEXT)
     ledger.bind(wid, "mem", "rec-1")
     ledger.append_tombstones([dict(store="mem", record_id="rec-1", reason="forget")])
     conn = raw(path)
@@ -292,12 +327,133 @@ def test_bad_or_missing_tag_raises(path, ledger, parent):
     assert raw(path).execute("SELECT COUNT(*) FROM writes").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("table", ["direct_parents", "context_members"])
 @pytest.mark.parametrize("tag", ["maybe", None])
-def test_db_rejects_hand_inserted_bad_tag(path, ledger, tag):
-    wid = write(ledger)
-    conn = raw(path)
+def test_db_rejects_hand_inserted_bad_tag(path, ledger, tag, table):
+    wid = write(ledger, context=CONTEXT)
+    key = wid if table == "direct_parents" else set_of(path, wid)
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO parents VALUES (?, 'mem', 'r1', ?)", (wid, tag))
+        raw(path).execute(f"INSERT INTO {table} VALUES (?, 'mem', 'new', ?)", (key, tag))
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT INTO parents VALUES ('w', 'mem', 'r1', 'in_prompt')",
+        "UPDATE parents SET tag='in_prompt'",
+        "DELETE FROM parents",
+    ],
+)
+def test_parents_view_is_read_only(path, ledger, sql):
+    write(ledger, parents=[("mem", "r1", "retrieved_in_scope")], context=CONTEXT)
+    with pytest.raises(sqlite3.OperationalError, match="view"):
+        raw(path).execute(sql)
+
+
+def test_context_set_stored_once_for_many_writes(path, ledger):
+    context = [("mem", f"c{i}", "retrieved_in_scope") for i in range(10)]
+    wids = [write(ledger, context=list(context)) for _ in range(3)]
+    wids += ledger.append_batch([_batch_row(context=context) for _ in range(5)])
+    assert count(path, "context_sets") == 1
+    assert count(path, "context_members") == 10
+    assert count(path, "direct_parents") == 0
+    assert len({set_of(path, w) for w in wids}) == 1
+    for w in wids:
+        assert edges(path, w) == sorted(context)
+    assert count(path, "parents") == 80
+
+
+def test_context_set_is_content_addressed(path, ledger):
+    # Order and duplicates don't matter; the same members hash the same.
+    a = write(ledger, context=[("mem", "a", "retrieved_in_scope"), ("pg", "b", "in_prompt")])
+    b = write(ledger, context=[
+        ("pg", "b", "retrieved_in_scope"), ("pg", "b", "in_prompt"),
+        ("mem", "a", "retrieved_in_scope"),
+    ])
+    assert set_of(path, a) == set_of(path, b)
+    # The address depends only on the members, so another ledger agrees.
+    with Ledger(path.with_name("other.db")) as other:
+        c = write(other, context=[("pg", "b", "in_prompt"), ("mem", "a", "retrieved_in_scope")])
+    other_hash = raw(path.with_name("other.db")).execute(
+        "SELECT context_set FROM writes WHERE write_id=?", (c,)
+    ).fetchone()[0]
+    assert other_hash == set_of(path, a)
+
+
+def test_grown_or_retagged_context_is_a_new_set(path, ledger):
+    base = [("mem", "a", "retrieved_in_scope")]
+    w1 = write(ledger, context=base)
+    w2 = write(ledger, context=base + [("mem", "b", "retrieved_in_scope")])
+    w3 = write(ledger, context=[("mem", "a", "in_prompt"), ("mem", "b", "retrieved_in_scope")])
+    w4 = write(ledger, context=base)
+    assert len({set_of(path, w) for w in (w1, w2, w3)}) == 3
+    assert set_of(path, w4) == set_of(path, w1)
+    rows = raw(path).execute("SELECT seq, size FROM context_sets ORDER BY seq").fetchall()
+    assert rows == [(1, 1), (2, 2), (3, 2)]
+    assert count(path, "context_members") == 5
+
+
+def test_empty_context_has_no_set(path, ledger):
+    wid = write(ledger, parents=[("mem", "r", "in_prompt")], context=[])
+    assert set_of(path, wid) is None
+    assert count(path, "context_sets") == 0
+    assert edges(path, wid) == [("mem", "r", "in_prompt")]
+
+
+@pytest.mark.parametrize(
+    "direct_tag,context_tag",
+    [
+        ("in_prompt", "retrieved_in_scope"),
+        ("retrieved_in_scope", "in_prompt"),
+        ("retrieved_in_scope", "retrieved_in_scope"),
+        ("in_prompt", "in_prompt"),
+    ],
+)
+def test_item_in_direct_parents_and_context_is_one_edge(path, ledger, direct_tag, context_tag):
+    wid = write(
+        ledger,
+        parents=[("mem", "x", direct_tag)],
+        context=[("mem", "x", context_tag), ("mem", "y", "retrieved_in_scope")],
+    )
+    merged = "in_prompt" if "in_prompt" in (direct_tag, context_tag) else "retrieved_in_scope"
+    assert edges(path, wid) == [("mem", "x", merged), ("mem", "y", "retrieved_in_scope")]
+    # Another write sharing the set still sees the context's own tag.
+    other = write(ledger, context=[("mem", "x", context_tag), ("mem", "y", "retrieved_in_scope")])
+    assert edges(path, other) == [("mem", "x", context_tag), ("mem", "y", "retrieved_in_scope")]
+
+
+def test_context_set_is_content_free(path, ledger):
+    cols = {t: [r[1] for r in raw(path).execute(f"PRAGMA table_info({t})")]
+            for t in ("context_sets", "context_members")}
+    assert cols == {
+        "context_sets": ["seq", "set_hash", "size", "ts"],
+        "context_members": ["set_hash", "store", "record_id", "tag"],
+    }
+    write(ledger, content="secret-memory-content", context=CONTEXT)
+    assert b"secret-memory-content" not in path.read_bytes()
+    wal = path.with_name(path.name + "-wal")
+    if wal.exists():
+        assert b"secret-memory-content" not in wal.read_bytes()
+
+
+def test_bad_context_records_nothing(path, ledger):
+    with pytest.raises(ValueError):
+        ledger.append_batch([
+            _batch_row(context=CONTEXT),
+            _batch_row(context=[("mem", "c", "bad-tag")]),
+        ])
+    for table in TABLES:
+        assert count(path, table) == 0
+
+
+def test_failed_batch_leaves_no_context_set(path, ledger):
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.append_batch([_batch_row(context=CONTEXT)], [("no-such-write", "mem", "r")])
+    for table in TABLES:
+        assert count(path, table) == 0
+    # The set is recorded normally afterwards.
+    wid = write(ledger, context=CONTEXT)
+    assert edges(path, wid) == sorted(CONTEXT)
 
 
 def test_empty_parents(path, ledger):

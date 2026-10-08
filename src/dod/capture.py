@@ -7,7 +7,9 @@ Nothing is filtered by relevance or recency: a missed parent breaks trace and
 excision silently, while an extra edge only costs precision.
 
 Retrievals are held in memory and never touch the ledger; only writes,
-compactions, bindings, and deletions (tombstones) do.
+compactions, bindings, and deletions (tombstones) do. A write's context goes
+to the ledger as its context set, stored once however many writes share it;
+a compaction's replaced items are its direct parents.
 
 In-memory state and its lifecycle:
 
@@ -140,7 +142,8 @@ class Capture:
                 source=source,
                 agent_id=agent_id,
                 session_id=session_id,
-                parents=[(s, r, "in_prompt") for s, r in replaced] + parents,
+                parents=[(s, r, "in_prompt") for s, r in replaced],
+                context=parents,
                 record_id=record_id,
             )
             for replaced, content, source, record_id in writes
@@ -233,7 +236,8 @@ class Capture:
             source=source,
             agent_id=agent_id,
             session_id=session_id,
-            parents=list(extra) + parents,
+            parents=extra,
+            context=parents,
         )
         with self._lock:
             self._pending[write_id] = store
