@@ -66,6 +66,15 @@ Direct edits and deletions
     filter, and the storage API doesn't report which IDs it deleted, so they
     pass through and log a warning on every call.
 
+Quarantine
+    ``recall`` drops results whose ``(store, record.id)`` the ledger has
+    quarantined, before they reach the caller or the context, so they never
+    become parents. The quarantined set is cached; each recall applies only
+    the actions whose ``seq`` is past the last one applied
+    (``Ledger.quarantine_log``), which covers quarantines from any
+    connection. Each dropped result is counted per item; read the counts with
+    ``blocked_retrievals()``.
+
 ``remember_many``
     Saves in the background and returns ``[]``. Each item is recorded as a
     write when ``remember_many`` is called, with the scope's context as
@@ -84,11 +93,12 @@ import logging
 import sys
 import threading
 import weakref
+from collections import Counter
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from dod.capture import Capture
-from dod.ledger import SOURCES
+from dod.ledger import SOURCES, Item, Ledger
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +129,41 @@ _in_prompt_callers: set = set()
 # Frames above the wrapper to search: covers MemoryScope/MemorySlice and
 # arecall delegating to recall.
 _CALLER_DEPTH = 4
+
+# (store, record_id) -> recall results dropped because it was quarantined.
+_blocked: "Counter[Item]" = Counter()
+_blocked_lock = threading.Lock()
+
+
+class _Quarantine:
+    """A ledger's quarantined set, updated when its quarantine ``seq`` moves.
+
+    Each call reads only the actions after the last ``seq`` applied (an
+    index seek; usually none), so a change costs its own rows, not a re-read
+    of every quarantined item.
+    """
+
+    __slots__ = ("ledger", "seq", "items", "lock")
+
+    def __init__(self, ledger: Ledger) -> None:
+        self.ledger = ledger
+        self.seq = 0
+        self.items: frozenset = frozenset()
+        self.lock = threading.Lock()
+
+    def current(self) -> frozenset:
+        with self.lock:
+            rows = self.ledger.quarantine_log(self.seq)
+            if rows:
+                items = set(self.items)
+                for _seq, store, record_id, action in rows:
+                    if action == "quarantine":
+                        items.add((store, record_id))
+                    else:
+                        items.discard((store, record_id))
+                self.items = frozenset(items)
+                self.seq = rows[-1][0]
+            return self.items
 
 
 class _Consolidation:
@@ -172,10 +217,20 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
             f"{type(memory).__name__} has no _background_encode_batch to observe"
         )
     warned = []
+    quarantine = _Quarantine(capture._ledger)
 
     @functools.wraps(orig_recall)
     def recall(*args, **kwargs):
         results = orig_recall(*args, **kwargs)
+        blocked = quarantine.current()
+        if blocked and results:
+            kept = [m for m in results if (store, m.record.id) not in blocked]
+            if len(kept) != len(results):
+                dropped = [(store, m.record.id) for m in results
+                           if (store, m.record.id) in blocked]
+                with _blocked_lock:
+                    _blocked.update(dropped)
+                results = kept
         key = _key.get()
         if key is not None and results:
             capture.on_retrieve(
@@ -353,6 +408,12 @@ def agent_task_scope(agent_id: Any, task_id: Any) -> Iterator[Key]:
     finally:
         _key.reset(token)
         _reset(key)
+
+
+def blocked_retrievals() -> Dict[Item, int]:
+    """Recall results dropped by quarantine since process start, per item."""
+    with _blocked_lock:
+        return dict(_blocked)
 
 
 def install_task_scopes() -> None:
