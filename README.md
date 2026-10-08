@@ -39,6 +39,7 @@ pip install -e ".[crewai]"      # CrewAI memory (crewai==1.15.22)
 pip install -e ".[langgraph]"   # LangGraph Store (langgraph==1.2.14)
 pip install -e ".[anthropic]"   # Anthropic memory tool (anthropic==1.12.1)
 pip install -e ".[crewai,langgraph]"   # both, for the quickstart
+pip install -e ".[otel]"        # OpenTelemetry export (opentelemetry-api/sdk==1.45.1)
 ```
 
 The core library has no dependencies; integrations are optional extras.
@@ -104,6 +105,25 @@ Run it with `python examples/quickstart.py`. `tests/test_quickstart.py` runs the
 
 Inside a crew, call `crewai.install_task_scopes()` once instead of entering scopes by hand: every task then runs in `agent_task_scope(agent.id, task.id)`.
 
+## OpenTelemetry
+
+`OTelObserver` adds each captured write to the traces you already collect: a `dod.memory_write` event on the current span (or a short span of that name if none is active), plus `dod.memory_bind` and `dod.memory_delete`.
+
+```python
+from opentelemetry import trace
+
+from dod.capture import Capture
+from dod.export.otel import OTelObserver
+
+cap = Capture(ledger, observers=[OTelObserver()])
+tracer = trace.get_tracer("my-agent")
+
+with tracer.start_as_current_span("agent-step"):
+    ...  # instrumented recalls and writes add dod.memory_write events here
+```
+
+Attributes are IDs, hashes and tags only (`dod.write.id`, `dod.write.content_hash`, `dod.parents.store`/`record_id`/`tag`, ...; see `dod/export/otel.py`), never memory content, and never `gen_ai.*` names. The observer only calls the OpenTelemetry API: where the data goes is decided by your own SDK and exporter configuration, and without one nothing is sent. Observers run after the ledger commit; one that raises is logged and never breaks capture.
+
 ## Guarantees
 
 - **Content-free ledger.** The ledger stores IDs, content hashes, edges, and metadata only. Memory content stays in your stores. (`reason` and `actor` on quarantine are stored as you pass them; keep content out of them.)
@@ -125,8 +145,9 @@ Supported:
 - **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`).
 - **Anthropic memory tool** (anthropic 1.12.1, `memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and `clear_all_memory`, on `BetaAbstractMemoryTool`/`BetaAsyncAbstractMemoryTool` subclasses that keep the default `call` (such as `BetaLocalFilesystemMemoryTool`). A viewed file is an `in_prompt` parent; the record ID is the memory path.
 - `trace`, `blast_radius`, quarantine/release, and `excise` (quarantine or delete), across all three stores through one ledger.
+- OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
 
-Next: regenerate (rewrite derived items without the bad parent), more integrations (LangGraph agents, Pydantic AI, an MCP gateway), and export of edges as OpenTelemetry attributes.
+Next: regenerate (rewrite derived items without the bad parent) and more integrations (LangGraph agents, Pydantic AI, an MCP gateway).
 
 ## Demo
 

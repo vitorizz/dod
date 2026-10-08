@@ -14,12 +14,14 @@ dev = ["pytest"]
 crewai = ["crewai==1.15.22"]
 langgraph = ["langgraph==1.2.14", "langgraph-checkpoint==4.2.0"]
 anthropic = ["anthropic==1.12.1"]
+otel = ["opentelemetry-api==1.45.1", "opentelemetry-sdk==1.45.1"]
 
 [tool.pytest.ini_options]
 markers = [
     "crewai: needs the real crewai package (pip install -e \".[crewai]\")",
     "langgraph: needs the langgraph package (pip install -e \".[langgraph]\")",
     "anthropic: needs the anthropic package (pip install -e \".[anthropic]\")",
+    "otel: needs the OpenTelemetry API and SDK (pip install -e \".[otel]\")",
 ]
 
 [tool.hatch.build.targets.wheel]
