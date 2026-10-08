@@ -163,6 +163,37 @@ def test_record_bound_to_several_writes_resolves_to_all(ledger):
     assert [w.write_id for w in r.items] == [a1, a2]
 
 
+def _forget(ledger, store, record_id, reason="forget", write_id=None):
+    ledger.append_tombstones(
+        [dict(store=store, record_id=record_id, reason=reason, write_id=write_id)]
+    )
+
+
+def test_deleted_items_reported_and_still_walked(ledger):
+    a = put(ledger, "mem", "a", source="user")
+    b = put(ledger, "pg", "b", [("mem", "a", "in_prompt")])
+    c = put(ledger, "mem", "c", [("pg", "b", "in_prompt"), ("mem", "gone", "retrieved_in_scope")])
+    _forget(ledger, "mem", "a", "consolidation", write_id=b)
+    _forget(ledger, "mem", "a", "excision")
+    _forget(ledger, "mem", "gone")  # unrecorded, but its deletion was recorded
+    _forget(ledger, "pg", "a")  # same record ID in another store: not in the result
+    _forget(ledger, "mem", "c")
+    r = trace(ledger, "mem", "c")
+    assert depths(r) == {b: 1, a: 2}  # deletion doesn't cut lineage
+    assert sorted(r.deleted) == [("mem", "a"), ("mem", "c"), ("mem", "gone")]
+    assert [(t.reason, t.write_id) for t in r.deleted[("mem", "a")]] == [
+        ("consolidation", b), ("excision", None),
+    ]
+    assert r.is_deleted("mem", "c") and not r.is_deleted("pg", "b")
+    assert not r.is_deleted("pg", "a")
+
+
+def test_no_tombstones_means_nothing_deleted(ledger):
+    put(ledger, "mem", "a")
+    put(ledger, "mem", "b", [("mem", "a", "in_prompt")])
+    assert trace(ledger, "mem", "b").deleted == {}
+
+
 def test_trace_10k_ledger_depth_50_under_100ms(path):
     with Ledger(path) as ledger:
         # 50-deep chain of the traced item, each step also seeing noise records.

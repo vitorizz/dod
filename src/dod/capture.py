@@ -7,7 +7,7 @@ Nothing is filtered by relevance or recency: a missed parent breaks trace and
 excision silently, while an extra edge only costs precision.
 
 Retrievals are held in memory and never touch the ledger; only writes,
-compactions, and bindings do.
+compactions, bindings, and deletions (tombstones) do.
 
 In-memory state and its lifecycle:
 
@@ -104,19 +104,27 @@ class Capture:
         binds: Iterable[Tuple[str, str]] = (),
         agent_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        deletes: Iterable[Tuple[str, str, Optional[str]]] = (),
     ) -> List[str]:
-        """Record several writes and binds in one ledger transaction.
+        """Record several writes, binds and deletions in one ledger transaction.
 
         Each of ``writes`` is ``(replaced, content, source, record_id)``: a
         compaction of ``replaced`` as with ``on_compaction`` (a plain write if
         ``replaced`` is empty), bound to ``record_id`` in the same transaction
         unless it is None. ``binds`` are ``(write_id, record_id)`` for writes
-        recorded earlier, with ``bind``'s rules. All or nothing: if the ledger
-        call raises, nothing is recorded and every write in ``binds`` stays
-        pending. Returns the new write IDs in order.
+        recorded earlier, with ``bind``'s rules. ``deletes`` are
+        ``(record_id, reason, write_id)`` tombstones in ``store``, as with
+        ``on_delete``. All or nothing: if the ledger call raises, nothing is
+        recorded and every write in ``binds`` stays pending. Returns the new
+        write IDs in order.
         """
         writes = [(list(r), c, s, rid) for r, c, s, rid in writes]
         binds = list(binds)
+        tombstones = [
+            dict(store=store, record_id=r, reason=reason, write_id=w,
+                 agent_id=agent_id, session_id=session_id)
+            for r, reason, w in deletes
+        ]
         with self._lock:
             ctx = self._context.get(key)
             parents = [(s, r, t) for (s, r), t in ctx.items()] if ctx else []
@@ -139,7 +147,7 @@ class Capture:
         ]
         write_ids = None
         try:
-            write_ids = self._ledger.append_batch(rows, bindings)
+            write_ids = self._ledger.append_batch(rows, bindings, tombstones)
         finally:
             with self._lock:
                 self._binding.difference_update(ids)
@@ -152,6 +160,28 @@ class Capture:
                     while len(self._pending) > self._max_pending:
                         self._pending.popitem(last=False)
         return write_ids
+
+    def on_delete(
+        self,
+        store: str,
+        record_ids: Iterable[str],
+        reason: str,
+        write_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Record a tombstone for each of ``record_ids``, deleted from ``store``.
+
+        Call after the store deleted them. ``reason`` is one of the ledger's
+        ``REASONS``; ``write_id`` is the recorded write whose save deleted
+        them, if any, and ``agent_id``/``session_id`` the actor. A deletion
+        has no parents, so no context key is involved.
+        """
+        self._ledger.append_tombstones(
+            dict(store=store, record_id=r, reason=reason, write_id=write_id,
+                 agent_id=agent_id, session_id=session_id)
+            for r in record_ids
+        )
 
     def snapshot(self, key: Hashable) -> Hashable:
         """Return a new key whose context is a copy of ``key``'s.

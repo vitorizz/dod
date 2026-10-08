@@ -19,6 +19,17 @@ def test_retrieve_and_write_p99_under_1ms(tmp_path):
     assert p99 < 1.0
 
 
+def test_on_delete_p99_under_1ms(tmp_path):
+    counter = iter(range(100_000))
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        cap = Capture(ledger)
+        p99 = p99_ms(
+            lambda: cap.on_delete("mem", [f"rec-{next(counter)}"], "forget", None, "a1", "s1"),
+            label="on_delete (1 record, on-disk)",
+        )
+    assert p99 < 1.0
+
+
 def test_bind_p99_under_1ms(tmp_path):
     n, warmup = 10_000, 1_000
     with Ledger(tmp_path / "ledger.db") as ledger:

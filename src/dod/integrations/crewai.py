@@ -44,21 +44,36 @@ Compaction
     runs on a copy of the caller's context, so the observation follows it. If
     any record was rewritten or deleted, each rewritten or newly saved record
     is recorded as a compaction, replacing every record the consolidation
-    consulted, rewrote or deleted. If records were only deleted, the
-    compaction is bound to the record ``remember`` returned (crewai returns
-    the first similar record, which may be one it just deleted). The
-    compactions and the write's bind go to the ledger in one transaction.
+    consulted, rewrote or deleted. Each deleted record gets a tombstone
+    (reason ``consolidation``) naming the ``remember`` write that caused it.
+    The compactions, tombstones and the write's bind go to the ledger in one
+    transaction.
 
 Direct edits and deletions
     ``update(record_id, ...)`` is recorded as a compaction of that record, with
     the scope's context, before the store write, and bound to it after. A
-    metadata-only update hashes the record's unchanged content.
-    ``forget(record_ids=...)`` is recorded as an unbound compaction whose
-    parents are the given IDs (with filters too, they over-include the deleted
-    set). Both are tagged ``agent_inference``: the method takes no source.
-    ``forget`` without ``record_ids``, ``reset`` and ``reset_all`` delete by
-    filter, and the storage API doesn't report which IDs it deleted, so they
-    pass through and log a warning on every call.
+    metadata-only update hashes the record's unchanged content. It is tagged
+    ``agent_inference``: the method takes no source.
+    ``forget``, ``reset`` and ``reset_all`` record a tombstone (reason
+    ``forget``, actor the current scope's agent and task, if any) for each
+    record they deleted. The storage API returns only a count, so the
+    wrapped ``storage.delete``/``storage.reset`` lists the affected records
+    before the call and records those gone after it: the given IDs for a
+    ``forget(record_ids=...)`` without other filters (``get_record`` each),
+    otherwise every record in the store. The listing runs inside crewai's
+    call, after ``reset`` has drained pending saves, so it covers them.
+
+    Capture never changes the delete. If the listing fails (a backend without
+    ``get_record``/``count``/``list_records``, or one that raises), a warning
+    is logged, nothing is recorded, and the delete runs as it would
+    uninstrumented. A failing post-delete listing or tombstone commit is
+    logged too: the delete's own result or exception is what the caller gets.
+
+    Limit: the before/after diff can't tell who deleted a record. A record
+    deleted concurrently by another caller (another agent's consolidation, a
+    concurrent ``forget``) during a filter delete is tombstoned as this
+    call's ``forget``, and a record added during the call and deleted by it
+    is missed.
 
 Quarantine
     ``recall`` drops results whose ``(store, record.id)`` the ledger has
@@ -110,6 +125,11 @@ _hook_stack: "contextvars.ContextVar[Tuple[Tuple[Key, Optional[Key]], ...]]" = (
 _pending_batch: "contextvars.ContextVar[Optional[_Batch]]" = contextvars.ContextVar(
     "dod_crewai_batch", default=None
 )
+# Record IDs deleted by storage during one forget/reset/reset_all.
+_deleting: "contextvars.ContextVar[Optional[List[str]]]" = contextvars.ContextVar(
+    "dod_crewai_deleting", default=None
+)
+_DELETE_MARK = "_dod_deletes_observed"
 
 # Code objects of callers that put every recall result into the prompt.
 _in_prompt_callers: set = set()
@@ -192,6 +212,7 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
     if type(memory).__module__.startswith("crewai."):
         _load_in_prompt_callers()
     _observe_storage(storage)
+    _observe_deletes(storage)
     _scope.register(capture)
 
     orig_recall = memory.recall
@@ -250,10 +271,9 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
             record = orig_remember(*args, **kwargs)
         finally:
             _observed.reset(token)
-            returned = [record] if record is not None else []
             binds = [(write_id, record.id)] if record is not None else []
             _settle(capture, ctx_key, obs, store, source, agent_id, session_id,
-                    binds, returned, content)
+                    binds, write_id)
         return record
 
     @functools.wraps(orig_remember_many)
@@ -299,9 +319,10 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
             _observed.reset(token)
             try:
                 returned = list(records or ())
+                # Which item's save deleted a record is unknown in a batch.
+                cause = batch.writes[0][1] if len(batch.writes) == 1 else None
                 _settle(capture, batch.key, obs, store, batch.source, batch.agent_id,
-                        batch.session_id, _batch_binds(batch, obs, returned), returned,
-                        batch.writes[0][0])
+                        batch.session_id, _batch_binds(batch, obs, returned), cause)
             finally:
                 capture.reset(batch.key)
         return records
@@ -341,36 +362,31 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
 
         wrapped.append(("update", update))
 
-    orig_forget = getattr(memory, "forget", None)
-    if orig_forget is not None:
-
-        @functools.wraps(orig_forget)
-        def forget(*args, **kwargs):
-            record_ids = list(_arg(args, kwargs, 4, "record_ids") or ())
-            if not record_ids:
-                _warn_uncaptured("forget")
-                return orig_forget(*args, **kwargs)
-            ctx_key, agent_id, session_id = scope("forget")
-            # Nothing survives a deletion, so the compaction stays unbound.
-            capture.on_batch(
-                ctx_key, store,
-                [([(store, r) for r in record_ids], "", "agent_inference", None)],
-                agent_id=agent_id, session_id=session_id,
-            )
-            return orig_forget(*args, **kwargs)
-
-        wrapped.append(("forget", forget))
-
-    for name in ("reset", "reset_all"):
+    for name in ("forget", "reset", "reset_all"):
         orig = getattr(memory, name, None)
         if orig is None:
             continue
 
-        def reset(*args, _orig=orig, _name=name, **kwargs):
-            _warn_uncaptured(_name)
-            return _orig(*args, **kwargs)
+        def delete(*args, _orig=orig, _name=name, **kwargs):
+            # The wrapped storage.delete/reset fills in what it deleted.
+            gone: List[str] = []
+            token = _deleting.set(gone)
+            try:
+                return _orig(*args, **kwargs)
+            finally:
+                _deleting.reset(token)
+                if gone:
+                    agent_id, session_id = _key.get() or (None, None)
+                    try:
+                        capture.on_delete(store, gone, "forget", None, agent_id,
+                                          session_id)
+                    except Exception:
+                        # The delete happened (or raised its own error, which
+                        # must propagate unchanged): log, don't raise.
+                        logger.warning("dod: couldn't record %d tombstones for %s()",
+                                       len(gone), _name, exc_info=True)
 
-        wrapped.append((name, functools.update_wrapper(reset, orig)))
+        wrapped.append((name, functools.update_wrapper(delete, orig)))
 
     for name, fn in wrapped:
         setattr(fn, _MARK, True)
@@ -497,9 +513,77 @@ def _observe_storage(storage: Any) -> None:
         object.__setattr__(storage, name, wrapper)
 
 
-def _settle(capture, key, obs, store, source, agent_id, session_id, binds, returned,
-            content) -> None:
-    """Record a save's compactions and binds in one ledger transaction."""
+def _observe_deletes(storage: Any) -> None:
+    """List what ``storage.delete``/``reset`` deletes during a wrapped
+    ``forget``/``reset``/``reset_all``, into ``_deleting``."""
+    for name in ("delete", "reset"):
+        orig = getattr(storage, name, None)
+        if orig is None or getattr(orig, _DELETE_MARK, False):
+            continue
+
+        def wrapper(*args, _orig=orig, _name=name, **kwargs):
+            gone = _deleting.get()
+            if gone is None:
+                return _orig(*args, **kwargs)
+            ids = _arg(args, kwargs, 2, "record_ids") if _name == "delete" else None
+            filtered = any(
+                _arg(args, kwargs, i, n)
+                for i, n in ((1, "categories"), (3, "older_than"), (4, "metadata_filter"))
+            )
+            # crewai's backends delete exactly the given IDs when no other
+            # filter is set (scope is ignored); otherwise list everything.
+            ids = list(dict.fromkeys(ids)) if ids and not filtered else None
+            # A backend's reset may call its own delete: list only once.
+            token = _deleting.set(None)
+            try:
+                before = _snapshot(storage, ids, _name)
+                try:
+                    return _orig(*args, **kwargs)
+                finally:
+                    # Also on failure: whatever it deleted before failing is gone.
+                    after = None if before is None else _snapshot(storage, ids, _name)
+                    if after is not None:
+                        gone.extend(sorted(before - after))
+            finally:
+                _deleting.reset(token)
+
+        functools.update_wrapper(wrapper, orig)
+        setattr(wrapper, _DELETE_MARK, True)
+        object.__setattr__(storage, name, wrapper)
+
+
+def _snapshot(storage: Any, ids: Optional[List[str]], name: str) -> Optional[set]:
+    """``_existing``, or None (logged) if the backend can't list its records.
+
+    Capture never stops or changes the delete: it runs, and records nothing.
+    """
+    try:
+        return _existing(storage, ids)
+    except Exception:
+        logger.warning(
+            "dod: couldn't list records around storage.%s(); its deletions are "
+            "not recorded", name, exc_info=True,
+        )
+        return None
+
+
+def _existing(storage: Any, ids: Optional[List[str]]) -> set:
+    """Which of ``ids`` are in ``storage``; every record ID if ``ids`` is None."""
+    if ids is not None:
+        return {r for r in ids if storage.get_record(r) is not None}
+    limit = storage.count() + 1
+    while True:
+        records = storage.list_records(limit=limit)
+        if len(records) < limit:
+            return {r.id for r in records}
+        limit *= 2  # records were added since count()
+
+
+def _settle(capture, key, obs, store, source, agent_id, session_id, binds, cause) -> None:
+    """Record a save's compactions, tombstones and binds in one ledger transaction.
+
+    ``cause`` is the write whose save ran the consolidation, if known.
+    """
     compactions = []
     touched = list(obs.deleted) + list(obs.updated)
     if touched:
@@ -508,15 +592,10 @@ def _settle(capture, key, obs, store, source, agent_id, session_id, binds, retur
         # the caller's own.
         merged = [(r, "agent_inference") for r in obs.updated.values()]
         merged += [(r, source) for r in obs.saved if r.id not in obs.updated]
-        if not merged:
-            # Delete-only: bind the compaction to the record(s) the call
-            # returned, so the deletion is never missing from the ledger.
-            merged = [(r, "agent_inference") for r in returned]
         compactions = [(replaced, r.content, src, r.id) for r, src in merged]
-        if not compactions:  # the save failed after deleting; nothing to bind
-            compactions = [(replaced, content, "agent_inference", None)]
-    if compactions or binds:
-        capture.on_batch(key, store, compactions, binds, agent_id, session_id)
+    deletes = [(rid, "consolidation", cause) for rid in obs.deleted]
+    if compactions or binds or deletes:
+        capture.on_batch(key, store, compactions, binds, agent_id, session_id, deletes)
 
 
 def _batch_binds(batch: _Batch, obs: _Consolidation, returned: list) -> list:
@@ -538,15 +617,6 @@ def _batch_binds(batch: _Batch, obs: _Consolidation, returned: list) -> list:
     if not binds and len(batch.writes) == 1 and len(returned) == 1:
         binds.append((batch.writes[0][1], returned[0].id))
     return binds
-
-
-def _warn_uncaptured(method: str) -> None:
-    # Every call: these are rare, and each one is a gap in the ledger.
-    logger.warning(
-        "dod: %s() deletes by filter; the deleted record IDs are unknown, so the "
-        "deletion is not in the ledger. Pass record_ids to forget() to record it.",
-        method,
-    )
 
 
 def _text(content: Any) -> Any:
