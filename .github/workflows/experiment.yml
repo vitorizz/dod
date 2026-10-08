@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "LiteLLM model string"
+        description: "CrewAI LLM model, provider/model"
         required: true
         default: "anthropic/claude-sonnet-5-5"
       steps:
@@ -60,7 +60,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[crewai,langgraph]"
+          pip install -e ".[crewai,langgraph,anthropic]"  # anthropic: CrewAI's native provider for anthropic/ models
 
       - name: Name the run
         run: echo "RUN_NAME=$(date -u +%Y%m%dT%H%M%SZ)-run${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
