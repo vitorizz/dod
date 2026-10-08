@@ -1,4 +1,6 @@
+import gc
 import random
+import shutil
 import sqlite3
 import threading
 import time
@@ -7,7 +9,7 @@ from collections import Counter
 import pytest
 from perf import SCALE
 
-from dod.ledger import Ledger
+from dod.ledger import INDEX_VERSION, Ledger
 from dod.query import Edge, TracedWrite, blast_radius, trace
 
 
@@ -233,7 +235,7 @@ def test_deleted_items_reported_and_still_walked(ledger):
     assert blast_radius(ledger, "mem", "c").deleted == {}
 
 
-def test_blast_radius_10k_ledger_from_root_under_250ms(path):
+def test_blast_radius_10k_ledger_from_root_under_100ms(path):
     rng = random.Random(10_000)
     with Ledger(path) as ledger:
         put(ledger, "mem", "r0", source="user")
@@ -246,9 +248,10 @@ def test_blast_radius_10k_ledger_from_root_under_250ms(path):
 
         blast_radius(ledger, "mem", "r0")  # warm the page cache
         # Best of several runs: the walk is O(ledger), so the minimum is its
-        # cost and the rest is scheduler noise. Measured min under 100 to ~130 ms on CI,
-        # ~125-185 ms on dev machines. The index fill lags a burst of appends,
-        # so most of this walk reads the not-yet-indexed tail.
+        # cost and the rest is scheduler noise. The background fill catches up
+        # once the appends stop, so the best run walks the lineage index:
+        # measured min ~50-85 ms on a dev machine (~150 ms with nothing
+        # indexed, all from the source tables).
         samples = []
         for _ in range(5):
             start = time.perf_counter()
@@ -260,7 +263,7 @@ def test_blast_radius_10k_ledger_from_root_under_250ms(path):
             f"min {elapsed_ms:.2f} ms, median {sorted(samples)[2]:.2f} ms"
         )
     assert len(r.descendants) > 9_000
-    assert elapsed_ms < 250 * SCALE
+    assert elapsed_ms < 100 * SCALE
 
 
 # --- Indexed walk (integer lineage index) ---------------------------------
@@ -587,6 +590,104 @@ def test_two_ledgers_filling_one_file_concurrently(path):
                 full_scan_blast_radius(path, "mongo", "seed")
 
 
+def test_lineage_file_is_derived_and_separate(path):
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        random_ledger(ledger, random.Random(5), 100)
+        fill_all(ledger)
+    # The ledger file holds no index tables; the lineage file holds them all.
+    main = {r[0] for r in sqlite3.connect(str(path)).execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert not main & {"items", "direct_children", "write_items", "index_filled"}
+    assert scalar(path, "PRAGMA lineage.user_version") == INDEX_VERSION
+    # Deleted, it is rebuilt from the ledger.
+    shutil.os.remove(f"{path}-lineage")
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        assert watermark(path) == 0
+        fill_all(ledger)
+        assert comparable(blast_radius(ledger, "mongo", "seed")) == \
+            full_scan_blast_radius(path, "mongo", "seed")
+    assert edge_rows(path, "index") == edge_rows(path, "parents")
+
+
+@pytest.mark.parametrize("damage", ["other_ledger", "garbage", "other_version", "restored_backup"])
+def test_stale_lineage_file_is_rebuilt(tmp_path, damage):
+    path = tmp_path / "ledger.db"
+    lineage = tmp_path / "ledger.db-lineage"
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        random_ledger(ledger, random.Random(3), 200)
+        fill_all(ledger)
+    if damage == "other_ledger":
+        other = tmp_path / "other.db"
+        with Ledger(other, checkpoint_interval=3600, background_index=False) as o:
+            random_ledger(o, random.Random(4), 300)
+            fill_all(o)
+        shutil.copy(f"{other}-lineage", lineage)
+    elif damage == "garbage":
+        lineage.write_bytes(b"not a database " * 1000)
+    elif damage == "other_version":
+        conn = sqlite3.connect(str(lineage))
+        conn.execute(f"PRAGMA user_version={INDEX_VERSION + 1}")
+        conn.close()
+    else:  # the ledger restored from a backup older than its lineage file
+        backup = tmp_path / "backup.db"
+        shutil.copy(path, backup)
+        with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+            for i in range(20):
+                put(ledger, "mongo", f"late{i}", [("mongo", "seed", "in_prompt")])
+            fill_all(ledger)
+        shutil.copy(backup, path)
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        fill_all(ledger)
+        assert comparable(blast_radius(ledger, "mongo", "seed")) == \
+            full_scan_blast_radius(path, "mongo", "seed")
+    assert edge_rows(path, "index") == edge_rows(path, "parents")
+    assert binding_rows(path, "index") == binding_rows(path, "bindings")
+    assert watermark(path) == max_seq(path)
+
+
+@pytest.mark.parametrize("fill_first", [False, True])
+def test_lazy_edges_are_the_walks_snapshot(path, fill_first):
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        random_ledger(ledger, random.Random(9), 200)
+        if fill_first:
+            fill_all(ledger)
+        lazy = blast_radius(ledger, "mongo", "seed")
+        expected = sorted(blast_radius(ledger, "mongo", "seed").edges)
+        # The ledger and the index move on before the edges are read.
+        for i in range(30):
+            put(ledger, "mongo", f"new{i}", [("mongo", "seed", "in_prompt")])
+        fill_all(ledger)
+        assert sorted(lazy.edges) == expected
+        assert len(blast_radius(ledger, "mongo", "seed").edges) == len(expected) + 30
+
+
+def test_in_memory_ledger_walks_with_and_without_index():
+    with Ledger(":memory:", checkpoint_interval=3600, background_index=False) as ledger:
+        random_ledger(ledger, random.Random(11), 300)
+        unindexed = comparable(blast_radius(ledger, "mongo", "seed"))
+        assert ledger._fill_index(100) is not None
+        half = comparable(blast_radius(ledger, "mongo", "seed"))
+        fill_all(ledger)
+        assert ledger._fill_index() is None
+        indexed = comparable(blast_radius(ledger, "mongo", "seed"))
+        assert unindexed == half == indexed
+        assert unindexed["descendants"]
+
+
+def test_walk_leaves_the_garbage_collector_as_it_found_it(ledger):
+    put(ledger, "mem", "a")
+    put(ledger, "mem", "b", [("mem", "a", "in_prompt")])
+    assert gc.isenabled()
+    assert blast_radius(ledger, "mem", "a").edges
+    assert gc.isenabled()
+    gc.disable()
+    try:
+        assert blast_radius(ledger, "mem", "a").edges
+        assert not gc.isenabled()
+    finally:
+        gc.enable()
+
+
 def build_clusters(ledger, n_clusters, size, rng):
     """A root item ``r0``, then ``n_clusters`` random DAGs of ``size`` writes
     each, every cluster's first write a child of ``r0``. The clusters' writes
@@ -640,8 +741,7 @@ def test_blast_radius_100k_ledger_indexed(path):
               f" full scan min {scan_ms:.0f} ms")
         assert len(r.descendants) == 100_000
         assert comparable(r) == expected
-    assert small_ms < 50 * SCALE
-    # Measured min ~1.1-1.4 s on CI, ~1.35-1.5 s on dev machines, ~0.65-0.75x
-    # the full scan.
-    assert root_ms < 2_500 * SCALE
+    assert small_ms < 10 * SCALE
+    # Measured min ~0.65-0.9 s on a dev machine, ~0.3-0.4x the full scan.
+    assert root_ms < 1_000 * SCALE
     assert root_ms < 2 * scan_ms

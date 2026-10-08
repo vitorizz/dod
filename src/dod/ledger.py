@@ -188,17 +188,23 @@ SELECT f.write_key IS (SELECT write_id FROM writes WHERE seq = f.writes_upto)
     AND f.binding_key IS (SELECT write_id FROM bindings WHERE rowid = f.bindings_upto)
 FROM lineage.index_filled f ORDER BY f.seq DESC LIMIT 1"""
 
-# Most writes (and, separately, bindings) one fill transaction indexes. A
-# fill never holds the ledger's write lock, so this only bounds a
-# transaction's size, not how long appends could wait.
-_FILL_MAX = 2000
-# Pause between fill transactions while the index is a full batch or more
-# behind; otherwise the background thread fills every _FILL_IDLE_POLL
-# seconds. Fewer, larger fills cost less in total and hand the GIL back and
-# forth less with the threads appending.
-_FILL_PAUSE = 0.001
+# Most writes (and, separately, bindings) one fill transaction indexes, while
+# writes are arriving (busy) and when they aren't (idle).
+_FILL_BUSY_MAX = 200
+_FILL_MAX = 1000
+# A fill never holds the ledger's write lock, but it still slows appends on
+# other threads while it runs: SQLite's allocator takes one process-wide
+# mutex (its memory statistics) on every allocation, so SQLite work on any
+# thread contends with every append. While writes are arriving, the fill
+# runs at most _FILL_BUSY_SHARE of the time; that keeps up with sustained
+# writes at realistic rates, and under heavier load the index lags (queries
+# read the rest from the source tables) and catches up once writes pause.
+_FILL_BUSY_SHARE = 0.02
+# Writes count as arriving until none has for _FILL_QUIET seconds. An idle
+# background thread looks for new writes every _FILL_IDLE_POLL seconds, and
+# fills back to back while a full batch or more is waiting.
+_FILL_QUIET = 0.1
 _FILL_IDLE_POLL = 0.02
-
 
 def _append_only(tables, prefix: str = "", replace=()) -> str:
     """Triggers that reject UPDATE and DELETE on ``tables`` and an INSERT
@@ -479,17 +485,20 @@ def _attach_index(conn: sqlite3.Connection, path: str) -> None:
     ledger) to ``conn`` as ``lineage``, creating it if new and rebuilding it
     if it is at another index version, unreadable, or filled from a
     different ledger."""
-    conn.execute("ATTACH DATABASE ? AS lineage", (path,))
     try:
+        conn.execute("ATTACH DATABASE ? AS lineage", (path,))
+        attached = True
         version = conn.execute("PRAGMA lineage.user_version").fetchone()[0]
         stale = version not in (0, INDEX_VERSION) or (
             version == INDEX_VERSION
             and (conn.execute(_INDEX_MATCHES).fetchone() or (1,))[0] != 1
         )
     except sqlite3.DatabaseError:  # not a database, or damaged
+        attached = "lineage" in {r[1] for r in conn.execute("PRAGMA database_list")}
         version, stale = 0, True
     if stale and path != ":memory:":
-        conn.execute("DETACH DATABASE lineage")
+        if attached:
+            conn.execute("DETACH DATABASE lineage")
         _remove_index(path)
         conn.execute("ATTACH DATABASE ? AS lineage", (path,))
         version = 0
@@ -654,11 +663,10 @@ class Ledger:
     ``close()`` stops it and runs a final checkpoint.
 
     Unless ``background_index`` is false (the index is then filled only by
-    calling ``_fill_index``), the same thread fills the lineage index in short
-    transactions sized to hold
-    the write lock ~0.2 ms each. While writes are arriving it pauses ~100x
-    that between them, so appends rarely wait behind one; when they stop, it
-    catches up at full speed.
+    calling ``_fill_index``), the same thread fills the lineage file. A fill
+    never takes the ledger's write lock, so appends don't wait for it; while
+    writes are arriving it still runs at most ~2% of the time (see
+    ``_FILL_BUSY_SHARE``), and when they stop it catches up at full speed.
 
     Safe to share across threads: appends are serialized with a lock.
     Quarantine reads use a third connection, so they never wait behind an
@@ -761,6 +769,7 @@ class Ledger:
     def _checkpoint_loop(self, interval: float, index: bool) -> None:
         next_ckpt = time.monotonic() + interval
         pause = min(interval, _FILL_IDLE_POLL) if index else interval
+        last_change, seen = -1e9, None
         while not self._stop.wait(pause):
             if time.monotonic() >= next_ckpt:
                 next_ckpt = time.monotonic() + interval
@@ -770,18 +779,34 @@ class Ledger:
                         self._ckpt_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except sqlite3.Error:
                     pass  # retried next interval
-            filled = None
-            if index:
-                try:
-                    filled = self._fill_index()
-                except sqlite3.Error:
-                    pass  # retried next round
-            # Far behind (a full batch): fill again right away. Otherwise wait
-            # a poll interval, so under sustained writes each fill takes the
-            # interval's writes in one transaction, not a few at a time.
-            pause = _FILL_PAUSE if filled and filled >= _FILL_MAX else max(
-                0.0, min(_FILL_IDLE_POLL if index else interval, next_ckpt - time.monotonic())
-            )
+            until_ckpt = max(0.0, next_ckpt - time.monotonic())
+            if not index:
+                pause = until_ckpt
+                continue
+            try:
+                with self._ckpt_lock:
+                    now = self._ckpt_conn.execute(
+                        "SELECT (SELECT max(seq) FROM writes), (SELECT max(rowid) FROM bindings)"
+                    ).fetchone()
+                if now != seen:
+                    if seen is not None:
+                        last_change = time.monotonic()
+                    seen = now
+                busy = time.monotonic() - last_change < _FILL_QUIET
+                limit = _FILL_BUSY_MAX if busy else _FILL_MAX
+                began = time.monotonic()
+                filled = self._fill_index(limit)
+                spent = time.monotonic() - began
+            except sqlite3.Error:
+                busy, filled = False, None  # retried next round
+            if busy:
+                # Writes are arriving: stay under _FILL_BUSY_SHARE of the time.
+                pause = spent * (1 / _FILL_BUSY_SHARE - 1) if filled else _FILL_IDLE_POLL
+            elif filled and filled >= limit:
+                pause = 0.0  # idle and a full batch behind: catch up
+            else:
+                pause = _FILL_IDLE_POLL
+            pause = min(pause, until_ckpt)
 
     def _index_watermarks(self, conn: sqlite3.Connection) -> Tuple[int, int, int]:
         """``(writes_upto, sets_upto, bindings_upto)``: the last write

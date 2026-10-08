@@ -85,10 +85,8 @@ def test_append_write_fresh_random_parents_p99_under_1ms(tmp_path, as_):
 
 
 def _watermark(ledger):
-    with ledger._read_lock:
-        return ledger._read_conn.execute(
-            "SELECT coalesce((SELECT writes_upto FROM index_filled ORDER BY seq DESC LIMIT 1), 0)"
-        ).fetchone()[0]
+    with ledger._index_lock:
+        return ledger._index_watermarks(ledger._index_conn)[0]
 
 
 @pytest.mark.parametrize("as_", ["parents", "context"])

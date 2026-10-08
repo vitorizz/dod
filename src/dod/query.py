@@ -14,6 +14,7 @@ import json
 import sqlite3
 import threading
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
@@ -671,18 +672,41 @@ def blast_radius(
     finally:
         release()
 
-    # Building tens of thousands of tuples triggers repeated generational
-    # collections that find nothing to free; pause the collector meanwhile.
-    gc_was_enabled = gc.isenabled()
-    gc.disable()
-    try:
+    with _gc_paused():
         return _blast_result(
             ledger, store, record_id, max_depth, bounds, reached, bound, truncated,
             deleted_rows,
         )
+
+
+# Walks building their results right now, and whether the collector was
+# enabled when the first of them began. Guarded by _gc_lock.
+_gc_lock = threading.Lock()
+_gc_pauses = [0, False]
+
+
+@contextmanager
+def _gc_paused():
+    """Pause the cyclic garbage collector while building a large result.
+
+    Tens of thousands of new tuples trigger repeated generational
+    collections that find nothing to free (~25% of a 100k-write walk). The
+    switch is process-wide, so overlapping walks share one pause: the first
+    turns the collector off if it was on, and the last turns it back on. A
+    collector the application disabled stays disabled.
+    """
+    with _gc_lock:
+        if _gc_pauses[0] == 0:
+            _gc_pauses[1] = gc.isenabled()
+            gc.disable()
+        _gc_pauses[0] += 1
+    try:
+        yield
     finally:
-        if gc_was_enabled:
-            gc.enable()
+        with _gc_lock:
+            _gc_pauses[0] -= 1
+            if _gc_pauses[0] == 0 and _gc_pauses[1]:
+                gc.enable()
 
 
 def _bounds(ledger: Ledger, conn: sqlite3.Connection) -> Dict[str, int]:
@@ -840,16 +864,11 @@ def _load_edges(
         release()
     edges = []
     append = edges.append
-    gc_was_enabled = gc.isenabled()
-    gc.disable()  # see blast_radius
-    try:
+    with _gc_paused():
         for (item, seq), tag in rows.items():
             s, r = names[item]
             child = wid[seq]
             t = _TAG[tag]
             for parent in by_item[item]:
                 append(_edge((child, s, r, t, wid[parent])))
-    finally:
-        if gc_was_enabled:
-            gc.enable()
     return edges

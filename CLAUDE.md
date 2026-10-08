@@ -70,7 +70,7 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 
 ## Stack
 - Python >= 3.9 (CI runs 3.12). Package `dod` in `src/` layout, built with hatchling (`pyproject.toml`).
-- Ledger: stdlib `sqlite3`, append-only, WAL mode. No ORM.
+- Ledger: stdlib `sqlite3`, append-only, WAL mode. No ORM. The lineage index (integers, for `blast_radius`) lives in a companion file, `<ledger>-lineage`, filled by the ledger's background thread; it is derived, so it is rebuilt (never migrated) when missing, stale or at another `INDEX_VERSION`.
 - Tests: pytest. Benchmarks are plain pytest tests using `tests/perf.py` (p50/p99 via `time.perf_counter_ns`). Bars are CI's; `DOD_PERF_SCALE` (default 1.0) divides measured times so a slower dev machine can scale them, and benchmarks that time themselves multiply their bar by `perf.SCALE`.
 - Framework integrations are optional extras, never core dependencies: `[crewai]` pins `crewai==1.15.22`; `[langgraph]` pins `langgraph==1.2.14` and `langgraph-checkpoint==4.2.0` (where `BaseStore` lives); `[anthropic]` pins `anthropic==1.12.1` (memory tool `memory_20250818`, `anthropic.tools.memory`); `[otel]` pins `opentelemetry-api==1.45.1` and `opentelemetry-sdk==1.45.1` (the SDK for tests).
 - Exporters are `Capture` observers in `dod.export` (`Capture(ledger, observers=[...])`, called after the ledger commit, failing open). `dod.export.otel.OTelObserver` emits `dod.*` span events only, never `gen_ai.*`.
