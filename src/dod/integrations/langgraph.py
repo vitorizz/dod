@@ -37,6 +37,16 @@ Reads
     context as ``retrieved_in_scope``: the store can't see the prompt.
     ``list_namespaces`` returns no items.
 
+Quarantine
+    Items the ledger has quarantined are dropped from ``GetOp`` (returns
+    ``None``) and ``SearchOp`` results before they reach the caller or the
+    context, as in the CrewAI integration (``dod.quarantine``). The pre-read
+    of a put still sees them, so overwriting one is a compaction.
+
+Excision
+    ``DeleteAdapter(store)`` lets ``dod.excise`` delete items through the
+    instrumented ``delete``, so each deletion is tombstoned.
+
 Writes
     Before the store call, the instrumented store reads the keys being put
     (one extra ``batch`` with ``refresh_ttl=False``) and records every put in
@@ -47,9 +57,10 @@ Writes
       call succeeds. If the call raises, the write stays unbound.
     - A put over an existing key is a compaction whose parents include the
       overwritten item, bound the same way.
-    - A delete (a put with ``None``) of an existing item is an unbound
-      compaction with the deleted item as parent. A delete of a missing key
-      deletes nothing and isn't recorded.
+    - A delete (a put with ``None``) of an existing item records a tombstone
+      (reason ``forget``, or ``excision`` when called by ``dod.excise``; actor
+      the current scope's agent and task, if any) after the store call
+      succeeds. A delete of a missing key deletes nothing and isn't recorded.
 
     The read and the put aren't atomic: a key created by another writer in
     between is recorded as a plain write. When one batch puts the same key
@@ -65,6 +76,8 @@ from langgraph.store.base import BaseStore, GetOp, PutOp, SearchOp
 
 from dod import scope as _scope
 from dod.capture import Capture
+from dod.excise import deletion_reason
+from dod.quarantine import QuarantineCache, count_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -102,42 +115,45 @@ def instrument(store: Any, capture: Capture, store_name: str = "langgraph") -> A
     _scope.register(capture)
     cls = type(store)
     warned = []
+    quarantine = QuarantineCache(capture._ledger)
 
     def record(puts: List[PutOp], found: list) -> Tuple[Any, list]:
-        """Record the batch's puts; return the context key and pending binds."""
+        """Record the batch's writes; return what ``settle`` records after
+        the store call: the context key, actor, pending binds and deletes."""
         key = _scope.current_key()
-        if key is not None:
-            ctx_key, agent_id, session_id = key, key[0], key[1]
-        else:
-            if not warned:
-                warned.append(True)
-                logger.warning("dod: put outside agent_task_scope; recorded with no parents")
-            # A fresh key has no context, and no other write can share it.
-            ctx_key, agent_id, session_id = object(), None, None
-        writes, rids = [], []
+        agent_id, session_id = key if key is not None else (None, None)
+        # A fresh key has no context, and no other write can share it.
+        ctx_key = key if key is not None else object()
+        writes, rids, deletes = [], [], []
         for op, old in zip(puts, found):
             rid = record_id(op.namespace, op.key)
-            replaced = [(store_name, rid)] if old is not None else []
             if op.value is not None:
+                replaced = [(store_name, rid)] if old is not None else []
                 writes.append((replaced, _content(op.value), _SOURCE, None))
                 rids.append(rid)
             elif old is not None:
-                # Nothing survives a deletion, so the compaction stays unbound.
-                writes.append((replaced, "", _SOURCE, None))
-                rids.append(None)
-        if not writes:
-            return ctx_key, []
-        ids = capture.on_batch(
-            ctx_key, store_name, writes, agent_id=agent_id, session_id=session_id
-        )
-        return ctx_key, [(w, r) for w, r in zip(ids, rids) if r is not None]
+                deletes.append((rid, deletion_reason(), None))
+        ids = []
+        if writes:
+            if key is None and not warned:
+                warned.append(True)
+                logger.warning("dod: put outside agent_task_scope; recorded with no parents")
+            ids = capture.on_batch(
+                ctx_key, store_name, writes, agent_id=agent_id, session_id=session_id
+            )
+        binds = list(zip(ids, rids))
+        return ctx_key, agent_id, session_id, binds, deletes
 
-    def settle(ctx_key: Any, binds: list, ops: list, results: list) -> None:
-        if binds:
-            capture.on_batch(ctx_key, store_name, binds=binds)
+    def settle(pending: tuple, ops: list, results: list) -> list:
+        """Record binds and tombstones, then filter and track the reads."""
+        ctx_key, agent_id, session_id, binds, deletes = pending
+        if binds or deletes:
+            capture.on_batch(ctx_key, store_name, binds=binds, agent_id=agent_id,
+                             session_id=session_id, deletes=deletes)
+        results = _drop_quarantined(quarantine.current(), store_name, ops, results)
         key = _scope.current_key()
         if key is None:
-            return
+            return results
         items = []
         for op, result in zip(ops, results):
             if isinstance(op, GetOp) and result is not None:
@@ -146,24 +162,23 @@ def instrument(store: Any, capture: Capture, store_name: str = "langgraph") -> A
                 items += [(store_name, record_id(i.namespace, i.key)) for i in result or ()]
         if items:
             capture.on_retrieve(key, items)
+        return results
 
     @functools.wraps(cls.batch)
     def batch(self, ops):
         ops, puts = _plan(ops)
         found = cls.batch(self, _reads(puts)) if puts else []
-        ctx_key, binds = record(puts, found)
+        pending = record(puts, found)
         results = cls.batch(self, ops)
-        settle(ctx_key, binds, ops, results)
-        return results
+        return settle(pending, ops, results)
 
     @functools.wraps(cls.abatch)
     async def abatch(self, ops):
         ops, puts = _plan(ops)
         found = (await cls.abatch(self, _reads(puts))) if puts else []
-        ctx_key, binds = record(puts, found)
+        pending = record(puts, found)
         results = await cls.abatch(self, ops)
-        settle(ctx_key, binds, ops, results)
-        return results
+        return settle(pending, ops, results)
 
     for fn in (batch, abatch):
         setattr(fn, _MARK, True)
@@ -172,9 +187,32 @@ def instrument(store: Any, capture: Capture, store_name: str = "langgraph") -> A
     # layout, so the instance can switch to it in place.
     store.__class__ = type(
         cls.__name__, (cls,),
-        {"__slots__": (), "__module__": cls.__module__, "batch": batch, "abatch": abatch},
+        {"__slots__": (), "__module__": cls.__module__, "batch": batch, "abatch": abatch,
+         "_dod_base": cls},
     )
     return store
+
+
+class DeleteAdapter:
+    """Delete adapter for ``dod.excise``: deletes one item through the
+    instrumented ``delete``, which records its tombstone."""
+
+    def __init__(self, store: Any) -> None:
+        if not getattr(getattr(store, "batch", None), _MARK, False):
+            raise TypeError("store must be instrumented with dod's langgraph.instrument")
+        self.store = store
+
+    def delete(self, record_id: str) -> bool:
+        """Delete the item ``record_id`` names; return False if it wasn't there."""
+        *namespace, key = json.loads(record_id)
+        # Check through the uninstrumented store: not a retrieval, and it must
+        # see quarantined items too.
+        base = type(self.store)._dod_base
+        (found,) = base.batch(self.store, [GetOp(tuple(namespace), key, refresh_ttl=False)])
+        if found is None:
+            return False
+        self.store.delete(tuple(namespace), key)
+        return True
 
 
 def _plan(ops: Iterable[Any]) -> Tuple[list, List[PutOp]]:
@@ -190,6 +228,34 @@ def _plan(ops: Iterable[Any]) -> Tuple[list, List[PutOp]]:
 def _reads(puts: List[PutOp]) -> List[GetOp]:
     # Not a retrieval: nothing read here reaches the model.
     return [GetOp(op.namespace, op.key, refresh_ttl=False) for op in puts]
+
+
+def _drop_quarantined(blocked: frozenset, store_name: str, ops: list, results: list) -> list:
+    """``results`` with quarantined items removed: a ``GetOp`` finds nothing,
+    a ``SearchOp`` omits them. Each dropped item is counted."""
+    if not blocked:
+        return results
+    dropped, out = [], list(results)
+    for i, (op, result) in enumerate(zip(ops, results)):
+        if isinstance(op, GetOp) and result is not None:
+            item = (store_name, record_id(result.namespace, result.key))
+            if item in blocked:
+                dropped.append(item)
+                out[i] = None
+        elif isinstance(op, SearchOp) and result:
+            kept = []
+            for r in result:
+                item = (store_name, record_id(r.namespace, r.key))
+                if item in blocked:
+                    dropped.append(item)
+                else:
+                    kept.append(r)
+            if len(kept) != len(result):
+                out[i] = kept
+    if not dropped:
+        return results
+    count_blocked(dropped)
+    return out
 
 
 def _content(value: Optional[dict]) -> str:

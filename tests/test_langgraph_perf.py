@@ -65,3 +65,45 @@ def test_search_overhead_p99_under_1ms(tmp_path):
             )
     print(f"search overhead p99 ~ {p99 - base:.4f} ms")
     assert p99 - base < 1.0
+
+
+def test_search_with_1000_quarantined_overhead_p99_under_1ms(tmp_path):
+    # 10 results, 2 of them quarantined, among 1,000 quarantined items.
+    from dod.integrations.langgraph import record_id
+
+    base = p99_ms(_search(_seeded(InMemoryStore())), rounds=3, label="raw search (10 results)")
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        ledger.quarantine([("langgraph", f"other-{i}") for i in range(998)])
+        ledger.quarantine([("langgraph", record_id(("facts",), k)) for k in ("f3", "f7")])
+        store = instrument(_seeded(InMemoryStore()), Capture(ledger))
+
+        def run():
+            assert len(store.search(("facts",), limit=10)) == 8
+
+        with agent_task_scope("agent", "task"):
+            p99 = p99_ms(run, rounds=3,
+                         label="instrumented search (10 results, 1,000 quarantined)")
+    print(f"quarantined search overhead p99 ~ {p99 - base:.4f} ms")
+    assert p99 - base < 1.0
+
+
+def test_delete_overhead_p99_under_1ms(tmp_path):
+    # Each delete: one pre-read, then a tombstone commit after the store call.
+    n = 5_000
+
+    def deleter(store):
+        keys = itertools.count()
+        for i in range(n + 1_000):
+            store.put(NS, f"k{i}", {"text": "x"})
+        return lambda: store.delete(NS, f"k{next(keys)}")
+
+    base = p99_ms(deleter(InMemoryStore()), n=n, rounds=1, label="raw delete")
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        store = instrument(InMemoryStore(), Capture(ledger))
+        p99s = []
+        for _ in range(3):  # fresh keys each round
+            store._data.clear()
+            p99s.append(p99_ms(deleter(store), n=n, label="instrumented delete (on-disk)"))
+    p99 = sorted(p99s)[1]
+    print(f"delete overhead p99 ~ {p99 - base:.4f} ms")
+    assert p99 - base < 1.0

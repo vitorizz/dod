@@ -205,17 +205,47 @@ def test_overwrite_is_compaction_of_overwritten_item(path, ledger, store):
     assert {w.write_id for w in t.items} == {w1, w2}
 
 
-def test_delete_is_unbound_compaction_of_deleted_item(path, store):
+def tombstones(path):
+    return raw(path).execute(
+        "SELECT store, record_id, reason, write_id, agent_id, session_id"
+        " FROM tombstones ORDER BY seq"
+    ).fetchall()
+
+
+def test_delete_records_a_tombstone_not_a_write(path, store):
     with agent_task_scope("agent", "task"):
         store.put(NS, "a", {"text": "A"})
         store.delete(NS, "a")
         store.delete(NS, "never-existed")  # deletes nothing: not recorded
-    assert len(writes(path)) == 2
-    d = writes(path)[-1]
-    assert parents(path, d[0]) == {rid("a"): "in_prompt"}
-    assert bound(path, d[0]) == []
-    assert d[5] == hashlib.sha256(b"").hexdigest()
+    assert len(writes(path)) == 1
+    assert tombstones(path) == [("langgraph", rid("a"), "forget", None, "agent", "task")]
     assert store.get(NS, "a") is None
+
+
+def test_delete_outside_scope_records_tombstone_without_warning(path, store, caplog):
+    store.put(NS, "a", {"text": "A"})
+    caplog.clear()
+    store.delete(NS, "a")
+    assert tombstones(path) == [("langgraph", rid("a"), "forget", None, None, None)]
+    assert "outside agent_task_scope" not in caplog.text
+
+
+class FailingDeleteStore(InMemoryStore):
+    __slots__ = ()
+
+    def batch(self, ops):
+        ops = list(ops)
+        if any(isinstance(o, PutOp) and o.value is None for o in ops):
+            raise RuntimeError("store down")
+        return super().batch(ops)
+
+
+def test_failed_delete_records_no_tombstone(path, cap):
+    s = instrument(FailingDeleteStore(), cap)
+    s.put(NS, "a", {"text": "A"})
+    with pytest.raises(RuntimeError):
+        s.delete(NS, "a")
+    assert tombstones(path) == []
 
 
 def test_batch_with_duplicate_key_records_the_last_put(path, store):
@@ -240,13 +270,12 @@ def test_async_variants_are_captured_identically(path, store):
             await store.adelete(NS, "b")
 
     asyncio.run(run())
-    a, b, a2, d = [w[0] for w in writes(path)]
+    a, b, a2 = [w[0] for w in writes(path)]
     assert parents(path, b) == {rid("a"): "retrieved_in_scope"}
     assert bound(path, b) == [rid("b")]
     assert parents(path, a2) == {rid("a"): "in_prompt"}
     assert bound(path, a2) == [rid("a")]
-    assert parents(path, d) == {rid("a"): "retrieved_in_scope", rid("b"): "in_prompt"}
-    assert bound(path, d) == []
+    assert tombstones(path) == [("langgraph", rid("b"), "forget", None, "agent", "task")]
 
 
 def test_failed_async_put_leaves_write_unbound(path, cap):
@@ -321,3 +350,37 @@ def test_search_items_map_to_put_record_ids(path, store):
         store.put(("users", "u1"), "k", {"text": "A"})
         (item,) = store.search(("users",))
     assert record_id(item.namespace, item.key) == bound(path, writes(path)[0][0])[0]
+
+
+# --- Quarantine --------------------------------------------------------------
+
+
+def test_quarantined_items_are_not_returned_or_recorded_as_parents(path, ledger, store):
+    from dod.quarantine import _blocked, blocked_retrievals
+
+    _blocked.clear()
+    store.put(NS, "good", {"text": "G"})
+    store.put(NS, "bad", {"text": "B"})
+    ledger.quarantine([("langgraph", rid("bad"))])
+    with agent_task_scope("agent", "task"):
+        assert store.get(NS, "bad") is None
+        assert [i.key for i in store.search(NS)] == ["good"]
+        store.put(NS, "c", {"text": "C"})
+    assert parents(path, writes(path)[-1][0]) == {rid("good"): "retrieved_in_scope"}
+    assert blocked_retrievals() == {("langgraph", rid("bad")): 2}
+
+    # Overwriting a quarantined key is still seen as a compaction.
+    with agent_task_scope("agent", "task2"):
+        store.put(NS, "bad", {"text": "B2"})
+    assert parents(path, writes(path)[-1][0]) == {rid("bad"): "in_prompt"}
+
+    ledger.release([("langgraph", rid("bad"))])
+    assert store.get(NS, "bad").value == {"text": "B2"}
+
+    async def run():
+        ledger.quarantine([("langgraph", rid("good"))])
+        assert await store.aget(NS, "good") is None
+        assert [i.key for i in await store.asearch(NS)] == ["bad", "c"]
+
+    asyncio.run(run())
+    _blocked.clear()
