@@ -1,0 +1,33 @@
+model: anthropic/claude-sonnet-5-5  steps: 10  seeds: 1  code: ca34136c9dad0df41ef07aa482e22e7ef44ea576
+ERROR:root:Anthropic API call failed: Messages.create() got an unexpected keyword argument 'temperature'
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/runner/work/dod/dod/experiments/propagation/run.py", line 196, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/runner/work/dod/dod/experiments/propagation/run.py", line 179, in main
+    runs = [run_one(c) for c in cfgs]
+            ^^^^^^^^^^
+  File "/home/runner/work/dod/dod/experiments/propagation/run.py", line 71, in run_one
+    r = scenario.run(cfg, d, ledger, agent)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/dod/dod/experiments/propagation/scenario.py", line 247, in run
+    value = agent.decide(topic, policy, [t for _, t in prompt])
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/dod/dod/experiments/propagation/scenario.py", line 171, in decide
+    reply = self.llm.call([{"role": "user", "content": (
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/crewai/llms/providers/anthropic/completion.py", line 437, in call
+    return self._handle_completion(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/crewai/llms/providers/anthropic/completion.py", line 1052, in _handle_completion
+    raise e from e
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/crewai/llms/providers/anthropic/completion.py", line 1046, in _handle_completion
+    response = self._get_sync_client().messages.create(**params)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.12.15/x64/lib/python3.12/site-packages/anthropic/_utils/_utils.py", line 294, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+TypeError: Messages.create() got an unexpected keyword argument 'temperature'
+llm mode: 1 run(s) x 10 steps = ~10 LLM calls to anthropic/claude-sonnet-5-5, one per step.
