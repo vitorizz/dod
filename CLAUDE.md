@@ -72,7 +72,7 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 - Python >= 3.9 (CI runs 3.12). Package `dod` in `src/` layout, built with hatchling (`pyproject.toml`).
 - Ledger: stdlib `sqlite3`, append-only, WAL mode. No ORM.
 - Tests: pytest. Benchmarks are plain pytest tests using `tests/perf.py` (p50/p99 via `time.perf_counter_ns`).
-- Framework integrations are optional extras, never core dependencies: `[crewai]` pins `crewai==1.15.22`; `[langgraph]` pins `langgraph==1.2.14` and `langgraph-checkpoint==4.2.0` (where `BaseStore` lives).
+- Framework integrations are optional extras, never core dependencies: `[crewai]` pins `crewai==1.15.22`; `[langgraph]` pins `langgraph==1.2.14` and `langgraph-checkpoint==4.2.0` (where `BaseStore` lives); `[anthropic]` pins `anthropic==1.12.1` (memory tool `memory_20250818`, `anthropic.tools.memory`).
 - The context scope (`agent_task_scope`) lives in `dod.scope` and is shared by every integration, so one scope links retrievals and writes across stores.
 - CI and agents: GitHub Actions (`ci.yml`, `claude.yml`, `claude-code-review.yml`, `project-board.yml`, `update-branches.yml`).
 
@@ -86,9 +86,11 @@ pip install -e ".[dev,crewai]"       # add the real CrewAI dependency
 pytest -q -m crewai                  # CrewAI integration tests (skipped without crewai)
 pip install -e ".[dev,langgraph]"    # add LangGraph (InMemoryStore needs no service)
 pytest -q -m langgraph               # LangGraph + cross-store tests (skipped without langgraph)
+pip install -e ".[dev,anthropic]"    # add the Anthropic SDK (memory tool; no API calls in tests)
+pytest -q -m anthropic               # memory tool tests (skipped without anthropic)
 ```
 In agent runs, use these exact forms. Don't create a venv or call pip through `python -m`: they are not in the allowed tools and get denied. (`python -m pytest` is allowed.)
-CI's `test` job installs both integrations, so every test runs; `test-core` runs without them to keep the core dependency-free. CrewAI unit tests use a stub mirroring the pinned `Memory` signatures; tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore`, are marked `langgraph`, and skip without it.
+CI's `test` job installs both integrations, so every test runs; `test-core` runs without them to keep the core dependency-free. CrewAI unit tests use a stub mirroring the pinned `Memory` signatures; tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore`, are marked `langgraph`, and skip without it. Memory tool tests run `BetaLocalFilesystemMemoryTool` in a temp dir via `tool.call({...})` (no network), are marked `anthropic`, and skip without it; CI's `test` job doesn't install `[anthropic]` yet (#54 needs a separate `ci.yml` change).
 
 ## Workflow
 1. Every change starts as an issue using the agent-task template (Goal / Acceptance criteria / Files involved), sized for one PR. New issues go on the board as Backlog with Priority and Size.

@@ -37,6 +37,7 @@ Not on PyPI yet. From a clone:
 ```bash
 pip install -e ".[crewai]"      # CrewAI memory (crewai==1.15.22)
 pip install -e ".[langgraph]"   # LangGraph Store (langgraph==1.2.14)
+pip install -e ".[anthropic]"   # Anthropic memory tool (anthropic==1.12.1)
 pip install -e ".[crewai,langgraph]"   # both, for the quickstart
 ```
 
@@ -113,7 +114,7 @@ Inside a crew, call `crewai.install_task_scopes()` once instead of entering scop
 What it does **not** do:
 
 - **No automated detection of bad memories.** You identify the bad output; `dod` traces it to its origin and shows what it reached.
-- Quarantine is enforced by the instrumented stores (CrewAI recall, LangGraph `get`/`search`); reads that bypass them see quarantined items.
+- Quarantine is enforced by the instrumented stores (CrewAI recall, LangGraph `get`/`search`, memory tool `view`); reads that bypass them see quarantined items.
 - Writes that bypass an instrumented store (direct database inserts, uninstrumented tools) are not captured.
 
 ## Status
@@ -122,9 +123,10 @@ Supported:
 
 - **CrewAI 1.15.22** `Memory`: `recall`, `remember`, `remember_many`, `update`, `forget`, `reset`, `reset_all`, and consolidation on save. Rewrites are recorded as compactions; every deleted record gets an append-only tombstone, so `trace` and `blast_radius` report what was deleted and why.
 - **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`).
-- `trace`, `blast_radius`, quarantine/release, and `excise` (quarantine or delete), across both stores through one ledger.
+- **Anthropic memory tool** (anthropic 1.12.1, `memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and `clear_all_memory`, on `BetaAbstractMemoryTool`/`BetaAsyncAbstractMemoryTool` subclasses that keep the default `call` (such as `BetaLocalFilesystemMemoryTool`). A viewed file is an `in_prompt` parent; the record ID is the memory path.
+- `trace`, `blast_radius`, quarantine/release, and `excise` (quarantine or delete), across all three stores through one ledger.
 
-Next: regenerate (rewrite derived items without the bad parent), more integrations (LangGraph agents, Pydantic AI, Anthropic memory tool, an MCP gateway), and export of edges as OpenTelemetry attributes.
+Next: regenerate (rewrite derived items without the bad parent), more integrations (LangGraph agents, Pydantic AI, an MCP gateway), and export of edges as OpenTelemetry attributes.
 
 ## Demo
 
