@@ -1,0 +1,29 @@
+name: Update PR branches
+
+# After every push to main, merge main into open PRs that are behind so CI and review
+# rerun on current code. Uses PAT_TOKEN: pushes made with GITHUB_TOKEN don't trigger CI.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: update-branches
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update behind PRs
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.ref_name }}
+        run: bash scripts/update-branches.sh

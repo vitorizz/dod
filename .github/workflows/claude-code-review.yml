@@ -25,6 +25,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Comments created before this point belong to earlier reviews.
+      - name: Record review start time
+        id: start
+        run: echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
@@ -63,4 +68,29 @@ jobs:
             Post specific issues as inline comments with `mcp__github_inline_comment__create_inline_comment`,
             then one summary with `gh pr comment` listing blocking vs. non-blocking findings.
             If there are no issues, say so explicitly and state what you checked.
-          claude_args: '--model claude-sonnet-5 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(pip install *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *)"'
+            The summary comment must end with one line per blocking finding of exactly `BLOCKING_FILE: <path>`
+            (the repo-relative file it is in, or `-` if it isn't tied to one file), then a final line of exactly
+            `BLOCKING: <count>`, where <count> is the number of blocking findings (`BLOCKING: 0` if none).
+            Automation reads these lines.
+          claude_args: '--model claude-sonnet-5-5 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(pip install *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *)"'
+
+      # The next step holds PAT_TOKEN, so run the script as it is on the base branch:
+      # a PR (including an agent run, which can't touch workflows) can change scripts/.
+      - name: Checkout base-branch scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          sparse-checkout: scripts
+
+      # Asks Claude to fix blocking items, up to 3 rounds per PR, then hands off via needs-human.
+      # Uses PAT_TOKEN: comments made with GITHUB_TOKEN don't trigger claude.yml.
+      - name: Request fixes for blocking findings
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.ts }}
+          FIX_MSG: "@claude fix the blocking items in the latest review"
+          MAX_ROUNDS: 3
+        run: bash base/scripts/review-auto-fix.sh
