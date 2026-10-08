@@ -1,0 +1,504 @@
+{
+  "schema_version": 1,
+  "config": {
+    "mode": "llm",
+    "steps": 60,
+    "error_rate": null,
+    "facts": 6,
+    "customers": 4,
+    "prompt_k": 4,
+    "max_notes": 4,
+    "model": "anthropic/claude-haiku-5-5"
+  },
+  "runs": [
+    {
+      "seed": 0,
+      "use_prob": null,
+      "tasks": {
+        "answer": 29,
+        "note": 15,
+        "summarize": 16
+      },
+      "ledger": {
+        "writes": 67,
+        "items": 57,
+        "tombstoned_items": 3
+      },
+      "planted": [
+        {
+          "store": "crewai",
+          "record_id": "d9eebb67-48bf-4955-a424-1005bf502429",
+          "derived_writes": 41,
+          "derived_writes_in_prompt": 9,
+          "derived_over_time": [
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            2,
+            3,
+            3,
+            3,
+            4,
+            4,
+            4,
+            4,
+            5,
+            5,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            16,
+            17,
+            17,
+            18,
+            19,
+            20,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            37,
+            38,
+            39,
+            40,
+            41
+          ],
+          "max_depth": 4,
+          "stores_reached": {
+            "crewai": 11,
+            "langgraph": 30
+          },
+          "contaminating_edges": {
+            "in_prompt": 139,
+            "retrieved_in_scope": 34,
+            "in_prompt_share": 0.8035
+          },
+          "deleted_derived_items": 0,
+          "excise": {
+            "items": 35,
+            "wrong": 9,
+            "correct": 26
+          },
+          "excise_in_prompt": {
+            "items": 9,
+            "wrong": 9,
+            "correct": 0
+          }
+        }
+      ],
+      "outputs": {
+        "total": 29,
+        "wrong": 5,
+        "wrong_tracing_to_planted": 5,
+        "wrong_tracing_to_planted_in_prompt": 5,
+        "fraction_wrong_tracing": 1.0,
+        "fraction_wrong_tracing_in_prompt": 1.0,
+        "correct_tracing_to_planted": 15
+      },
+      "wipe": {
+        "items": 54,
+        "wrong": 9,
+        "correct": 45
+      },
+      "headline": {
+        "derived_writes": 41,
+        "derived_writes_in_prompt": 9,
+        "max_depth": 4,
+        "stores_reached": 2,
+        "in_prompt_share": 0.8035,
+        "outputs_wrong": 5,
+        "fraction_wrong_tracing": 1.0,
+        "fraction_wrong_tracing_in_prompt": 1.0,
+        "excise_items": 35,
+        "excise_correct": 26,
+        "excise_in_prompt_items": 9,
+        "excise_in_prompt_correct": 0,
+        "wipe_items": 54,
+        "wipe_correct": 45
+      }
+    },
+    {
+      "seed": 1,
+      "use_prob": null,
+      "tasks": {
+        "answer": 32,
+        "note": 17,
+        "summarize": 11
+      },
+      "ledger": {
+        "writes": 67,
+        "items": 61,
+        "tombstoned_items": 4
+      },
+      "planted": [
+        {
+          "store": "crewai",
+          "record_id": "69d2bd0a-d1c2-430d-841a-9d5af24e549c",
+          "derived_writes": 43,
+          "derived_writes_in_prompt": 9,
+          "derived_over_time": [
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            4,
+            4,
+            5,
+            6,
+            7,
+            8,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            13,
+            14,
+            14,
+            15,
+            15,
+            15,
+            16,
+            16,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            40,
+            41,
+            42,
+            43
+          ],
+          "max_depth": 4,
+          "stores_reached": {
+            "crewai": 13,
+            "langgraph": 30
+          },
+          "contaminating_edges": {
+            "in_prompt": 95,
+            "retrieved_in_scope": 71,
+            "in_prompt_share": 0.5723
+          },
+          "deleted_derived_items": 2,
+          "excise": {
+            "items": 37,
+            "wrong": 9,
+            "correct": 28
+          },
+          "excise_in_prompt": {
+            "items": 9,
+            "wrong": 9,
+            "correct": 0
+          }
+        }
+      ],
+      "outputs": {
+        "total": 32,
+        "wrong": 6,
+        "wrong_tracing_to_planted": 6,
+        "wrong_tracing_to_planted_in_prompt": 6,
+        "fraction_wrong_tracing": 1.0,
+        "fraction_wrong_tracing_in_prompt": 1.0,
+        "correct_tracing_to_planted": 16
+      },
+      "wipe": {
+        "items": 57,
+        "wrong": 9,
+        "correct": 48
+      },
+      "headline": {
+        "derived_writes": 43,
+        "derived_writes_in_prompt": 9,
+        "max_depth": 4,
+        "stores_reached": 2,
+        "in_prompt_share": 0.5723,
+        "outputs_wrong": 6,
+        "fraction_wrong_tracing": 1.0,
+        "fraction_wrong_tracing_in_prompt": 1.0,
+        "excise_items": 37,
+        "excise_correct": 28,
+        "excise_in_prompt_items": 9,
+        "excise_in_prompt_correct": 0,
+        "wipe_items": 57,
+        "wipe_correct": 48
+      }
+    },
+    {
+      "seed": 2,
+      "use_prob": null,
+      "tasks": {
+        "answer": 31,
+        "note": 17,
+        "summarize": 12
+      },
+      "ledger": {
+        "writes": 67,
+        "items": 60,
+        "tombstoned_items": 3
+      },
+      "planted": [
+        {
+          "store": "crewai",
+          "record_id": "7706a7df-9d1d-4497-b9ac-055220df71bf",
+          "derived_writes": 36,
+          "derived_writes_in_prompt": 8,
+          "derived_over_time": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            4,
+            4,
+            5,
+            6,
+            7,
+            7,
+            7,
+            8,
+            9,
+            10,
+            10,
+            10,
+            11,
+            11,
+            12,
+            13,
+            14,
+            14,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            21,
+            22,
+            22,
+            23,
+            24,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36
+          ],
+          "max_depth": 6,
+          "stores_reached": {
+            "crewai": 8,
+            "langgraph": 28
+          },
+          "contaminating_edges": {
+            "in_prompt": 75,
+            "retrieved_in_scope": 24,
+            "in_prompt_share": 0.7576
+          },
+          "deleted_derived_items": 0,
+          "excise": {
+            "items": 33,
+            "wrong": 7,
+            "correct": 26
+          },
+          "excise_in_prompt": {
+            "items": 7,
+            "wrong": 7,
+            "correct": 0
+          }
+        }
+      ],
+      "outputs": {
+        "total": 31,
+        "wrong": 4,
+        "wrong_tracing_to_planted": 4,
+        "wrong_tracing_to_planted_in_prompt": 4,
+        "fraction_wrong_tracing": 1.0,
+        "fraction_wrong_tracing_in_prompt": 1.0,
+        "correct_tracing_to_planted": 16
+      },
+      "wipe": {
+        "items": 57,
+        "wrong": 7,
+        "correct": 50
+      },
+      "headline": {
+        "derived_writes": 36,
+        "derived_writes_in_prompt": 8,
+        "max_depth": 6,
+        "stores_reached": 2,
+        "in_prompt_share": 0.7576,
+        "outputs_wrong": 4,
+        "fraction_wrong_tracing": 1.0,
+        "fraction_wrong_tracing_in_prompt": 1.0,
+        "excise_items": 33,
+        "excise_correct": 26,
+        "excise_in_prompt_items": 7,
+        "excise_in_prompt_correct": 0,
+        "wipe_items": 57,
+        "wipe_correct": 50
+      }
+    }
+  ],
+  "summary": [
+    {
+      "use_prob": null,
+      "runs": 3,
+      "seeds": [
+        0,
+        1,
+        2
+      ],
+      "headline": {
+        "derived_writes": {
+          "mean": 40.0,
+          "min": 36,
+          "max": 43
+        },
+        "derived_writes_in_prompt": {
+          "mean": 8.6667,
+          "min": 8,
+          "max": 9
+        },
+        "max_depth": {
+          "mean": 4.6667,
+          "min": 4,
+          "max": 6
+        },
+        "stores_reached": {
+          "mean": 2.0,
+          "min": 2,
+          "max": 2
+        },
+        "in_prompt_share": {
+          "mean": 0.7111,
+          "min": 0.5723,
+          "max": 0.8035
+        },
+        "outputs_wrong": {
+          "mean": 5.0,
+          "min": 4,
+          "max": 6
+        },
+        "fraction_wrong_tracing": {
+          "mean": 1.0,
+          "min": 1.0,
+          "max": 1.0
+        },
+        "fraction_wrong_tracing_in_prompt": {
+          "mean": 1.0,
+          "min": 1.0,
+          "max": 1.0
+        },
+        "excise_items": {
+          "mean": 35.0,
+          "min": 33,
+          "max": 37
+        },
+        "excise_correct": {
+          "mean": 26.6667,
+          "min": 26,
+          "max": 28
+        },
+        "excise_in_prompt_items": {
+          "mean": 8.3333,
+          "min": 7,
+          "max": 9
+        },
+        "excise_in_prompt_correct": {
+          "mean": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "wipe_items": {
+          "mean": 56.0,
+          "min": 54,
+          "max": 57
+        },
+        "wipe_correct": {
+          "mean": 47.6667,
+          "min": 45,
+          "max": 50
+        }
+      }
+    }
+  ],
+  "elapsed_s": 134.94
+}
