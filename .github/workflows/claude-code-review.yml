@@ -45,7 +45,7 @@ jobs:
 
             1. Tests
                - Every new or changed behavior has a test. Missing tests is a blocking finding.
-               - Run exactly `pip install -e ".[dev,crewai,langgraph]"` then `pytest -q`, directly on the runner; report failures verbatim.
+               - Run exactly `pip install -e ".[dev,crewai,langgraph,anthropic]"` then `pytest -q`, directly on the runner; report failures verbatim.
                  Don't create a venv or call pip/pytest through `python -m`: only these command forms are allowed.
                - Tests must assert behavior, not just that code runs.
             2. Edge cases
