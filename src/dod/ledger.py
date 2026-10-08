@@ -149,6 +149,13 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
 )
 
 
+# The last write ID issued in this process. Taken inside a Ledger's _lock
+# (always in that order), so IDs strictly increase within the process and,
+# per Ledger, with seq.
+_id_lock = threading.Lock()
+_last_id = 0
+
+
 def _write_id(ts: int, last: int) -> int:
     """A UUIDv7-layout ID as an int: 48-bit Unix ms, then random bits.
 
@@ -234,7 +241,6 @@ class Ledger:
 
     def __init__(self, path: Union[str, os.PathLike], checkpoint_interval: float = 1.0):
         self._lock = threading.Lock()
-        self._last_id = 0  # the last write ID issued, under _lock
         self._conn = sqlite3.connect(
             str(path), isolation_level=None, check_same_thread=False
         )
@@ -364,17 +370,19 @@ class Ledger:
         with self._lock:
             # IDs are issued under the lock, so they increase with seq across
             # concurrent writers. A failed batch just skips its IDs.
+            global _last_id
             write_rows, parent_rows, write_ids = [], [], []
-            last = self._last_id
-            for row, direct, store, record_id in prepared:
-                last = _write_id(ts, last)
-                write_id = f"{last:032x}"
-                write_rows.append((write_id,) + row)
-                parent_rows += [(write_id, s, r, t) for s, r, t in direct]
-                if record_id is not None:
-                    binding_rows.append((write_id, store, record_id, ts))
-                write_ids.append(write_id)
-            self._last_id = last
+            with _id_lock:
+                last = _last_id
+                for row, direct, store, record_id in prepared:
+                    last = _write_id(ts, last)
+                    write_id = f"{last:032x}"
+                    write_rows.append((write_id,) + row)
+                    parent_rows += [(write_id, s, r, t) for s, r, t in direct]
+                    if record_id is not None:
+                        binding_rows.append((write_id, store, record_id, ts))
+                    write_ids.append(write_id)
+                _last_id = last
             binding_rows += later_bindings
             conn = self._conn
             # IMMEDIATE takes the write lock up front (waiting via

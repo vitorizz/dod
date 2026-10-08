@@ -621,12 +621,10 @@ def test_concurrent_appends(path, ledger):
     assert ids == sorted(ids) and len(set(ids)) == len(ids)
 
 
-def test_write_id_state_is_per_ledger(tmp_path):
+def test_write_ids_increase_across_ledgers_in_a_process(tmp_path):
     with Ledger(tmp_path / "a.db") as a, Ledger(tmp_path / "b.db") as b:
-        write(a)
-        assert b._last_id == 0
-        assert int(write(b), 16) == b._last_id
-        assert a._last_id != b._last_id
+        wids = [write(led) for _ in range(100) for led in (a, b)]
+    assert wids == sorted(wids) and len(set(wids)) == len(wids)
 
 
 def test_two_ledgers_racing_on_the_same_new_context(path):
