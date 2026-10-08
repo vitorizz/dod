@@ -120,7 +120,7 @@ def test_cycle_terminates(path, ledger):
     c = put(ledger, "mem", "c", [("mem", "b", "in_prompt")])
     # Hand-insert c as a parent of a, closing a -> b -> c -> a.
     conn = sqlite3.connect(str(path), isolation_level=None)
-    conn.execute("INSERT INTO parents VALUES (?, 'mem', 'c', 'in_prompt')", (a,))
+    conn.execute("INSERT INTO direct_parents VALUES (?, 'mem', 'c', 'in_prompt')", (a,))
     conn.close()
     r = blast_radius(ledger, "mem", "a")
     assert depths(r) == {b: 1, c: 2}

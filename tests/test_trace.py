@@ -1,10 +1,11 @@
+import random
 import sqlite3
 import time
 
 import pytest
 
-from dod.ledger import Ledger
-from dod.query import Edge, UnrecordedAncestor, trace
+from dod.ledger import TAGS, Ledger
+from dod.query import Edge, UnrecordedAncestor, blast_radius, trace
 
 
 @pytest.fixture
@@ -110,7 +111,7 @@ def test_cycle_terminates(path, ledger):
     c = put(ledger, "mem", "c", [("mem", "b", "in_prompt")])
     # Hand-insert a -> c, closing a -> c -> b -> a.
     conn = sqlite3.connect(str(path), isolation_level=None)
-    conn.execute("INSERT INTO parents VALUES (?, 'mem', 'c', 'in_prompt')", (a,))
+    conn.execute("INSERT INTO direct_parents VALUES (?, 'mem', 'c', 'in_prompt')", (a,))
     conn.close()
     r = trace(ledger, "mem", "c")
     assert depths(r) == {b: 1, a: 2}
@@ -216,3 +217,181 @@ def test_trace_10k_ledger_depth_50_under_100ms(path):
         print(f"trace depth 50 over 10k writes: {elapsed_ms:.2f} ms")
     assert max(w.depth for w in r.ancestors) == 50
     assert elapsed_ms < 100
+
+
+# Equivalence of the two parent representations. "Old" stores every edge as a
+# per-write row (the schema before context sets; what ``direct_parents``
+# holds when nothing is passed as ``context``). "New" passes the scope's
+# context as a shared, content-addressed context set. Queries must not be
+# able to tell them apart.
+
+STORES = ("mem", "pg")
+
+
+def _random_ops(rng, n_writes=200, n_items=60):
+    def item():
+        return (rng.choice(STORES), f"r{rng.randrange(n_items)}", rng.choice(TAGS))
+
+    scopes = [[] for _ in range(4)]
+    batches = []
+    while sum(len(b) for b in batches) < n_writes:
+        ctx = scopes[rng.randrange(len(scopes))]
+        if rng.random() < 0.1:
+            ctx.clear()  # the scope ended; a new one starts empty
+        ctx += [item() for _ in range(rng.choice([0, 0, 1, 2, 5]))]
+        shared = list(ctx)  # one object per batch, as Capture.on_batch passes
+        batch = []
+        for _ in range(rng.choice([1, 1, 1, 3, 5])):
+            batch.append(dict(
+                replaced=[item() for _ in range(rng.choice([0, 0, 0, 1, 3]))],
+                context=shared,
+                store=rng.choice(STORES),
+                record_id=None if rng.random() < 0.1 else f"r{rng.randrange(n_items)}",
+            ))
+        batches.append(batch)
+    deletes = [
+        dict(store=rng.choice(STORES), record_id=f"r{rng.randrange(n_items)}", reason="forget")
+        for _ in range(10)
+    ]
+    return batches, deletes
+
+
+def _build(ledger, batches, deletes, split):
+    ids = []
+    for batch in batches:
+        rows = [
+            dict(
+                content=str(len(ids) + i),
+                store=w["store"],
+                source="agent_inference",
+                record_id=w["record_id"],
+                parents=w["replaced"] if split else w["replaced"] + w["context"],
+                context=w["context"] if split else (),
+            )
+            for i, w in enumerate(batch)
+        ]
+        ids += ledger.append_batch(rows)
+    ledger.append_tombstones(deletes)
+    return {wid: i for i, wid in enumerate(ids)}
+
+
+def _norm_write(w, idx):
+    return (idx[w.write_id], w.depth, w.content_hash, w.store, w.source)
+
+
+def _norm_edges(edges, idx):
+    return sorted(
+        (idx[e.child_write_id], e.parent_store, e.parent_record_id, e.tag,
+         idx.get(e.parent_write_id, -1))
+        for e in edges
+    )
+
+
+def _norm_deleted(deleted, idx):
+    return {k: [(t.reason, idx.get(t.write_id)) for t in ts] for k, ts in deleted.items()}
+
+
+def _norm_trace(r, idx):
+    return (
+        [_norm_write(w, idx) for w in r.items],
+        [_norm_write(w, idx) for w in r.ancestors],
+        [_norm_write(w, idx) for w in r.roots],
+        _norm_edges(r.edges, idx),
+        r.unrecorded,
+        r.truncated,
+        _norm_deleted(r.deleted, idx),
+    )
+
+
+def _norm_blast(r, idx):
+    return (
+        [_norm_write(w, idx) for w in r.items],
+        [_norm_write(w, idx) for w in r.descendants],
+        _norm_edges(r.edges, idx),
+        {idx[w]: items for w, items in r.bindings.items()},
+        r.store_counts,
+        r.truncated,
+        _norm_deleted(r.deleted, idx),
+    )
+
+
+def _edges_by_write(ledger, idx):
+    rows = ledger._conn.execute(
+        "SELECT write_id, parent_store, parent_record_id, tag FROM parents"
+    ).fetchall()
+    return sorted((idx[w], s, r, t) for w, s, r, t in rows)
+
+
+def _count(ledger, table):
+    return ledger._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_context_sets_query_like_per_write_edges(tmp_path, seed):
+    rng = random.Random(seed)
+    batches, deletes = _random_ops(rng)
+    with Ledger(tmp_path / "old.db") as old, Ledger(tmp_path / "new.db") as new:
+        old_idx = _build(old, batches, deletes, split=False)
+        new_idx = _build(new, batches, deletes, split=True)
+        # The new ledger really shares context: fewer stored rows than edges.
+        assert _count(old, "context_sets") == 0
+        assert _count(new, "direct_parents") + _count(new, "context_members") < _count(
+            old, "direct_parents"
+        )
+
+        assert _edges_by_write(old, old_idx) == _edges_by_write(new, new_idx)
+        bound = sorted({(w["store"], w["record_id"]) for b in batches for w in b
+                        if w["record_id"] is not None})
+        for store, record_id in rng.sample(bound, 25):
+            for max_depth in (None, 1):
+                assert _norm_trace(trace(old, store, record_id, max_depth), old_idx) == \
+                    _norm_trace(trace(new, store, record_id, max_depth), new_idx)
+                assert _norm_blast(blast_radius(old, store, record_id, max_depth), old_idx) == \
+                    _norm_blast(blast_radius(new, store, record_id, max_depth), new_idx)
+
+
+def test_shared_context_with_different_direct_parents_in_one_batch(tmp_path):
+    # Two writes in one batch share the context object but have their own
+    # direct parents, one overlapping the context with the other tag.
+    context = [("mem", "c1", "retrieved_in_scope"), ("pg", "c2", "in_prompt")]
+    batches = [
+        [dict(replaced=[], context=[], store="mem", record_id="c1")],  # write 0
+        [dict(replaced=[], context=[], store="pg", record_id="c2")],  # write 1
+        [
+            dict(  # write 2
+                replaced=[("mem", "c1", "in_prompt"), ("pg", "d0", "retrieved_in_scope")],
+                context=context, store="mem", record_id="a",
+            ),
+            dict(  # write 3
+                replaced=[("pg", "c2", "retrieved_in_scope"), ("mem", "d1", "in_prompt")],
+                context=context, store="pg", record_id="b",
+            ),
+        ],
+    ]
+    expected = [
+        # Write 2: c1 is in its direct parents as in_prompt, which beats the
+        # context's retrieved_in_scope.
+        (2, "mem", "c1", "in_prompt"),
+        (2, "pg", "c2", "in_prompt"),
+        (2, "pg", "d0", "retrieved_in_scope"),
+        # Write 3: c2 stays in_prompt from the context; c1 keeps the
+        # context's tag, unaffected by write 2's direct parent.
+        (3, "mem", "c1", "retrieved_in_scope"),
+        (3, "mem", "d1", "in_prompt"),
+        (3, "pg", "c2", "in_prompt"),
+    ]
+    with Ledger(tmp_path / "old.db") as old, Ledger(tmp_path / "new.db") as new:
+        old_idx = _build(old, batches, [], split=False)
+        new_idx = _build(new, batches, [], split=True)
+        assert _edges_by_write(old, old_idx) == expected
+        assert _edges_by_write(new, new_idx) == expected
+        assert (_count(new, "context_sets"), _count(new, "context_members")) == (1, 2)
+        assert _count(new, "direct_parents") == 4
+        for store, record_id in (("mem", "a"), ("pg", "b")):
+            r = trace(new, store, record_id)
+            assert _norm_trace(r, new_idx) == _norm_trace(trace(old, store, record_id), old_idx)
+            assert sorted(new_idx[w.write_id] for w in r.ancestors) == [0, 1]
+        for store, record_id in (("mem", "c1"), ("pg", "c2")):
+            r = blast_radius(new, store, record_id)
+            assert _norm_blast(r, new_idx) == _norm_blast(blast_radius(old, store, record_id), old_idx)
+            assert sorted(new_idx[w.write_id] for w in r.descendants) == [2, 3]
