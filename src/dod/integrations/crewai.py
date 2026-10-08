@@ -7,16 +7,10 @@ events are not used: save events carry no record ID, and the event bus runs
 sync handlers in a thread pool, so they can arrive out of order.
 
 Scoping
-    The context key is ``(agent_id, task_id)``, held in a ``ContextVar``.
-    Recalls and writes are linked only under the same key. Enter it with
-    ``agent_task_scope(agent_id, task_id)``.
-
-    - asyncio tasks copy the current context, so the scope carries through.
-    - Plain threads and ``ThreadPoolExecutor`` workers start with an empty
-      context: enter the scope inside the worker, or submit the work through
-      ``contextvars.copy_context().run``.
-    - Outside any scope, recalls are not tracked, and a write is recorded with
-      zero parents and a one-time warning. There is no shared fallback key.
+    The context key and ``agent_task_scope`` live in ``dod.scope``, shared
+    with every other integration (re-exported here). Outside any scope,
+    recalls are not tracked, and a write is recorded with zero parents and a
+    one-time warning.
 
     In a crew run, call ``install_task_scopes()`` once. It registers crewai
     ``PRE_STEP``/``POST_STEP`` interception hooks, which ``Task._execute_core``
@@ -82,23 +76,19 @@ import functools
 import inspect
 import logging
 import sys
-import threading
-import weakref
-from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from dod import scope as _scope
 from dod.capture import Capture
 from dod.ledger import SOURCES
+from dod.scope import Key, _key, agent_task_scope
+
+__all__ = ["agent_task_scope", "install_task_scopes", "instrument"]
 
 logger = logging.getLogger(__name__)
 
-Key = Tuple[str, str]
-
 _MARK = "_dod_instrumented"
 
-_key: "contextvars.ContextVar[Optional[Key]]" = contextvars.ContextVar(
-    "dod_crewai_key", default=None
-)
 _observed: "contextvars.ContextVar[Optional[_Consolidation]]" = contextvars.ContextVar(
     "dod_crewai_consolidation", default=None
 )
@@ -109,10 +99,6 @@ _hook_stack: "contextvars.ContextVar[Tuple[Tuple[Key, Optional[Key]], ...]]" = (
 _pending_batch: "contextvars.ContextVar[Optional[_Batch]]" = contextvars.ContextVar(
     "dod_crewai_batch", default=None
 )
-
-# Every Capture passed to instrument(); entering a scope resets its key in each.
-_captures: "weakref.WeakSet[Capture]" = weakref.WeakSet()
-_captures_lock = threading.Lock()
 
 # Code objects of callers that put every recall result into the prompt.
 _in_prompt_callers: set = set()
@@ -160,8 +146,7 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
     if type(memory).__module__.startswith("crewai."):
         _load_in_prompt_callers()
     _observe_storage(storage)
-    with _captures_lock:
-        _captures.add(capture)
+    _scope.register(capture)
 
     orig_recall = memory.recall
     orig_remember = memory.remember
@@ -338,23 +323,6 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
     return memory
 
 
-@contextmanager
-def agent_task_scope(agent_id: Any, task_id: Any) -> Iterator[Key]:
-    """Make ``(agent_id, task_id)`` the current context key.
-
-    Resets the key's context on entry and on exit, so a finished scope holds
-    no memory, and restores the previous key on exit, so scopes nest.
-    """
-    key = (str(agent_id), str(task_id))
-    _reset(key)
-    token = _key.set(key)
-    try:
-        yield key
-    finally:
-        _key.reset(token)
-        _reset(key)
-
-
 def install_task_scopes() -> None:
     """Enter ``agent_task_scope(agent.id, task.id)`` around every crewai task.
 
@@ -373,7 +341,7 @@ def _enter_task_scope(ctx: Any) -> None:
     if getattr(ctx, "kind", None) != "task" or agent is None or task is None:
         return None
     key = (str(agent.id), str(task.id))
-    _reset(key)
+    _scope.reset(key)
     _hook_stack.set(_hook_stack.get() + ((key, _key.get()),))
     _key.set(key)
     return None  # a non-None return would replace the step's payload
@@ -389,16 +357,9 @@ def _exit_task_scope(ctx: Any) -> None:
         if key[1] == task_id:
             _key.set(previous)
             _hook_stack.set(stack[:i])
-            _reset(key)  # the task is done; free its context
+            _scope.reset(key)  # the task is done; free its context
             break
     return None
-
-
-def _reset(key: Key) -> None:
-    with _captures_lock:
-        captures = list(_captures)
-    for cap in captures:
-        cap.reset(key)
 
 
 def _arg(args: tuple, kwargs: dict, index: int, name: str) -> Any:
