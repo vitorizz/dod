@@ -12,7 +12,8 @@ Everything else is a query over that graph:
 
 - `trace(ledger, store, record_id)` walks backward from a bad output to the writes it came from.
 - `blast_radius(ledger, store, record_id)` walks forward to everything derived from an item, across stores.
-- `ledger.quarantine(items)` marks items as contaminated (reversible with `ledger.release`); instrumented CrewAI recall stops returning them, so they can't become parents of new writes.
+- `ledger.quarantine(items)` marks items as contaminated (reversible with `ledger.release`); instrumented stores stop returning them, so they can't become parents of new writes.
+- `excise(ledger, store, record_id)` quarantines (default) or, with `mode="delete"`, deletes an item and its whole blast radius across stores, leaving everything else untouched. `dry_run=True` shows the plan first.
 
 ```mermaid
 flowchart LR
@@ -112,7 +113,7 @@ Inside a crew, call `crewai.install_task_scopes()` once instead of entering scop
 What it does **not** do:
 
 - **No automated detection of bad memories.** You identify the bad output; `dod` traces it to its origin and shows what it reached.
-- Quarantine is enforced on CrewAI recall only; LangGraph reads are not filtered yet.
+- Quarantine is enforced by the instrumented stores (CrewAI recall, LangGraph `get`/`search`); reads that bypass them see quarantined items.
 - Writes that bypass an instrumented store (direct database inserts, uninstrumented tools) are not captured.
 
 ## Status
@@ -121,10 +122,28 @@ Supported:
 
 - **CrewAI 1.15.22** `Memory`: `recall`, `remember`, `remember_many`, `update`, `forget`, `reset`, `reset_all`, and consolidation on save. Rewrites are recorded as compactions; every deleted record gets an append-only tombstone, so `trace` and `blast_radius` report what was deleted and why.
 - **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`).
-- `trace`, `blast_radius`, quarantine/release, across both stores through one ledger.
+- `trace`, `blast_radius`, quarantine/release, and `excise` (quarantine or delete), across both stores through one ledger.
 
-Next: excision (delete and regenerate alongside quarantine), more integrations (LangGraph agents, Pydantic AI, Anthropic memory tool, an MCP gateway), and export of edges as OpenTelemetry attributes.
+Next: regenerate (rewrite derived items without the bad parent), more integrations (LangGraph agents, Pydantic AI, Anthropic memory tool, an MCP gateway), and export of edges as OpenTelemetry attributes.
 
 ## Demo
 
-Coming soon: plant a false memory, trace it, and excise only what it contaminated.
+A support agent keeps memory in CrewAI and a LangGraph store, with 12 correct items. One customer message gets saved as a "policy update" (refunds within 90 days; the real policy is 30), and scripted steps derive four items from it across both stores. The last one is a wrong reply to a customer. The demo traces that reply back to its roots, shows the blast radius per store, quarantines only that subgraph, and re-runs the reply. Then it compares the result with wiping everything.
+
+```bash
+pip install -e ".[crewai,langgraph]"
+python examples/false_memory_demo.py
+```
+
+It runs in seconds, offline, with no LLM calls (the agents are fixed rules), and prints the same output every time. It ends with:
+
+```
+== 6. Wipe everything vs. excise ==================================
+Wipe both stores:        loses all 17 items, including 12 correct ones.
+Roll back to the root:   loses 3 correct items learned after it.
+Excise its subgraph:     removes 5, keeps all 12 correct items.
+
+Summary: excised 5 items, preserved 12, stores touched: crewai, langgraph.
+```
+
+`tests/test_demo.py` runs the demo and checks these numbers.
