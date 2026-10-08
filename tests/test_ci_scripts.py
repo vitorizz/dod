@@ -353,3 +353,71 @@ def test_conflict_check_error_fails_without_touching_label(gh, repo):
     assert "Couldn't check #8 for conflicts." in r.stdout
     assert labels_removed(gh) == [] and gh.comments() == []
     assert not any(c[:2] == ["pr", "update-branch"] for c in gh.calls)
+
+
+# --- update-branches.sh: local merge when GitHub's merge ignores .gitattributes ----
+
+@pytest.fixture
+def union_repo(tmp_path):
+    """Like `repo`, but both sides append to a file merged with git's union driver."""
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    git(tmp_path, "init", "-q", "-b", "main", str(work))
+    git(work, "remote", "add", "origin", str(origin))
+    commit(work, {".gitattributes": "log.md merge=union\n", "log.md": "- base\n"}, "base")
+    git(work, "push", "-q", "origin", "main")
+    git(work, "checkout", "-q", "-b", "feature")
+    commit(work, {"log.md": "- base\n- from pr\n"}, "pr")
+    git(work, "push", "-q", "origin", "HEAD:refs/pull/7/head", "HEAD:refs/heads/feature")
+    git(work, "checkout", "-q", "main")
+    commit(work, {"log.md": "- base\n- from main\n"}, "main moves on")
+    git(work, "push", "-q", "origin", "main")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(origin), str(clone))
+    return origin, clone
+
+
+def test_union_only_conflict_is_merged_locally_and_pushed(gh, union_repo):
+    origin, clone = union_repo
+    pr_list(gh)
+    gh.on("pr", "update-branch", "7", rc=1, stderr="merge conflict\n")
+    r = gh.run("update-branches.sh", clone, BASE="main")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "#7 merged with main locally" in r.stdout
+    assert gh.comments() == [] and gh.labels_added() == []
+    log = git(origin, "show", "feature:log.md")
+    assert "- from pr" in log and "- from main" in log
+    # The pushed branch contains main, so it's no longer behind.
+    assert git(origin, "merge-base", "--is-ancestor", "main", "feature") == ""
+    # No temporary worktree is left registered.
+    assert git(clone, "worktree", "list").count("\n") == 1
+
+
+def test_local_merge_push_failure_errors_without_labeling(gh, union_repo):
+    origin, clone = union_repo
+    pr_list(gh)
+    gh.on("pr", "update-branch", "7", rc=1, stderr="merge conflict\n")
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho rejected >&2\nexit 1\n")
+    hook.chmod(0o755)
+    r = gh.run("update-branches.sh", clone, BASE="main")
+    assert r.returncode == 1
+    assert "merging it locally failed too" in r.stdout
+    assert gh.comments() == [] and gh.labels_added() == []
+    assert git(clone, "worktree", "list").count("\n") == 1
+
+
+def test_fork_prs_are_never_pushed_to(gh, union_repo):
+    origin, clone = union_repo
+    gh.on("pr", "list", json_out=[{
+        "number": 7, "headRefName": "feature", "headRepositoryOwner": {"login": "someone-else"},
+        "labels": [],
+    }])
+    gh.on("api", f"repos/{REPO}/compare/main...someone-else:feature", json_out={"behind_by": 1})
+    gh.on("pr", "update-branch", "7", rc=1, stderr="merge conflict\n")
+    before = git(origin, "rev-parse", "feature")
+    r = gh.run("update-branches.sh", clone, BASE="main")
+    assert r.returncode == 1
+    assert "from a fork" in r.stdout
+    assert git(origin, "rev-parse", "feature") == before
