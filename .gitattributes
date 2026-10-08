@@ -1,0 +1,3 @@
+# Every PR appends to the decisions log, so parallel PRs always conflicted at its
+# end. union keeps both sides' lines; entries are independent one-liners.
+docs/decisions.md merge=union
