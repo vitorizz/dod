@@ -448,7 +448,7 @@ def test_delta_context_sets_query_like_per_write_edges(tmp_path, seed, monkeypat
         ).fetchone()
         assert deltas > 0 and upgraded > 0
         assert _edges_by_write(old, old_idx) == _edges_by_write(new, new_idx)
-        while new._fill_child_edges() is not None:  # blast_radius through child_edges
+        while new._fill_index() is not None:  # blast_radius through the lineage index
             pass
         bound = sorted({(w["store"], w["record_id"]) for b in batches for w in b
                         if w["record_id"] is not None})

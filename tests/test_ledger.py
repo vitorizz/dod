@@ -799,7 +799,7 @@ def test_background_checkpoint_runs_before_close(path, tmp_path):
 def test_no_checkpoint_on_append_path(path, tmp_path):
     # Control for the test above: without the background thread, appends
     # alone never move rows into the main file.
-    with Ledger(path, checkpoint_interval=3600) as led:
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as led:
         for _ in range(100):
             write(led)
         time.sleep(0.2)
