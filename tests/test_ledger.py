@@ -762,6 +762,38 @@ def test_future_version_raises(path):
     assert user_version(path) == SCHEMA_VERSION + 1
 
 
+def test_version_3_migrates_in_place(path):
+    # Version 3 differs only by the derived child_edges index, which version 4
+    # drops (the lineage file replaces it).
+    with Ledger(path) as led:
+        first = write(led)
+    conn = raw(path)
+    conn.executescript("""
+    CREATE TABLE child_edges (parent_store TEXT, parent_record_id TEXT, seq INTEGER,
+        write_id TEXT, tag TEXT, PRIMARY KEY (parent_store, parent_record_id, seq));
+    CREATE TABLE child_edges_filled (upto INTEGER PRIMARY KEY, ts INTEGER NOT NULL);
+    CREATE TRIGGER child_edges_no_delete BEFORE DELETE ON child_edges
+    BEGIN SELECT RAISE(ABORT, 'child_edges is append-only'); END;
+    PRAGMA user_version=3;
+    """)
+    conn.close()
+    with Ledger(path) as led:
+        write(led)
+    assert user_version(path) == SCHEMA_VERSION == 4
+    names = {r[0] for r in raw(path).execute("SELECT name FROM sqlite_master")}
+    assert not any(n.startswith("child_edges") for n in names)
+    assert count(path, "writes") == 2
+    assert raw(path).execute("SELECT 1 FROM writes WHERE write_id = ?", (first,)).fetchone()
+
+
+def test_version_2_still_raises(path):
+    with Ledger(path):
+        pass
+    raw(path).execute("PRAGMA user_version=2")
+    with pytest.raises(LedgerSchemaError, match="schema version 2"):
+        Ledger(path)
+
+
 def test_close_checkpoints_wal(path):
     led = Ledger(path)
     for _ in range(100):
@@ -799,7 +831,7 @@ def test_background_checkpoint_runs_before_close(path, tmp_path):
 def test_no_checkpoint_on_append_path(path, tmp_path):
     # Control for the test above: without the background thread, appends
     # alone never move rows into the main file.
-    with Ledger(path, checkpoint_interval=3600) as led:
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as led:
         for _ in range(100):
             write(led)
         time.sleep(0.2)

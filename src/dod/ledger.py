@@ -21,11 +21,22 @@ picked Fenwick-style by ``step`` (deltas since the last full set), so a chain
 has at most ``log2(_CHAIN_STEPS) + 1`` parts and a full set is re-stored
 every ``_CHAIN_STEPS`` steps.
 
-``child_edges`` is the same edges keyed by parent item, for walking forward.
-It is derived, never written on the append path: the background thread fills
-it after the fact, and ``child_edges_filled`` records how far (the highest
-write ``seq`` indexed). Queries read writes past that watermark from the
-source tables.
+The lineage index holds the same lineage as integers, for walking forward,
+in the shape it is stored in rather than one row per edge, so its size
+follows what the ledger stores: ``items`` interns each ``(store,
+record_id)``; ``direct_children`` lists the writes that name an item as a
+direct parent; ``part_items`` the context sets (by ``seq``) whose own member
+rows hold an item; ``set_parts`` the sets whose chain includes a part;
+``set_writes`` the writes that use each set; and ``write_items`` the items
+bound to each write. It is derived, so it lives in a companion file (the
+ledger's path plus ``-lineage``, attached as ``lineage``) that is never
+written on the append path: the background thread fills it after the fact,
+in transactions that take only that file's write lock, and ``index_filled``
+records how far (the highest write ``seq``, context set ``seq`` and
+``bindings`` rowid indexed, each with the key of the row it stopped at).
+Queries read what lies past those watermarks from the source tables. A
+companion file at another index version, unreadable, or filled from a
+different ledger (its keys don't match) is deleted and rebuilt.
 
 A file records its schema version (``PRAGMA user_version``); opening one at
 another version, or an unversioned file with tables, raises
@@ -52,7 +63,15 @@ Parent = Tuple[str, str, str]
 # Stored in the file's ``PRAGMA user_version``. Bump it on any change to
 # tables, columns, triggers or views, and ship a migration (or a "recreate"
 # note in docs/decisions.md) with the bump.
-SCHEMA_VERSION = 3  # 3: delta context sets (#52); 2: child_edges (#34)
+SCHEMA_VERSION = 4  # 4: child_edges dropped; 3: delta context sets (#52); 2: child_edges (#34)
+# Version 3 files migrate in place: version 4 only drops the derived
+# child_edges index, which the lineage file replaces.
+_MIGRATIONS = {
+    3: ("DROP TABLE IF EXISTS child_edges", "DROP TABLE IF EXISTS child_edges_filled"),
+}
+# The lineage file's ``PRAGMA user_version``. It is derived, so a file at
+# another version is rebuilt rather than migrated.
+INDEX_VERSION = 1
 
 # A context set's chain restarts with a full set every _CHAIN_STEPS steps, so
 # chains have at most log2(_CHAIN_STEPS) + 1 = 13 parts.
@@ -67,7 +86,11 @@ class LedgerSchemaError(Exception):
 
 _TABLES = (
     "writes", "direct_parents", "context_sets", "context_members", "context_chain",
-    "bindings", "tombstones", "quarantine", "child_edges", "child_edges_filled",
+    "bindings", "tombstones", "quarantine",
+)
+_INDEX_TABLES = (
+    "items", "direct_children", "part_items", "set_parts", "set_writes", "write_items",
+    "index_filled",
 )
 
 # Context edges of writes ``w``: every member row of every part of the
@@ -87,29 +110,127 @@ WHERE NOT EXISTS (
         AND m2.record_id = m.record_id AND m2.tag = 'in_prompt'
 ))"""
 
-# The parents view's edges for writes with lo < seq <= hi, as
-# (parent_store, parent_record_id, seq, write_id, tag). Spelled out per branch
-# so both seek writes by seq.
-_EDGES_BETWEEN = f"""
-SELECT d.parent_store, d.parent_record_id, w.seq, w.write_id, d.tag
-FROM writes w JOIN direct_parents d ON d.write_id = w.write_id
-WHERE w.seq > :lo AND w.seq <= :hi
-UNION ALL
-SELECT m.store, m.record_id, w.seq, w.write_id, m.tag{_CONTEXT_EDGES}
-    AND w.seq > :lo AND w.seq <= :hi
-"""
+# A fill indexes writes (:lo, :hi], the context sets (:slo, :shi] and
+# bindings (:blo, :bhi], entirely in SQL on the fill connection (the ledger,
+# with the lineage file attached): it interns their items, then appends the
+# integer rows. A binding appended twice is one row.
+#
+# New names and bindings are deduplicated in staging tables on the fill
+# connection (in memory, emptied after each use) rather than with DISTINCT,
+# UNION or an INSERT that reads its own target, each of which builds and
+# frees a temporary b-tree per statement. SQLite's allocator takes a
+# process-wide mutex, so that churn would slow appends on other threads.
+_FILL_STAGING = (
+    "CREATE TEMP TABLE IF NOT EXISTS fill_names (store TEXT NOT NULL,"
+    " record_id TEXT NOT NULL, PRIMARY KEY (store, record_id)) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS fill_binds (seq INTEGER NOT NULL,"
+    " item INTEGER NOT NULL, PRIMARY KEY (seq, item)) WITHOUT ROWID",
+)
+_FILL_SQL = (
+    """INSERT OR IGNORE INTO temp.fill_names
+    SELECT d.parent_store, d.parent_record_id
+    FROM writes w CROSS JOIN direct_parents d ON d.write_id = w.write_id
+    WHERE w.seq > :lo AND w.seq <= :hi""",
+    """INSERT OR IGNORE INTO temp.fill_names
+    SELECT m.store, m.record_id
+    FROM context_sets cs CROSS JOIN context_members m ON m.set_hash = cs.set_hash
+    WHERE cs.seq > :slo AND cs.seq <= :shi""",
+    """INSERT OR IGNORE INTO temp.fill_names
+    SELECT store, record_id FROM bindings WHERE rowid > :blo AND rowid <= :bhi""",
+    """DELETE FROM temp.fill_names WHERE EXISTS (
+        SELECT 1 FROM lineage.items i
+        WHERE i.store = fill_names.store AND i.record_id = fill_names.record_id
+    )""",
+    "INSERT INTO lineage.items (store, record_id) SELECT store, record_id FROM temp.fill_names",
+    "DELETE FROM temp.fill_names",
+    """INSERT INTO lineage.direct_children
+    SELECT i.item, w.seq, d.tag = 'in_prompt'
+    FROM writes w CROSS JOIN direct_parents d ON d.write_id = w.write_id
+    CROSS JOIN lineage.items i ON i.store = d.parent_store AND i.record_id = d.parent_record_id
+    WHERE w.seq > :lo AND w.seq <= :hi""",
+    """INSERT INTO lineage.part_items
+    SELECT i.item, cs.seq, m.tag = 'in_prompt'
+    FROM context_sets cs CROSS JOIN context_members m ON m.set_hash = cs.set_hash
+    CROSS JOIN lineage.items i ON i.store = m.store AND i.record_id = m.record_id
+    WHERE cs.seq > :slo AND cs.seq <= :shi""",
+    """INSERT INTO lineage.set_parts
+    SELECT p.seq, s.seq FROM context_sets s
+    CROSS JOIN context_chain c ON c.set_hash = s.set_hash
+    CROSS JOIN context_sets p ON p.set_hash = c.part
+    WHERE s.seq > :slo AND s.seq <= :shi""",
+    """INSERT INTO lineage.set_writes
+    SELECT cs.seq, w.seq FROM writes w
+    CROSS JOIN context_sets cs ON cs.set_hash = w.context_set
+    WHERE w.seq > :lo AND w.seq <= :hi""",
+    """INSERT OR IGNORE INTO temp.fill_binds
+    SELECT w.seq, i.item FROM bindings b
+    CROSS JOIN writes w ON w.write_id = b.write_id
+    CROSS JOIN lineage.items i ON i.store = b.store AND i.record_id = b.record_id
+    WHERE b.rowid > :blo AND b.rowid <= :bhi""",
+    """DELETE FROM temp.fill_binds WHERE EXISTS (
+        SELECT 1 FROM lineage.write_items x
+        WHERE x.seq = fill_binds.seq AND x.item = fill_binds.item
+    )""",
+    "INSERT INTO lineage.write_items SELECT seq, item FROM temp.fill_binds",
+    "DELETE FROM temp.fill_binds",
+    """INSERT INTO lineage.index_filled (
+        writes_upto, write_key, sets_upto, set_key, bindings_upto, binding_key, ts)
+    VALUES (:hi, (SELECT write_id FROM writes WHERE seq = :hi),
+        :shi, (SELECT set_hash FROM context_sets WHERE seq = :shi),
+        :bhi, (SELECT write_id FROM bindings WHERE rowid = :bhi), :ts)""",
+)
 
-# Most edges and writes one fill transaction indexes.
-_FILL_MAX = 500
-# Each edge lands on a random leaf of child_edges, so a 500-edge fill holds
-# the write lock for milliseconds. The background fill sizes its batches to
-# hold it about _FILL_TARGET seconds, so an append that arrives mid-fill waits
-# well under the 1 ms bar.
-_FILL_TARGET = 0.0002
-# Pause between fill transactions: at least _FILL_MIN_PAUSE seconds, and
-# while writes are arriving, _FILL_BUSY_FACTOR times the last one's lock time.
-_FILL_MIN_PAUSE = 0.0005
-_FILL_BUSY_FACTOR = 100
+# Whether the lineage file was filled from this ledger: the rows its newest
+# watermarks stopped at are still there, with the same keys.
+_INDEX_MATCHES = """
+SELECT f.write_key IS (SELECT write_id FROM writes WHERE seq = f.writes_upto)
+    AND f.set_key IS (SELECT set_hash FROM context_sets WHERE seq = f.sets_upto)
+    AND f.binding_key IS (SELECT write_id FROM bindings WHERE rowid = f.bindings_upto)
+FROM lineage.index_filled f ORDER BY f.seq DESC LIMIT 1"""
+
+# Most writes (and, separately, bindings) one fill transaction indexes, while
+# writes are arriving (busy) and when they aren't (idle).
+_FILL_BUSY_MAX = 200
+_FILL_MAX = 1000
+# A fill never holds the ledger's write lock, but it still slows appends on
+# other threads while it runs: SQLite's allocator takes one process-wide
+# mutex (its memory statistics) on every allocation, so SQLite work on any
+# thread contends with every append. While writes are arriving, the fill
+# runs at most _FILL_BUSY_SHARE of the time; that keeps up with sustained
+# writes at realistic rates, and under heavier load the index lags (queries
+# read the rest from the source tables) and catches up once writes pause.
+_FILL_BUSY_SHARE = 0.02
+# Writes count as arriving until none has for _FILL_QUIET seconds. An idle
+# background thread looks for new writes every _FILL_IDLE_POLL seconds, and
+# fills back to back while a full batch or more is waiting.
+_FILL_QUIET = 0.1
+_FILL_IDLE_POLL = 0.02
+
+def _append_only(tables, prefix: str = "", replace=()) -> str:
+    """Triggers that reject UPDATE and DELETE on ``tables`` and an INSERT
+    that would replace a row. ``replace`` maps each table to the condition
+    on ``NEW`` under which an insert conflicts (the rowid by default)."""
+    keys = dict(replace)
+    out = "".join(
+        f"""
+CREATE TRIGGER IF NOT EXISTS {prefix}{t}_no_{op.lower()} BEFORE {op} ON {t}
+BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
+"""
+        for t in tables
+        for op in ("UPDATE", "DELETE")
+    )
+    # REPLACE deletes the conflicting row without firing DELETE triggers
+    # unless the writing connection enabled recursive_triggers, which is a
+    # per-connection setting. Reject the conflict before it happens instead.
+    return out + "".join(
+        f"""
+CREATE TRIGGER IF NOT EXISTS {prefix}{t}_no_replace BEFORE INSERT ON {t}
+WHEN EXISTS (SELECT 1 FROM {t} WHERE {keys.get(t, "rowid = NEW.rowid")})
+BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
+"""
+        for t in tables
+    )
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS writes (
@@ -184,19 +305,6 @@ CREATE TABLE IF NOT EXISTS quarantine (
     reason    TEXT,
     actor     TEXT
 );
-CREATE TABLE IF NOT EXISTS child_edges (
-    parent_store     TEXT NOT NULL,
-    parent_record_id TEXT NOT NULL,
-    seq              INTEGER NOT NULL,
-    write_id         TEXT NOT NULL,
-    tag              TEXT NOT NULL
-        CHECK (tag IN ('in_prompt', 'retrieved_in_scope')),
-    PRIMARY KEY (parent_store, parent_record_id, seq)
-) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS child_edges_filled (
-    upto INTEGER PRIMARY KEY,
-    ts   INTEGER NOT NULL
-);
 CREATE INDEX IF NOT EXISTS bindings_by_write ON bindings (write_id);
 CREATE INDEX IF NOT EXISTS bindings_by_record ON bindings (store, record_id);
 CREATE INDEX IF NOT EXISTS tombstones_by_record ON tombstones (store, record_id);
@@ -236,18 +344,73 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
         ("bindings", ""),
         ("tombstones", ""),
         ("quarantine", ""),
-        ("child_edges_filled", ""),
     )
 ) + """
-CREATE TRIGGER IF NOT EXISTS child_edges_no_replace BEFORE INSERT ON child_edges
-WHEN EXISTS (SELECT 1 FROM child_edges WHERE parent_store = NEW.parent_store
-    AND parent_record_id = NEW.parent_record_id AND seq = NEW.seq)
-BEGIN SELECT RAISE(ABORT, 'child_edges is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS context_chain_no_replace BEFORE INSERT ON context_chain
 WHEN EXISTS (SELECT 1 FROM context_chain WHERE set_hash = NEW.set_hash
     AND part = NEW.part)
 BEGIN SELECT RAISE(ABORT, 'context_chain is append-only'); END;
 """
+
+# The lineage file, attached as ``lineage``. Part and set IDs are
+# ``context_sets.seq``; a tag is 1 for in_prompt.
+_INDEX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS lineage.items (
+    item      INTEGER PRIMARY KEY,
+    store     TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    UNIQUE (store, record_id)
+);
+CREATE TABLE IF NOT EXISTS lineage.direct_children (
+    item INTEGER NOT NULL,
+    seq  INTEGER NOT NULL,
+    tag  INTEGER NOT NULL CHECK (tag IN (0, 1)),
+    PRIMARY KEY (item, seq)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS lineage.part_items (
+    item INTEGER NOT NULL,
+    part INTEGER NOT NULL,
+    tag  INTEGER NOT NULL CHECK (tag IN (0, 1)),
+    PRIMARY KEY (item, part)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS lineage.set_parts (
+    part INTEGER NOT NULL,
+    sid  INTEGER NOT NULL,
+    PRIMARY KEY (part, sid)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS lineage.set_writes (
+    sid INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    PRIMARY KEY (sid, seq)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS lineage.write_items (
+    seq  INTEGER NOT NULL,
+    item INTEGER NOT NULL,
+    PRIMARY KEY (seq, item)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS lineage.write_items_by_item ON write_items (item, seq);
+CREATE TABLE IF NOT EXISTS lineage.index_filled (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    writes_upto   INTEGER NOT NULL,
+    write_key     TEXT,
+    sets_upto     INTEGER NOT NULL,
+    set_key       TEXT,
+    bindings_upto INTEGER NOT NULL,
+    binding_key   TEXT,
+    ts            INTEGER NOT NULL
+);
+""" + _append_only(
+    _INDEX_TABLES,
+    "lineage.",
+    {
+        "items": "item = NEW.item OR (store = NEW.store AND record_id = NEW.record_id)",
+        "direct_children": "item = NEW.item AND seq = NEW.seq",
+        "part_items": "item = NEW.item AND part = NEW.part",
+        "set_parts": "part = NEW.part AND sid = NEW.sid",
+        "set_writes": "sid = NEW.sid AND seq = NEW.seq",
+        "write_items": "seq = NEW.seq AND item = NEW.item",
+    },
+)
 
 
 # The last write ID issued in this process. Taken inside a Ledger's _lock
@@ -290,21 +453,72 @@ def _statements(script: str):
             buf = ""
 
 
-def _check_schema(conn: sqlite3.Connection, path) -> bool:
-    """Raise ``LedgerSchemaError`` unless the file is new or at
-    ``SCHEMA_VERSION``; return whether it is new (no version, no tables)."""
+def _check_schema(conn: sqlite3.Connection, path) -> int:
+    """Raise ``LedgerSchemaError`` unless the file is new, at
+    ``SCHEMA_VERSION``, or at a version ``_MIGRATIONS`` upgrades; return its
+    version (0 if new: no version, no tables)."""
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version == SCHEMA_VERSION:
-        return False
+    if version == SCHEMA_VERSION or version in _MIGRATIONS:
+        return version
     if version == 0 and not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
     ).fetchone():
-        return True
+        return 0
     found = "unversioned (created before schema versioning)" if version == 0 else version
     raise LedgerSchemaError(
         f"ledger file {str(path)!r} has schema version {found}; this library"
         f" uses version {SCHEMA_VERSION}. Migrate or recreate the file."
     )
+
+
+def _remove_index(path: str) -> None:
+    """Delete a lineage file and its WAL companions."""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.remove(path + suffix)
+        except FileNotFoundError:
+            pass
+
+
+def _attach_index(conn: sqlite3.Connection, path: str) -> None:
+    """Attach the lineage file at ``path`` (``:memory:`` for an in-memory
+    ledger) to ``conn`` as ``lineage``, creating it if new and rebuilding it
+    if it is at another index version, unreadable, or filled from a
+    different ledger."""
+    try:
+        conn.execute("ATTACH DATABASE ? AS lineage", (path,))
+        attached = True
+        version = conn.execute("PRAGMA lineage.user_version").fetchone()[0]
+        stale = version not in (0, INDEX_VERSION) or (
+            version == INDEX_VERSION
+            and (conn.execute(_INDEX_MATCHES).fetchone() or (1,))[0] != 1
+        )
+    except sqlite3.DatabaseError:  # not a database, or damaged
+        attached = "lineage" in {r[1] for r in conn.execute("PRAGMA database_list")}
+        version, stale = 0, True
+    if stale and path != ":memory:":
+        if attached:
+            conn.execute("DETACH DATABASE lineage")
+        _remove_index(path)
+        conn.execute("ATTACH DATABASE ? AS lineage", (path,))
+        version = 0
+    conn.execute("PRAGMA lineage.journal_mode=WAL")
+    conn.execute("PRAGMA lineage.synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    for stmt in _FILL_STAGING:
+        conn.execute(stmt)
+    if version != INDEX_VERSION:
+        # Deferred: the first CREATE takes the file's write lock (waiting out
+        # another opener), and IF NOT EXISTS makes a second creation a no-op.
+        conn.execute("BEGIN")
+        try:
+            for stmt in _statements(_INDEX_SCHEMA):
+                conn.execute(stmt)
+            conn.execute(f"PRAGMA lineage.user_version={INDEX_VERSION}")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
 
 
 def _dedupe_parents(parents: Iterable[Parent]) -> list:
@@ -448,17 +662,23 @@ class Ledger:
     checkpoint on its own connection every ``checkpoint_interval`` seconds.
     ``close()`` stops it and runs a final checkpoint.
 
-    The same thread fills ``child_edges`` in short transactions sized to hold
-    the write lock ~0.2 ms each. While writes are arriving it pauses ~100x
-    that between them, so appends rarely wait behind one; when they stop, it
-    catches up at full speed.
+    Unless ``background_index`` is false (the index is then filled only by
+    calling ``_fill_index``), the same thread fills the lineage file. A fill
+    never takes the ledger's write lock, so appends don't wait for it; while
+    writes are arriving it still runs at most ~2% of the time (see
+    ``_FILL_BUSY_SHARE``), and when they stop it catches up at full speed.
 
     Safe to share across threads: appends are serialized with a lock.
     Quarantine reads use a third connection, so they never wait behind an
     append's commit (WAL readers don't block on the writer).
     """
 
-    def __init__(self, path: Union[str, os.PathLike], checkpoint_interval: float = 1.0):
+    def __init__(
+        self,
+        path: Union[str, os.PathLike],
+        checkpoint_interval: float = 1.0,
+        background_index: bool = True,
+    ):
         self._lock = threading.Lock()
         # (agent_id, session_id) -> (chain, members) of the last context set
         # this Ledger stored for it, most recently used last. Guarded by _lock.
@@ -482,10 +702,17 @@ class Ledger:
             conn.execute("PRAGMA wal_autocheckpoint=0")
             conn.execute("BEGIN IMMEDIATE")
             try:
-                if _check_schema(conn, path):
+                found = version = _check_schema(conn, path)
+                if version == 0:
                     for stmt in _statements(_SCHEMA):
                         conn.execute(stmt)
-                    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    version = SCHEMA_VERSION
+                while version in _MIGRATIONS:
+                    for stmt in _MIGRATIONS[version]:
+                        conn.execute(stmt)
+                    version += 1
+                if version != found:
+                    conn.execute(f"PRAGMA user_version={version}")
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
@@ -500,107 +727,157 @@ class Ledger:
         )
         self._read_conn.execute("PRAGMA busy_timeout=5000")
 
+        # The ledger's file; empty for an in-memory ledger.
+        self._file = next(
+            (f for _, name, f in conn.execute("PRAGMA database_list") if name == "main"), ""
+        )
+        # Idle connections for read-only walks (``dod.query``), kept so a walk
+        # doesn't pay to open a connection, parse the schema, create its temp
+        # tables and warm a page cache. Each walk takes one and gives it back.
+        self._walk_pool: List[sqlite3.Connection] = []
+        self._walk_pool_lock = threading.Lock()
+
         self._ckpt_conn = sqlite3.connect(
             str(path), isolation_level=None, check_same_thread=False
         )
         self._ckpt_conn.execute("PRAGMA busy_timeout=5000")
         self._ckpt_lock = threading.Lock()
+        # The lineage index is filled on the checkpoint connection, which
+        # never writes the ledger. An in-memory ledger has no file to open
+        # twice, so its index is in memory too, filled on the write connection.
+        if self._file:
+            self._index_path = self._file + "-lineage"
+            self._index_conn, self._index_lock = self._ckpt_conn, self._ckpt_lock
+        else:
+            self._index_path = ":memory:"
+            self._index_conn, self._index_lock = conn, self._lock
+        try:
+            _attach_index(self._index_conn, self._index_path)
+        except BaseException:
+            for c in (self._ckpt_conn, self._read_conn, conn):
+                c.close()
+            raise
         self._stop = threading.Event()
         self._ckpt_thread = threading.Thread(
             target=self._checkpoint_loop,
-            args=(checkpoint_interval,),
+            args=(checkpoint_interval, background_index),
             name="dod-ledger-checkpoint",
             daemon=True,
         )
         self._ckpt_thread.start()
 
-    def _checkpoint_loop(self, interval: float) -> None:
+    def _checkpoint_loop(self, interval: float, index: bool) -> None:
         next_ckpt = time.monotonic() + interval
-        pause = interval
-        last_seq = None
-        limit = 16
+        pause = min(interval, _FILL_IDLE_POLL) if index else interval
+        last_change, seen = -1e9, None
+        # While writes are arriving, the next fill waits until this time, so
+        # fills take at most _FILL_BUSY_SHARE of the time.
+        rest_until = 0.0
         while not self._stop.wait(pause):
-            now = time.monotonic()
-            if now >= next_ckpt:
-                next_ckpt = now + interval
+            if time.monotonic() >= next_ckpt:
+                next_ckpt = time.monotonic() + interval
                 try:
                     with self._ckpt_lock:
+                        # Every attached file: the ledger and its lineage file.
                         self._ckpt_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except sqlite3.Error:
                     pass  # retried next interval
-            seq = last_seq
+            until_ckpt = max(0.0, next_ckpt - time.monotonic())
+            if not index:
+                pause = until_ckpt
+                continue
             try:
                 with self._ckpt_lock:
-                    seq = self._ckpt_conn.execute("SELECT max(seq) FROM writes").fetchone()[0]
-                held = self._fill_child_edges(limit)
+                    now = self._ckpt_conn.execute(
+                        "SELECT (SELECT max(seq) FROM writes), (SELECT max(rowid) FROM bindings)"
+                    ).fetchone()
+                if now != seen:
+                    if seen is not None:
+                        last_change = time.monotonic()
+                    seen = now
+                busy = time.monotonic() - last_change < _FILL_QUIET
+                if busy and time.monotonic() < rest_until:
+                    # Resting, but look again within _FILL_QUIET: once writes
+                    # stop, catch up right away instead of resting it out.
+                    pause = min(rest_until - time.monotonic(), _FILL_QUIET, until_ckpt)
+                    continue
+                limit = _FILL_BUSY_MAX if busy else _FILL_MAX
+                began = time.monotonic()
+                filled = self._fill_index(limit)
+                spent = time.monotonic() - began
             except sqlite3.Error:
-                held = None  # retried next interval
-            if held is None:
-                pause = max(0.0, next_ckpt - time.monotonic())
+                busy, filled, spent = False, None, 0.0  # retried next round
+            if busy:
+                rest_until = time.monotonic() + spent * (1 / _FILL_BUSY_SHARE - 1)
+                pause = min(rest_until - time.monotonic(), _FILL_QUIET) if filled else (
+                    _FILL_IDLE_POLL)
+            elif filled and filled >= limit:
+                pause = 0.0  # idle and a full batch behind: catch up
             else:
-                fit = int(limit * _FILL_TARGET / max(held, 1e-6))
-                limit = max(1, min(_FILL_MAX, 2 * limit, fit))
-                # While writes are arriving, hold the write lock a small
-                # fraction of the time, so few appends ever wait behind a
-                # fill; when they stop, catch up at full speed.
-                busy = last_seq is not None and seq != last_seq
-                pause = max(_FILL_MIN_PAUSE, held * (_FILL_BUSY_FACTOR if busy else 1))
-            last_seq = seq
+                pause = _FILL_IDLE_POLL
+            pause = max(0.0, min(pause, until_ckpt))
 
-    def _fill_child_edges(self, limit: int = _FILL_MAX) -> Optional[float]:
-        """Index the next writes past the watermark into ``child_edges``.
+    def _index_watermarks(self, conn: sqlite3.Connection) -> Tuple[int, int, int]:
+        """``(writes_upto, sets_upto, bindings_upto)``: the last write
+        ``seq``, context set ``seq`` and ``bindings`` rowid the lineage index
+        covers. Every context set an indexed write uses is indexed. Reads
+        only the lineage file, so called first in a transaction, it fixes
+        that file's snapshot before the ledger's: the ledger then holds
+        everything the index was filled from."""
+        row = conn.execute(
+            "SELECT writes_upto, sets_upto, bindings_upto FROM lineage.index_filled"
+            " ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        return row if row else (0, 0, 0)
 
-        At most ``limit`` writes and (unless one write has more) ``limit``
-        edges, in one short transaction that also appends the new watermark.
-        Idempotent across connections and processes: the transaction
-        re-reads the watermark under the write lock and does nothing if
-        another connection moved it first. Returns the seconds the write
-        lock was held, or ``None`` if every write is already indexed.
+    def _fill_index(self, limit: int = _FILL_MAX) -> Optional[int]:
+        """Index up to ``limit`` writes past the watermarks, the context sets
+        they use, and up to ``limit`` bindings, in one transaction on the
+        lineage file. Returns how many writes and bindings it indexed, or
+        ``None`` if everything already is.
+
+        Runs entirely in SQL, so it holds neither the ledger's write lock nor
+        the GIL: appends never wait for it. Idempotent across connections and
+        processes: it takes the lineage file's write lock before reading the
+        watermarks, so two fills never index the same rows.
         """
-        with self._ckpt_lock:
-            conn = self._ckpt_conn
-            (wm,) = conn.execute(
-                "SELECT coalesce(max(upto), 0) FROM child_edges_filled"
-            ).fetchone()
-            # Upper bound on each write's edges (a direct parent that is
-            # also in the context set is one edge, counted twice here).
-            rows = conn.execute(
-                "SELECT w.seq,"
-                " (SELECT count(*) FROM direct_parents d WHERE d.write_id = w.write_id)"
-                " + coalesce((SELECT size FROM context_sets s"
-                " WHERE s.set_hash = w.context_set), 0)"
-                " FROM writes w WHERE w.seq > ? ORDER BY w.seq LIMIT ?",
-                (wm, limit),
-            ).fetchall()
-        if not rows:
-            return None
-        hi, total = rows[0][0], 0
-        for seq, n in rows:
-            if total and total + n > limit:
-                break
-            hi, total = seq, total + n
-        with self._lock:
-            start = time.perf_counter()
-            conn = self._conn
-            conn.execute("BEGIN IMMEDIATE")
+        with self._index_lock:
+            conn = self._index_conn
+            conn.execute("BEGIN")
             try:
-                (now_wm,) = conn.execute(
-                    "SELECT coalesce(max(upto), 0) FROM child_edges_filled"
+                # Take the lineage file's write lock first (a no-op write), so
+                # the transaction reads its newest state and can't fail later
+                # on a stale snapshot when it starts writing.
+                conn.execute("DELETE FROM lineage.index_filled WHERE 0")
+                wm, swm, bwm = self._index_watermarks(conn)
+                top, btop = conn.execute(
+                    "SELECT (SELECT coalesce(max(seq), 0) FROM writes),"
+                    " (SELECT coalesce(max(rowid), 0) FROM bindings)"
                 ).fetchone()
-                if now_wm != wm:
-                    conn.execute("ROLLBACK")  # filled by another connection
-                    return time.perf_counter() - start
-                conn.execute(
-                    f"INSERT INTO child_edges {_EDGES_BETWEEN}", {"lo": wm, "hi": hi}
-                )
-                conn.execute(
-                    "INSERT INTO child_edges_filled VALUES (?, ?)", (hi, time.time_ns())
-                )
+                if top <= wm and btop <= bwm:
+                    conn.execute("ROLLBACK")
+                    return None
+                hi, bhi = min(top, wm + limit), min(btop, bwm + limit)
+                # The sets these writes use. A set is appended with (or
+                # before) its first write, and a chain's parts before the set,
+                # so indexing every set up to the newest one used covers them.
+                (used,) = conn.execute(
+                    "SELECT max(cs.seq) FROM writes w"
+                    " CROSS JOIN context_sets cs ON cs.set_hash = w.context_set"
+                    " WHERE w.seq > ? AND w.seq <= ?",
+                    (wm, hi),
+                ).fetchone()
+                args = {
+                    "lo": wm, "hi": hi, "slo": swm, "shi": max(swm, used or 0),
+                    "blo": bwm, "bhi": bhi, "ts": time.time_ns(),
+                }
+                for sql in _FILL_SQL:
+                    conn.execute(sql, args if ":" in sql else ())
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
-            return time.perf_counter() - start
+            return (hi - wm) + (bhi - bwm)
 
     def append_write(
         self,
@@ -870,7 +1147,12 @@ class Ledger:
             return
         self._stop.set()
         self._ckpt_thread.join()
-        self._ckpt_conn.close()
+        with self._ckpt_lock:
+            self._ckpt_conn.close()
+        with self._walk_pool_lock:
+            for conn in self._walk_pool:
+                conn.close()
+            self._walk_pool.clear()
         with self._read_lock:
             self._read_conn.close()
         with self._lock:

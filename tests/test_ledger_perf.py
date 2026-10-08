@@ -85,20 +85,18 @@ def test_append_write_fresh_random_parents_p99_under_1ms(tmp_path, as_):
 
 
 def _watermark(ledger):
-    with ledger._read_lock:
-        return ledger._read_conn.execute(
-            "SELECT coalesce(max(upto), 0) FROM child_edges_filled"
-        ).fetchone()[0]
+    with ledger._index_lock:
+        return ledger._index_watermarks(ledger._index_conn)[0]
 
 
 @pytest.mark.parametrize("as_", ["parents", "context"])
 def test_append_write_during_100k_backlog_fill_p99_under_1ms(tmp_path, as_):
     # A ledger whose 100k writes (2 random parents each) aren't in
-    # child_edges yet, reopened so the background thread starts filling it,
+    # the lineage index yet, reopened so the background thread starts filling it,
     # then appends with 50 fresh random parents timed while the fill runs.
     path = tmp_path / "ledger.db"
     rng = random.Random(100)
-    with Ledger(path, checkpoint_interval=3600) as ledger:  # never fills
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:  # never fills
         for b in range(100):
             ledger.append_batch([
                 dict(content="x", store="mem", source="agent_inference",

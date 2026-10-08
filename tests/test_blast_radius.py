@@ -1,4 +1,6 @@
+import gc
 import random
+import shutil
 import sqlite3
 import threading
 import time
@@ -7,7 +9,7 @@ from collections import Counter
 import pytest
 from perf import SCALE
 
-from dod.ledger import Ledger
+from dod.ledger import INDEX_VERSION, Ledger
 from dod.query import Edge, TracedWrite, blast_radius, trace
 
 
@@ -233,37 +235,62 @@ def test_deleted_items_reported_and_still_walked(ledger):
     assert blast_radius(ledger, "mem", "c").deleted == {}
 
 
-def test_blast_radius_10k_ledger_from_root_under_250ms(path):
+def build_10k(ledger):
     rng = random.Random(10_000)
-    with Ledger(path) as ledger:
-        put(ledger, "mem", "r0", source="user")
-        for i in range(1, 10_000):
-            parents = {
-                ("mem" if j % 2 == 0 else "pg", f"r{j}", "in_prompt")
-                for j in rng.sample(range(max(0, i - 200), i), min(i, 2))
-            }
-            put(ledger, "mem" if i % 2 == 0 else "pg", f"r{i}", parents)
+    put(ledger, "mem", "r0", source="user")
+    for i in range(1, 10_000):
+        parents = {
+            ("mem" if j % 2 == 0 else "pg", f"r{j}", "in_prompt")
+            for j in rng.sample(range(max(0, i - 200), i), min(i, 2))
+        }
+        put(ledger, "mem" if i % 2 == 0 else "pg", f"r{i}", parents)
 
-        blast_radius(ledger, "mem", "r0")  # warm the page cache
-        # Best of several runs: the walk is O(ledger), so the minimum is its
-        # cost and the rest is scheduler noise. Measured min under 100 to ~130 ms on CI,
-        # ~125-185 ms on dev machines. The index fill lags a burst of appends,
-        # so most of this walk reads the not-yet-indexed tail.
-        samples = []
-        for _ in range(5):
-            start = time.perf_counter()
-            r = blast_radius(ledger, "mem", "r0")
-            samples.append((time.perf_counter() - start) * 1e3)
-        elapsed_ms = min(samples)
-        print(
-            f"blast radius from root over 10k writes: {len(r.descendants)} descendants, "
-            f"min {elapsed_ms:.2f} ms, median {sorted(samples)[2]:.2f} ms"
-        )
+
+def best_of_5(ledger):
+    """Min and median ms of five root walks (after one to warm the cache).
+    The walk is O(ledger), so the minimum is its cost and the rest is
+    scheduler noise."""
+    blast_radius(ledger, "mem", "r0")
+    samples = []
+    for _ in range(5):
+        start = time.perf_counter()
+        r = blast_radius(ledger, "mem", "r0")
+        samples.append((time.perf_counter() - start) * 1e3)
+    return min(samples), sorted(samples)[2], r
+
+
+def test_blast_radius_10k_ledger_from_root_under_100ms(path):
+    with Ledger(path) as ledger:
+        build_10k(ledger)
+        # The background fill catches up once the appends stop.
+        deadline = time.monotonic() + 10
+        while watermark(path) < max_seq(path) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        caught_up = 10 - (deadline - time.monotonic())
+        assert watermark(path) == max_seq(path)
+        elapsed_ms, median, r = best_of_5(ledger)
+        print(f"blast radius from root over 10k writes: {len(r.descendants)} descendants,"
+              f" min {elapsed_ms:.2f} ms, median {median:.2f} ms (indexed {caught_up:.2f} s"
+              " after the last append)")
     assert len(r.descendants) > 9_000
+    # Measured min ~50-85 ms on a dev machine.
+    assert elapsed_ms < 100 * SCALE
+
+
+def test_blast_radius_10k_ledger_unindexed_under_250ms(path):
+    # Nothing indexed: the whole walk reads the source tables (what a walk
+    # sees of writes the background fill hasn't reached yet).
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        build_10k(ledger)
+        elapsed_ms, median, r = best_of_5(ledger)
+        print(f"blast radius from root over 10k unindexed writes: min {elapsed_ms:.2f} ms,"
+              f" median {median:.2f} ms")
+    assert len(r.descendants) > 9_000
+    # Measured min ~150-160 ms on a dev machine and on CI.
     assert elapsed_ms < 250 * SCALE
 
 
-# --- Indexed walk (child_edges) -------------------------------------------
+# --- Indexed walk (integer lineage index) ---------------------------------
 
 
 def full_scan_blast_radius(path, store, record_id, max_depth=None):
@@ -351,8 +378,15 @@ def comparable(r):
     )
 
 
+def connect(path):
+    """A raw connection to the ledger with its lineage file attached."""
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.execute("ATTACH DATABASE ? AS lineage", (f"{path}-lineage",))
+    return conn
+
+
 def scalar(path, sql):
-    conn = sqlite3.connect(str(path))
+    conn = connect(path)
     try:
         return conn.execute(sql).fetchone()[0]
     finally:
@@ -360,7 +394,43 @@ def scalar(path, sql):
 
 
 def watermark(path):
-    return scalar(path, "SELECT coalesce(max(upto), 0) FROM child_edges_filled")
+    """The last write seq the lineage index covers."""
+    return scalar(
+        path, "SELECT coalesce((SELECT writes_upto FROM index_filled ORDER BY seq DESC"
+        " LIMIT 1), 0)"
+    )
+
+
+def bindings_watermark(path):
+    """The last bindings rowid the lineage index covers."""
+    return scalar(
+        path, "SELECT coalesce((SELECT bindings_upto FROM index_filled ORDER BY seq DESC"
+        " LIMIT 1), 0)"
+    )
+
+
+# The lineage index's edges and bindings, as strings, comparable with the
+# source tables.
+_INDEX_EDGES = """
+WITH direct AS (SELECT item, seq, tag FROM direct_children),
+context AS (
+    SELECT pi.item, sw.seq, max(pi.tag) AS tag FROM part_items pi
+    JOIN set_parts sp ON sp.part = pi.part JOIN set_writes sw ON sw.sid = sp.sid
+    GROUP BY pi.item, sw.seq
+),
+edges AS (
+    SELECT item, seq, tag FROM direct
+    UNION ALL SELECT c.item, c.seq, c.tag FROM context c
+    WHERE NOT EXISTS (SELECT 1 FROM direct d WHERE d.item = c.item AND d.seq = c.seq)
+)
+SELECT i.store, i.record_id, w.write_id,
+    CASE e.tag WHEN 1 THEN 'in_prompt' ELSE 'retrieved_in_scope' END
+FROM edges e JOIN items i ON i.item = e.item JOIN writes w ON w.seq = e.seq
+"""
+_INDEX_BINDINGS = (
+    "SELECT w.write_id, i.store, i.record_id FROM write_items x"
+    " JOIN items i ON i.item = x.item JOIN writes w ON w.seq = x.seq"
+)
 
 
 def max_seq(path):
@@ -368,17 +438,33 @@ def max_seq(path):
 
 
 def edge_rows(path, table):
-    conn = sqlite3.connect(str(path))
+    """Edges as sorted ``(parent_store, parent_record_id, write_id, tag)``,
+    from the ``parents`` view or (``"index"``) the lineage index."""
+    sql = _INDEX_EDGES if table == "index" else (
+        f"SELECT parent_store, parent_record_id, write_id, tag FROM {table}"
+    )
+    conn = connect(path)
     try:
-        return sorted(conn.execute(
-            f"SELECT parent_store, parent_record_id, write_id, tag FROM {table}"
-        ))
+        return sorted(conn.execute(sql))
+    finally:
+        conn.close()
+
+
+def binding_rows(path, table):
+    """Distinct bindings as sorted ``(write_id, store, record_id)``, from the
+    ``bindings`` table or (``"index"``) the lineage index."""
+    sql = _INDEX_BINDINGS if table == "index" else (
+        "SELECT DISTINCT write_id, store, record_id FROM bindings"
+    )
+    conn = connect(path)
+    try:
+        return sorted(conn.execute(sql))
     finally:
         conn.close()
 
 
 def fill_all(ledger, limit=100_000):
-    while ledger._fill_child_edges(limit) is not None:
+    while ledger._fill_index(limit) is not None:
         pass
 
 
@@ -420,7 +506,7 @@ def random_ledger(ledger, rng, n):
 
 def test_indexed_walk_matches_full_scan_unindexed_half_and_fully_indexed(path):
     rng = random.Random(34)
-    with Ledger(path, checkpoint_interval=3600) as ledger:  # filled by hand here
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:  # filled by hand here
         items = random_ledger(ledger, rng, 600)
         roots = sorted(set(rng.sample(items, 60)) | {("mongo", "seed")})
         top = max_seq(path)
@@ -434,7 +520,7 @@ def test_indexed_walk_matches_full_scan_unindexed_half_and_fully_indexed(path):
         assert watermark(path) == 0
         check("unindexed")
         while watermark(path) < top // 2:
-            assert ledger._fill_child_edges(37) is not None
+            assert ledger._fill_index(37) is not None
         assert 0 < watermark(path) < top
         check("half indexed")
         fill_all(ledger)
@@ -444,36 +530,44 @@ def test_indexed_walk_matches_full_scan_unindexed_half_and_fully_indexed(path):
         check("indexed plus tail")
 
 
-def test_child_edges_hold_exactly_the_parents_view(path):
-    with Ledger(path, checkpoint_interval=3600) as ledger:
+def test_index_holds_exactly_the_parents_view_and_bindings(path):
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
         random_ledger(ledger, random.Random(7), 300)
         fill_all(ledger)
     view = edge_rows(path, "parents")
-    assert view and edge_rows(path, "child_edges") == view
-    # Each edge's seq is its child write's.
-    assert scalar(
-        path,
-        "SELECT count(*) FROM child_edges c JOIN writes w ON w.seq = c.seq"
-        " WHERE w.write_id != c.write_id",
-    ) == 0
+    assert view and edge_rows(path, "index") == view
+    bound = binding_rows(path, "bindings")
+    assert bound and binding_rows(path, "index") == bound
+    # Each item is interned once.
+    assert scalar(path, "SELECT count(*) FROM items") == scalar(
+        path, "SELECT count(*) FROM (SELECT DISTINCT store, record_id FROM items)"
+    )
 
 
-def test_child_edges_are_append_only(path, ledger):
+def test_index_is_append_only(path, ledger):
     put(ledger, "mem", "a")
     put(ledger, "mem", "b", [("mem", "a", "in_prompt")])
+    # A write with a context set, so every index table has a row to protect.
+    wid = ledger.append_write(content="c", store="mem", source="agent_inference",
+                              context=[("mem", "a", "retrieved_in_scope")])
+    ledger.bind(wid, "mem", "c")
     fill_all(ledger)
-    conn = sqlite3.connect(str(path), isolation_level=None)
-    for sql in (
-        "UPDATE child_edges SET tag = 'retrieved_in_scope'",
-        "DELETE FROM child_edges",
-        "INSERT OR REPLACE INTO child_edges SELECT * FROM child_edges",
-        "UPDATE child_edges_filled SET ts = 0",
-        "DELETE FROM child_edges_filled",
-        "INSERT OR REPLACE INTO child_edges_filled SELECT * FROM child_edges_filled",
-    ):
-        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-            conn.execute(sql)
-    assert conn.execute("SELECT count(*) FROM child_edges").fetchone() == (1,)
+    conn = connect(path)
+    cols = {"items": "store", "direct_children": "tag", "part_items": "tag",
+            "set_parts": "sid", "set_writes": "seq", "write_items": "item",
+            "index_filled": "ts"}
+    for table, col in cols.items():
+        for sql in (
+            f"UPDATE {table} SET {col} = {col}",
+            f"DELETE FROM {table}",
+            f"INSERT OR REPLACE INTO {table} SELECT * FROM {table}",
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                conn.execute(sql)
+    for table in cols:
+        assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] > 0, table
+    assert conn.execute("SELECT count(*) FROM direct_children").fetchone() == (1,)
+    assert conn.execute("SELECT count(*) FROM write_items").fetchone() == (3,)
     conn.close()
 
 
@@ -485,22 +579,22 @@ def test_background_thread_fills_index(path):
         while watermark(path) < max_seq(path) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert watermark(path) == max_seq(path)
-        assert edge_rows(path, "child_edges") == [("mem", "a", b, "in_prompt")]
+        assert edge_rows(path, "index") == [("mem", "a", b, "in_prompt")]
         assert depths(blast_radius(ledger, "mem", "a")) == {b: 1}
 
 
 def test_two_ledgers_filling_one_file_concurrently(path):
-    with Ledger(path, checkpoint_interval=3600) as ledger:
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
         random_ledger(ledger, random.Random(2), 2_000)
     errors = []
-    with Ledger(path, checkpoint_interval=3600) as one, \
-            Ledger(path, checkpoint_interval=3600) as two:
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as one, \
+            Ledger(path, checkpoint_interval=3600, background_index=False) as two:
         barrier = threading.Barrier(2)
 
         def fill(led):
             try:
                 barrier.wait()
-                while led._fill_child_edges(25) is not None:
+                while led._fill_index(25) is not None:
                     pass
             except BaseException as e:  # reported below
                 errors.append(e)
@@ -512,11 +606,110 @@ def test_two_ledgers_filling_one_file_concurrently(path):
             t.join()
         assert errors == []
         # Nothing missing, nothing twice.
-        assert edge_rows(path, "child_edges") == edge_rows(path, "parents")
+        assert edge_rows(path, "index") == edge_rows(path, "parents")
+        assert binding_rows(path, "index") == binding_rows(path, "bindings")
         assert watermark(path) == max_seq(path)
         for led in (one, two):
             assert comparable(blast_radius(led, "mongo", "seed")) == \
                 full_scan_blast_radius(path, "mongo", "seed")
+
+
+def test_lineage_file_is_derived_and_separate(path):
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        random_ledger(ledger, random.Random(5), 100)
+        fill_all(ledger)
+    # The ledger file holds no index tables; the lineage file holds them all.
+    main = {r[0] for r in sqlite3.connect(str(path)).execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert not main & {"items", "direct_children", "write_items", "index_filled"}
+    assert scalar(path, "PRAGMA lineage.user_version") == INDEX_VERSION
+    # Deleted, it is rebuilt from the ledger.
+    shutil.os.remove(f"{path}-lineage")
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        assert watermark(path) == 0
+        fill_all(ledger)
+        assert comparable(blast_radius(ledger, "mongo", "seed")) == \
+            full_scan_blast_radius(path, "mongo", "seed")
+    assert edge_rows(path, "index") == edge_rows(path, "parents")
+
+
+@pytest.mark.parametrize("damage", ["other_ledger", "garbage", "other_version", "restored_backup"])
+def test_stale_lineage_file_is_rebuilt(tmp_path, damage):
+    path = tmp_path / "ledger.db"
+    lineage = tmp_path / "ledger.db-lineage"
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        random_ledger(ledger, random.Random(3), 200)
+        fill_all(ledger)
+    if damage == "other_ledger":
+        other = tmp_path / "other.db"
+        with Ledger(other, checkpoint_interval=3600, background_index=False) as o:
+            random_ledger(o, random.Random(4), 300)
+            fill_all(o)
+        shutil.copy(f"{other}-lineage", lineage)
+    elif damage == "garbage":
+        lineage.write_bytes(b"not a database " * 1000)
+    elif damage == "other_version":
+        conn = sqlite3.connect(str(lineage))
+        conn.execute(f"PRAGMA user_version={INDEX_VERSION + 1}")
+        conn.close()
+    else:  # the ledger restored from a backup older than its lineage file
+        backup = tmp_path / "backup.db"
+        shutil.copy(path, backup)
+        with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+            for i in range(20):
+                put(ledger, "mongo", f"late{i}", [("mongo", "seed", "in_prompt")])
+            fill_all(ledger)
+        shutil.copy(backup, path)
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        fill_all(ledger)
+        assert comparable(blast_radius(ledger, "mongo", "seed")) == \
+            full_scan_blast_radius(path, "mongo", "seed")
+    assert edge_rows(path, "index") == edge_rows(path, "parents")
+    assert binding_rows(path, "index") == binding_rows(path, "bindings")
+    assert watermark(path) == max_seq(path)
+
+
+@pytest.mark.parametrize("fill_first", [False, True])
+def test_lazy_edges_are_the_walks_snapshot(path, fill_first):
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
+        random_ledger(ledger, random.Random(9), 200)
+        if fill_first:
+            fill_all(ledger)
+        lazy = blast_radius(ledger, "mongo", "seed")
+        expected = sorted(blast_radius(ledger, "mongo", "seed").edges)
+        # The ledger and the index move on before the edges are read.
+        for i in range(30):
+            put(ledger, "mongo", f"new{i}", [("mongo", "seed", "in_prompt")])
+        fill_all(ledger)
+        assert sorted(lazy.edges) == expected
+        assert len(blast_radius(ledger, "mongo", "seed").edges) == len(expected) + 30
+
+
+def test_in_memory_ledger_walks_with_and_without_index():
+    with Ledger(":memory:", checkpoint_interval=3600, background_index=False) as ledger:
+        random_ledger(ledger, random.Random(11), 300)
+        unindexed = comparable(blast_radius(ledger, "mongo", "seed"))
+        assert ledger._fill_index(100) is not None
+        half = comparable(blast_radius(ledger, "mongo", "seed"))
+        fill_all(ledger)
+        assert ledger._fill_index() is None
+        indexed = comparable(blast_radius(ledger, "mongo", "seed"))
+        assert unindexed == half == indexed
+        assert unindexed["descendants"]
+
+
+def test_walk_leaves_the_garbage_collector_as_it_found_it(ledger):
+    put(ledger, "mem", "a")
+    put(ledger, "mem", "b", [("mem", "a", "in_prompt")])
+    assert gc.isenabled()
+    assert blast_radius(ledger, "mem", "a").edges
+    assert gc.isenabled()
+    gc.disable()
+    try:
+        assert blast_radius(ledger, "mem", "a").edges
+        assert not gc.isenabled()
+    finally:
+        gc.enable()
 
 
 def build_clusters(ledger, n_clusters, size, rng):
@@ -556,7 +749,7 @@ def best_ms(fn, runs):
 
 
 def test_blast_radius_100k_ledger_indexed(path):
-    with Ledger(path, checkpoint_interval=3600) as ledger:
+    with Ledger(path, checkpoint_interval=3600, background_index=False) as ledger:
         build_clusters(ledger, 1_000, 100, random.Random(100))
         fill_all(ledger)
 
@@ -572,8 +765,7 @@ def test_blast_radius_100k_ledger_indexed(path):
               f" full scan min {scan_ms:.0f} ms")
         assert len(r.descendants) == 100_000
         assert comparable(r) == expected
-    assert small_ms < 50 * SCALE
-    # Measured min ~1.1-1.4 s on CI, ~1.35-1.5 s on dev machines, ~0.65-0.75x
-    # the full scan.
-    assert root_ms < 2_500 * SCALE
+    assert small_ms < 10 * SCALE
+    # Measured min ~0.65-0.9 s on a dev machine, ~0.3-0.4x the full scan.
+    assert root_ms < 1_000 * SCALE
     assert root_ms < 2 * scan_ms
