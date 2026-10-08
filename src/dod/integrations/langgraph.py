@@ -47,6 +47,12 @@ Excision
     ``DeleteAdapter(store)`` lets ``dod.excise`` delete items through the
     instrumented ``delete``, so each deletion is tombstoned.
 
+Reconciliation
+    ``ReconcileAdapter(store)`` lets ``dod.reconcile`` list every item and
+    its content hash. An item that expires by TTL is deleted by the store,
+    not through ``delete``, so it isn't tombstoned: reconcile reports it as
+    ``missing``.
+
 Writes
     Before the store call, the instrumented store reads the keys being put
     (one extra ``batch`` with ``refresh_ttl=False``) and records every put in
@@ -76,6 +82,7 @@ from langgraph.store.base import BaseStore, GetOp, PutOp, SearchOp
 
 from dod import scope as _scope
 from dod.capture import Capture
+from dod.capture import _content_hash as _hash
 from dod.excise import deletion_reason
 from dod.quarantine import QuarantineCache, count_blocked
 
@@ -223,6 +230,45 @@ class DeleteAdapter:
             return False
         self.store.delete(tuple(namespace), key)
         return True
+
+
+class ReconcileAdapter:
+    """Store adapter for ``dod.reconcile``: lists every item through the
+    store's own (uninstrumented) ``batch``, so nothing is recorded as a
+    retrieval, quarantined items are seen too, and TTLs aren't refreshed.
+    Content hashes are computed as capture records them (the value as
+    sorted-key JSON), so ``modified`` is checked."""
+
+    def __init__(self, store: Any, page: int = 1000) -> None:
+        if not isinstance(store, BaseStore):
+            raise TypeError("store must be a langgraph BaseStore")
+        if page < 1:
+            raise ValueError("page must be >= 1")
+        self.store = store
+        self.page = page
+
+    def _batch(self, ops: list) -> list:
+        return getattr(type(self.store), "_dod_base", type(self.store)).batch(self.store, ops)
+
+    def scan(self) -> List[Tuple[str, str]]:
+        out = {}
+        offset = 0
+        while True:
+            (items,) = self._batch(
+                [SearchOp((), None, self.page, offset, None, refresh_ttl=False)]
+            )
+            for item in items:
+                out[record_id(item.namespace, item.key)] = _hash(_content(item.value))
+            if len(items) < self.page:
+                return list(out.items())
+            offset += self.page
+
+    def get(self, rid: str) -> Tuple[bool, Optional[str]]:
+        *namespace, key = json.loads(rid)
+        (found,) = self._batch([GetOp(tuple(namespace), key, refresh_ttl=False)])
+        if found is None:
+            return False, None
+        return True, _hash(_content(found.value))
 
 
 def _plan(ops: Iterable[Any]) -> Tuple[list, List[PutOp]]:

@@ -124,6 +124,34 @@ with tracer.start_as_current_span("agent-step"):
 
 Attributes are IDs, hashes and tags only (`dod.write.id`, `dod.write.content_hash`, `dod.parents.store`/`record_id`/`tag`, ...; see `dod/export/otel.py`), never memory content, and never `gen_ai.*` names. The observer only calls the OpenTelemetry API: where the data goes is decided by your own SDK and exporter configuration, and without one nothing is sent. Observers run after the ledger commit; one that raises is logged and never breaks capture.
 
+## Reconcile
+
+Capture only sees writes that go through an instrumented call. `reconcile` checks that nothing else changed your stores. It reads each store, compares it with the ledger, and reports every item they disagree on:
+
+```python
+from dod.integrations import anthropic_memory, crewai, langgraph
+from dod.reconcile import reconcile
+
+report = reconcile(ledger, {
+    "crewai": crewai.ReconcileAdapter(memory),
+    "langgraph": langgraph.ReconcileAdapter(store),
+    "anthropic_memory": anthropic_memory.ReconcileAdapter(tool),
+})
+for f in report.findings:
+    print(f.kind, f.store, f.record_id, "read into", len(f.read_into), "recorded writes")
+```
+
+The four kinds of finding:
+
+- `unrecorded`: in the store but never recorded. It was written outside capture.
+- `resurrected`: in the store, but recorded as deleted.
+- `missing`: recorded as live, but gone from the store. It was deleted outside capture, for example by a TTL sweep.
+- `modified`: content differs from the last recorded write. Not checked for the memory tool, whose ledger hash is a command's payload rather than the file.
+
+For `unrecorded` and `resurrected` items, `read_into` lists the recorded writes that already used the item as a parent. Those are the points where `trace` currently stops.
+
+Reconcile is read-only. It never records the reads it makes and never changes a store. Each finding is re-checked after `grace` seconds (default 1), so writes still in flight aren't reported. One pass over 100k items takes about a second. Run it on a schedule to keep the capture guarantee checked.
+
 ## Guarantees
 
 - **Content-free ledger.** The ledger stores IDs, content hashes, edges, and metadata only. Memory content stays in your stores. (`reason` and `actor` on quarantine are stored as you pass them; keep content out of them.)
@@ -135,7 +163,7 @@ What it does **not** do:
 
 - **No automated detection of bad memories.** You identify the bad output; `dod` traces it to its origin and shows what it reached.
 - Quarantine is enforced by the instrumented stores (CrewAI recall, LangGraph `get`/`search`, memory tool `view`); reads that bypass them see quarantined items.
-- Writes that bypass an instrumented store (direct database inserts, uninstrumented tools) are not captured.
+- Writes that bypass an instrumented store (direct database inserts, uninstrumented tools) are not captured; `reconcile` finds them afterwards.
 
 ## Status
 
@@ -145,6 +173,7 @@ Supported:
 - **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`).
 - **Anthropic memory tool** (anthropic 1.12.1, `memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and `clear_all_memory`, on `BetaAbstractMemoryTool`/`BetaAsyncAbstractMemoryTool` subclasses that keep the default `call` (such as `BetaLocalFilesystemMemoryTool`). A viewed file is an `in_prompt` parent; the record ID is the memory path.
 - `trace`, `blast_radius`, quarantine/release, and `excise` (quarantine or delete), across all three stores through one ledger.
+- `reconcile`: finds writes, edits and deletions made outside capture, in all three stores.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
 
 Next: regenerate (rewrite derived items without the bad parent) and more integrations (LangGraph agents, Pydantic AI, an MCP gateway).

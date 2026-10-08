@@ -107,6 +107,10 @@ Excision
     instrumented ``forget(record_ids=[...])``, so each deletion is
     tombstoned like any other ``forget``, with reason ``excision``.
 
+Reconciliation
+    ``ReconcileAdapter(memory)`` lets ``dod.reconcile`` list every record and
+    its content hash straight from storage.
+
 ``remember_many``
     Saves in the background and returns ``[]``. Each item is recorded as a
     write when ``remember_many`` is called, with the scope's context as
@@ -127,7 +131,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from dod import scope as _scope
-from dod.capture import Capture
+from dod.capture import Capture, _content_hash
 from dod.excise import deletion_reason
 from dod.ledger import SOURCES
 from dod.quarantine import _blocked, blocked_retrievals, count_blocked  # noqa: F401
@@ -135,7 +139,7 @@ from dod.quarantine import QuarantineCache
 from dod.scope import Key, _key, agent_task_scope
 
 __all__ = [
-    "DeleteAdapter", "agent_task_scope", "blocked_retrievals", "install_task_scopes",
+    "DeleteAdapter", "ReconcileAdapter", "agent_task_scope", "blocked_retrievals", "install_task_scopes",
     "instrument",
 ]
 
@@ -414,6 +418,34 @@ class DeleteAdapter:
     def delete(self, record_id: str) -> bool:
         """Delete ``record_id``; return False if it wasn't in storage."""
         return bool(self.memory.forget(record_ids=[record_id]))
+
+
+class ReconcileAdapter:
+    """Store adapter for ``dod.reconcile``: lists every record straight from
+    the memory's storage (not ``recall``), so nothing is recorded as a
+    retrieval and quarantined records are seen too. Content hashes are
+    computed as capture records them (the record's content), so ``modified``
+    is checked."""
+
+    def __init__(self, memory: Any) -> None:
+        storage = getattr(memory, "_storage", None)
+        if storage is None:
+            raise TypeError(f"{type(memory).__name__} has no _storage to read")
+        self.storage = storage
+
+    def scan(self) -> List[Tuple[str, str]]:
+        limit = self.storage.count() + 1
+        while True:
+            records = self.storage.list_records(limit=limit)
+            if len(records) < limit:
+                return [(r.id, _content_hash(_text(r.content))) for r in records]
+            limit *= 2  # records were added since count()
+
+    def get(self, record_id: str) -> Tuple[bool, Optional[str]]:
+        record = self.storage.get_record(record_id)
+        if record is None:
+            return False, None
+        return True, _content_hash(_text(record.content))
 
 
 def install_task_scopes() -> None:
