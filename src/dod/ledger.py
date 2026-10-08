@@ -19,6 +19,10 @@ It is derived, never written on the append path: the background thread fills
 it after the fact, and ``child_edges_filled`` records how far (the highest
 write ``seq`` indexed). Queries read writes past that watermark from the
 source tables.
+
+A file records its schema version (``PRAGMA user_version``); opening one at
+another version, or an unversioned file with tables, raises
+``LedgerSchemaError`` before anything is read or written.
 """
 
 import hashlib
@@ -35,6 +39,15 @@ REASONS = ("consolidation", "excision", "forget", "other")
 
 Item = Tuple[str, str]
 Parent = Tuple[str, str, str]
+
+# Stored in the file's ``PRAGMA user_version``. Bump it on any change to
+# tables, columns, triggers or views, and ship a migration (or a "recreate"
+# note in docs/decisions.md) with the bump.
+SCHEMA_VERSION = 2  # 2: child_edges + child_edges_filled (#34)
+
+
+class LedgerSchemaError(Exception):
+    """A ledger file's schema version differs from this library's."""
 
 _TABLES = (
     "writes", "direct_parents", "context_sets", "context_members", "bindings",
@@ -233,6 +246,33 @@ def _write_id(ts: int, last: int) -> int:
     return value if value > last else last + 1
 
 
+def _statements(script: str):
+    """Split ``script`` into single statements (trigger bodies kept whole)."""
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            yield buf
+            buf = ""
+
+
+def _check_schema(conn: sqlite3.Connection, path) -> bool:
+    """Raise ``LedgerSchemaError`` unless the file is new or at
+    ``SCHEMA_VERSION``; return whether it is new (no version, no tables)."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version == SCHEMA_VERSION:
+        return False
+    if version == 0 and not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+    ).fetchone():
+        return True
+    found = "unversioned (created before schema versioning)" if version == 0 else version
+    raise LedgerSchemaError(
+        f"ledger file {str(path)!r} has schema version {found}; this library"
+        f" uses version {SCHEMA_VERSION}. Migrate or recreate the file."
+    )
+
+
 def _dedupe_parents(parents: Iterable[Parent]) -> list:
     merged = {}
     for p in parents:
@@ -300,16 +340,32 @@ class Ledger:
 
     def __init__(self, path: Union[str, os.PathLike], checkpoint_interval: float = 1.0):
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(
+        self._conn = conn = sqlite3.connect(
             str(path), isolation_level=None, check_same_thread=False
         )
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA recursive_triggers=ON")
-        self._conn.execute("PRAGMA wal_autocheckpoint=0")
-        self._conn.executescript(_SCHEMA)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            # Checked before anything writes to the file, then again under
+            # the write lock in case another opener created it meanwhile.
+            _check_schema(conn, path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA recursive_triggers=ON")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if _check_schema(conn, path):
+                    for stmt in _statements(_SCHEMA):
+                        conn.execute(stmt)
+                    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.close()
+            raise
 
         self._read_lock = threading.Lock()
         self._read_conn = sqlite3.connect(
