@@ -55,7 +55,16 @@ ANTHROPIC_API_KEY=... python -m experiments.propagation.run --mode llm \
 ```
 
 `--use-prob` and `--error-rate` don't apply and are reported as `null`.
-Never run from tests or CI.
+Tests and automatic CI never run it.
+
+To run it without a key on your machine, start the **Propagation
+experiment** workflow (`.github/workflows/experiment.yml`) from the Actions
+tab. It takes a model, the steps per run and the number of seeds, and it
+reads the key from the `ANTHROPIC_API_KEY` repository secret. Each run's JSON
+and printed table are committed to the `experiment-results` branch under
+`propagation/`, named by time and run ID, including a failed run's output. The
+commit message records the model and the code SHA. Nothing starts it
+automatically.
 
 In both modes the harness renders the written text from the chosen value,
 so the ground truth is exact: an item is **wrong** if its value differs from
