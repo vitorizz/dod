@@ -149,22 +149,24 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
 )
 
 
+# The last write ID issued in this process. Taken inside a Ledger's _lock
+# (always in that order), so IDs strictly increase within the process and,
+# per Ledger, with seq.
 _id_lock = threading.Lock()
 _last_id = 0
 
 
-def _write_id(ts: int) -> str:
-    """A UUIDv7-layout ID: 48-bit Unix ms, then random bits.
+def _write_id(ts: int, last: int) -> int:
+    """A UUIDv7-layout ID as an int: 48-bit Unix ms, then random bits.
 
     Time-ordered, so a new write's entries in the ``write_id`` indexes land on
     the rightmost B-tree leaf instead of a random one. With random IDs every
     write in a commit dirtied its own leaf in each index, and the extra WAL
     pages dominated a multi-write commit.
 
-    IDs from one process are strictly increasing: within a millisecond, or if
-    the clock steps back, the next ID is the previous one plus one.
+    Strictly greater than ``last``: within a millisecond, or if the clock
+    steps back, the ID is ``last`` plus one. Format with ``:032x``.
     """
-    global _last_id
     ms = max(ts, 0) // 1_000_000
     rand = int.from_bytes(os.urandom(10), "big")
     value = (
@@ -174,11 +176,7 @@ def _write_id(ts: int) -> str:
         | 0b10 << 62
         | rand & (2**62 - 1)
     )
-    with _id_lock:
-        if value <= _last_id:
-            value = _last_id + 1
-        _last_id = value
-    return f"{value:032x}"
+    return value if value > last else last + 1
 
 
 def _dedupe_parents(parents: Iterable[Parent]) -> list:
@@ -334,7 +332,8 @@ class Ledger:
         ``append_tombstones``. Returns the new write IDs in order. All or
         nothing: if anything is invalid or fails, nothing is recorded.
         """
-        write_rows, parent_rows, binding_rows, write_ids = [], [], [], []
+        # Everything but the write IDs is prepared outside the lock.
+        prepared, binding_rows = [], []
         # id(context) -> (context, set_hash, members, tags): writes in one
         # batch usually pass the same context object, so hash it once.
         contexts = {}
@@ -355,23 +354,36 @@ class Ledger:
             _, set_hash, members, tags = contexts[id(context)]
             if set_hash is not None:
                 sets[set_hash] = members
-            write_id = _write_id(ts)
-            write_rows.append((
-                write_id, hashlib.sha256(content).hexdigest(), ts, w["store"],
+            row = (
+                hashlib.sha256(content).hexdigest(), ts, w["store"],
                 w.get("agent_id"), w.get("session_id"), source, set_hash,
-            ))
-            for s, r, t in _dedupe_parents(w.get("parents", ())):
-                # Shadows the context's edge in the parents view, so it carries
-                # the merged tag.
-                if tags.get((str(s), str(r))) == "in_prompt":
-                    t = "in_prompt"
-                parent_rows.append((write_id, s, r, t))
-            if w.get("record_id") is not None:
-                binding_rows.append((write_id, w["store"], w["record_id"], ts))
-            write_ids.append(write_id)
-        binding_rows += [(wid, s, r, ts) for wid, s, r in bindings]
+            )
+            # A direct parent shadows the context's edge in the parents view,
+            # so it carries the merged tag.
+            direct = [
+                (s, r, "in_prompt" if tags.get((str(s), str(r))) == "in_prompt" else t)
+                for s, r, t in _dedupe_parents(w.get("parents", ()))
+            ]
+            prepared.append((row, direct, w["store"], w.get("record_id")))
+        later_bindings = [(wid, s, r, ts) for wid, s, r in bindings]
         tombstone_rows = [_tombstone_row(t, ts) for t in tombstones]
         with self._lock:
+            # IDs are issued under the lock, so they increase with seq across
+            # concurrent writers. A failed batch just skips its IDs.
+            global _last_id
+            write_rows, parent_rows, write_ids = [], [], []
+            with _id_lock:
+                last = _last_id
+                for row, direct, store, record_id in prepared:
+                    last = _write_id(ts, last)
+                    write_id = f"{last:032x}"
+                    write_rows.append((write_id,) + row)
+                    parent_rows += [(write_id, s, r, t) for s, r, t in direct]
+                    if record_id is not None:
+                        binding_rows.append((write_id, store, record_id, ts))
+                    write_ids.append(write_id)
+                _last_id = last
+            binding_rows += later_bindings
             conn = self._conn
             # IMMEDIATE takes the write lock up front (waiting via
             # busy_timeout), so the context-set check below reads the latest

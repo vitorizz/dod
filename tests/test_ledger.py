@@ -616,6 +616,15 @@ def test_concurrent_appends(path, ledger):
     assert conn.execute("SELECT COUNT(*) FROM parents").fetchone()[0] == 4000
     seqs = [r[0] for r in conn.execute("SELECT seq FROM writes ORDER BY seq")]
     assert seqs == list(range(1, 4001))
+    # IDs are issued under the append lock, so they increase with seq.
+    ids = [r[0] for r in conn.execute("SELECT write_id FROM writes ORDER BY seq")]
+    assert ids == sorted(ids) and len(set(ids)) == len(ids)
+
+
+def test_write_ids_increase_across_ledgers_in_a_process(tmp_path):
+    with Ledger(tmp_path / "a.db") as a, Ledger(tmp_path / "b.db") as b:
+        wids = [write(led) for _ in range(100) for led in (a, b)]
+    assert wids == sorted(wids) and len(set(wids)) == len(wids)
 
 
 def test_two_ledgers_racing_on_the_same_new_context(path):
