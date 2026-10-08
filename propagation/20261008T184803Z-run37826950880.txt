@@ -1,0 +1,7 @@
+model: anthropic/claude-sonnet-5-5  steps: 10  seeds: 1  code: f91443d535c9f41637f37535abb8c871ff3079c5
+llm mode: 1 run(s) x 10 steps = ~10 LLM calls to anthropic/claude-sonnet-5-5, one per step.
+seed  p_use  derived  in_prompt  depth  stores  ip_share  wrong_out  traced  traced_ip  excise  excise_ok  excise_ip  excise_ip_ok  wipe  wipe_ok
+----  -----  -------  ---------  -----  ------  --------  ---------  ------  ---------  ------  ---------  ---------  ------------  ----  -------
+   0      -        2          2      1       1      1.00          2    1.00       1.00       3          0          3             0    17       14
+
+Wrote /home/runner/work/_temp/out/20261008T184803Z-run37826950880.json (1 run(s), 17.59 s).
