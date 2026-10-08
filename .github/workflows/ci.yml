@@ -17,17 +17,35 @@ jobs:
         with:
           python-version: "3.12"
 
+      # With the real integration packages, so the CrewAI, LangGraph, cross-store
+      # and quickstart tests run here instead of skipping.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install -e .; fi
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pytest
+          pip install -e ".[dev,crewai,langgraph]"
 
       - name: Run pytest
-        # Exit code 5 = no tests collected; tolerated until the first tests land.
+        run: pytest -q
+
+  # The core library must work with no integration installed.
+  test-core:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
         run: |
-          pytest -q || { code=$?; [ $code -eq 5 ] && echo "No tests collected" || exit $code; }
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest without integrations
+        run: pytest -q
 
   # Docs-only PRs (every changed file is Markdown or under docs/) skip the review.
   changes:
