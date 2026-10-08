@@ -73,7 +73,7 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 - Ledger: stdlib `sqlite3`, append-only, WAL mode. No ORM.
 - Tests: pytest. Benchmarks are plain pytest tests using `tests/perf.py` (p50/p99 via `time.perf_counter_ns`).
 - Framework integrations are optional extras, never core dependencies: `[crewai]` pins `crewai==1.15.22`.
-- CI and agents: GitHub Actions (`ci.yml`, `claude.yml`, `claude-code-review.yml`, `project-board.yml`).
+- CI and agents: GitHub Actions (`ci.yml`, `claude.yml`, `claude-code-review.yml`, `project-board.yml`, `update-branches.yml`).
 
 ## Test commands
 ```bash
@@ -90,7 +90,7 @@ CrewAI unit tests use a stub mirroring the pinned `Memory` signatures, so CI doe
 1. Every change starts as an issue using the agent-task template (Goal / Acceptance criteria / Files involved), sized for one PR. New issues go on the board as Backlog with Priority and Size.
 2. A human approves by adding the `agent-ready` label. The board moves the issue to Ready, then to In progress when Claude starts.
 3. Claude works on a `claude/issue-<N>-*` branch and pushes. A workflow step opens the PR with `Closes #N` (using `PAT_TOKEN`, so CI and review trigger).
-4. CI (pytest + benchmarks) runs on the PR. Claude Code Review runs only after CI passes, and not on docs-only PRs (all files Markdown or under `docs/`). Fix findings with `@claude` comments on the PR.
+4. CI (pytest + benchmarks) runs on the PR. Claude Code Review runs only after CI passes, and not on docs-only PRs (all files Markdown or under `docs/`). The review ends with `BLOCKING: <count>`; above 0, it posts `@claude fix the blocking items in the latest review` automatically, up to 3 rounds per PR, then adds `needs-human`. If every blocking finding is in `.github/workflows/` (per its `BLOCKING_FILE:` lines), it adds `needs-human` instead of requesting a fix. The logic lives in `scripts/review-auto-fix.sh` and `scripts/update-branches.sh`, tested in `tests/test_ci_scripts.py` with a fake `gh`. Other fixes go through `@claude` comments on the PR. After every push to main, open PRs that are behind get main merged in (CI and review rerun); a merge conflict gets a comment listing the files plus `needs-human`, which is removed automatically on a later push to main once the conflict is gone.
 5. A human merges. Merging closes the issue.
 
 If blocked or unsure (ambiguous acceptance criteria, a design decision the issue doesn't settle, a conflict with this file, a missing dependency or permission):
