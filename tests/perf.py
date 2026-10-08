@@ -3,8 +3,12 @@
 import time
 
 
-def p99_ms(fn, n=10_000, warmup=1_000, label=None):
+def p99_ms(fn, n=10_000, warmup=1_000, label=None, pause_s=0.0):
     """Call ``fn`` ``warmup`` times untimed, then ``n`` times timed.
+
+    ``pause_s`` sleeps (untimed) before each timed call, for paths that write
+    so much per call that a tight loop measures the kernel's dirty-page
+    writeback throttling rather than the call itself.
 
     Prints p50 and p99 (visible with ``pytest -s``) and returns p99 in ms.
     """
@@ -13,6 +17,8 @@ def p99_ms(fn, n=10_000, warmup=1_000, label=None):
     samples = []
     clock = time.perf_counter_ns
     for _ in range(n):
+        if pause_s:
+            time.sleep(pause_s)
         start = clock()
         fn()
         samples.append(clock() - start)

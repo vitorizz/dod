@@ -260,6 +260,76 @@ def test_compaction_replaced_overrides_context_tag(path, cap):
     assert parents(path, s) == {("mem", "A"): "in_prompt"}
 
 
+def bindings(path):
+    return raw(path).execute("SELECT write_id, store, record_id FROM bindings ORDER BY rowid").fetchall()
+
+
+def test_on_batch_records_writes_compactions_and_binds(path, cap):
+    earlier = write(cap, store="pg")
+    cap.on_retrieve("k", [("mem", "ctx")])
+    w_plain, w_merge, w_unbound = cap.on_batch(
+        "k", "pg",
+        [((), "a", "user", "rec-a"), ([("pg", "old")], "b", "agent_inference", "rec-b"),
+         ((), "c", "tool", None)],
+        binds=[(earlier, "rec-0")], agent_id="a1", session_id="s1",
+    )
+    assert parents(path, w_plain) == {("mem", "ctx"): "retrieved_in_scope"}
+    assert parents(path, w_merge) == {
+        ("pg", "old"): "in_prompt", ("mem", "ctx"): "retrieved_in_scope",
+    }
+    assert bindings(path) == [
+        (w_plain, "pg", "rec-a"), (w_merge, "pg", "rec-b"), (earlier, "pg", "rec-0"),
+    ]
+    rows = raw(path).execute(
+        "SELECT source, agent_id, session_id FROM writes ORDER BY seq"
+    ).fetchall()[1:]
+    assert rows == [("user", "a1", "s1"), ("agent_inference", "a1", "s1"), ("tool", "a1", "s1")]
+    # Bound writes are no longer pending; the unbound one is.
+    with pytest.raises(KeyError):
+        cap.bind(earlier, "again")
+    cap.bind(w_unbound, "rec-c")
+
+
+def test_on_batch_unknown_or_duplicate_bind_records_nothing(path, cap):
+    wid = write(cap)
+    for binds in ([("missing", "r")], [(wid, "r1"), (wid, "r2")]):
+        with pytest.raises(KeyError):
+            cap.on_batch("k", "mem", [((), "x", "user", None)], binds)
+    assert n_writes(path) == 1
+    cap.bind(wid, "r")  # still pending
+
+
+class FailBatchLedger:
+    def __init__(self, ledger):
+        self._ledger = ledger
+
+    def __getattr__(self, name):
+        return getattr(self._ledger, name)
+
+    def append_batch(self, *args):
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_on_batch_ledger_failure_keeps_binds_pending(path, ledger):
+    cap = Capture(FailBatchLedger(ledger))
+    wid = write(cap)
+    with pytest.raises(sqlite3.OperationalError):
+        cap.on_batch("k", "mem", [((), "x", "user", None)], [(wid, "r")])
+    cap.bind(wid, "r")
+    assert bindings(path) == [(wid, "mem", "r")]
+
+
+def test_snapshot_keeps_context_after_reset(path, cap):
+    cap.on_retrieve("k", [("mem", "a")], "in_prompt")
+    snap = cap.snapshot("k")
+    cap.reset("k")
+    cap.on_retrieve("k", [("mem", "later")])
+    wid = write(cap, key=snap)
+    assert parents(path, wid) == {("mem", "a"): "in_prompt"}
+    cap.reset(snap)
+    assert snap not in cap._context
+
+
 def test_concurrent_keys_never_mix(path, cap):
     n_threads, rounds = 8, 50
     results = {}

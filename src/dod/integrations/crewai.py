@@ -49,13 +49,23 @@ Compaction
     ``search``, ``save``, ``update`` and ``delete`` are observed; the save pool
     runs on a copy of the caller's context, so the observation follows it. If
     any record was rewritten or deleted, each rewritten or newly saved record
-    is recorded with ``capture.on_compaction``, replacing every record the
-    consolidation consulted, rewrote or deleted. ``Memory.update()`` called
-    directly writes outside ``remember`` and is not captured.
+    is recorded as a compaction, replacing every record the consolidation
+    consulted, rewrote or deleted. If records were only deleted, the
+    compaction is bound to the record ``remember`` returned (crewai returns
+    the first similar record, which may be one it just deleted). The
+    compactions and the write's bind go to the ledger in one transaction.
+    ``Memory.update()`` called directly writes outside ``remember`` and is not
+    captured.
 
-``remember_many`` (background, non-blocking) raises ``NotImplementedError``.
-A crew's automatic post-task save goes through it; crewai logs and swallows
-the error, so an instrumented crew doesn't auto-save until it is supported.
+``remember_many``
+    Saves in the background and returns ``[]``. Each item is recorded as a
+    write when ``remember_many`` is called, with the scope's context as
+    parents, so the edge doesn't depend on when the save runs. The wrapped
+    ``_background_encode_batch`` observes storage like ``remember`` does and,
+    when the save finishes, binds each write to the record inserted with its
+    content and records compactions, in one transaction. Items merged into an
+    existing record or dropped as in-batch duplicates stay unbound (a merge is
+    still a compaction); a one-item batch binds to the returned record.
 """
 
 import contextvars
@@ -87,6 +97,9 @@ _observed: "contextvars.ContextVar[Optional[_Consolidation]]" = contextvars.Cont
 _hook_stack: "contextvars.ContextVar[Tuple[Tuple[Key, Optional[Key]], ...]]" = (
     contextvars.ContextVar("dod_crewai_hook_stack", default=())
 )
+_pending_batch: "contextvars.ContextVar[Optional[_Batch]]" = contextvars.ContextVar(
+    "dod_crewai_batch", default=None
+)
 
 # Every Capture passed to instrument(); entering a scope resets its key in each.
 _captures: "weakref.WeakSet[Capture]" = weakref.WeakSet()
@@ -111,11 +124,23 @@ class _Consolidation:
         self.saved: List[Any] = []
 
 
+class _Batch:
+    """One ``remember_many`` call, handed to its background save."""
+
+    __slots__ = ("key", "writes", "source", "agent_id", "session_id")
+
+    def __init__(self, key, writes, source, agent_id, session_id) -> None:
+        self.key = key  # a snapshot: the caller's scope may end before the save
+        self.writes: List[Tuple[str, str]] = writes  # (content, write_id)
+        self.source = source
+        self.agent_id = agent_id
+        self.session_id = session_id
+
+
 def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
     """Wrap ``memory``'s ``recall``, ``remember`` and ``remember_many`` in place.
 
-    Signatures, return values and exceptions of ``recall`` and ``remember``
-    are unchanged. Instrumenting an already instrumented memory is a no-op.
+    Signatures, return values and exceptions are unchanged. Instrumenting an already instrumented memory is a no-op.
     """
     if getattr(getattr(memory, "recall", None), _MARK, False):
         return memory
@@ -131,6 +156,11 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
     orig_recall = memory.recall
     orig_remember = memory.remember
     orig_remember_many = memory.remember_many
+    orig_background = getattr(memory, "_background_encode_batch", None)
+    if orig_background is None:
+        raise TypeError(
+            f"{type(memory).__name__} has no _background_encode_batch to observe"
+        )
     warned = []
 
     @functools.wraps(orig_recall)
@@ -143,47 +173,93 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
             )
         return results
 
+    def scope(method):
+        key = _key.get()
+        if key is not None:
+            return key, key[0], key[1]
+        if not warned:
+            warned.append(True)
+            logger.warning(
+                "dod: %s() outside agent_task_scope; recorded with no parents", method
+            )
+        # A fresh key has no context, and no other write can share it.
+        return object(), None, None
+
     @functools.wraps(orig_remember)
     def remember(*args, **kwargs):
-        content = _arg(args, kwargs, 0, "content")
+        content = _text(_arg(args, kwargs, 0, "content"))
         source = _source(_arg(args, kwargs, 5, "source"))
-        key = _key.get()
-        if key is None:
-            if not warned:
-                warned.append(True)
-                logger.warning(
-                    "dod: remember() outside agent_task_scope; recorded with no parents"
-                )
-            # A fresh key has no context, and no other write can share it.
-            ctx_key, agent_id, session_id = object(), None, None
-        else:
-            ctx_key, (agent_id, session_id) = key, key
-        if not isinstance(content, (str, bytes)):
-            content = str(content)
+        ctx_key, agent_id, session_id = scope("remember")
         write_id = capture.on_write(ctx_key, content, store, source, agent_id, session_id)
 
         obs = _Consolidation()
         token = _observed.set(obs)
+        record = None
         try:
             record = orig_remember(*args, **kwargs)
         finally:
             _observed.reset(token)
-            _record_compaction(capture, ctx_key, obs, store, source, agent_id, session_id)
-        if record is not None:
-            capture.bind(write_id, record.id)
+            returned = [record] if record is not None else []
+            binds = [(write_id, record.id)] if record is not None else []
+            _settle(capture, ctx_key, obs, store, source, agent_id, session_id,
+                    binds, returned, content)
         return record
 
     @functools.wraps(orig_remember_many)
     def remember_many(*args, **kwargs):
-        raise NotImplementedError(
-            "dod: remember_many() saves in the background and isn't captured yet; "
-            "use remember() per item"
+        contents = [_text(c) for c in _arg(args, kwargs, 0, "contents") or ()]
+        if not contents:
+            return orig_remember_many(*args, **kwargs)
+        source = _source(_arg(args, kwargs, 5, "source"))
+        ctx_key, agent_id, session_id = scope("remember_many")
+        # Recorded now, in the caller's scope; bound once the background save
+        # has run. A read-only memory never saves, so its writes stay unbound.
+        write_ids = capture.on_batch(
+            ctx_key, store, [((), c, source, None) for c in contents],
+            agent_id=agent_id, session_id=session_id,
         )
+        if getattr(memory, "read_only", False):
+            return orig_remember_many(*args, **kwargs)
+        batch = _Batch(
+            capture.snapshot(ctx_key), list(zip(contents, write_ids)),
+            source, agent_id, session_id,
+        )
+        token = _pending_batch.set(batch)
+        try:
+            return orig_remember_many(*args, **kwargs)
+        except BaseException:
+            capture.reset(batch.key)
+            raise
+        finally:
+            _pending_batch.reset(token)
+
+    @functools.wraps(orig_background)
+    def background_encode_batch(*args, **kwargs):
+        # Runs on the save pool, in a copy of remember_many's context.
+        batch = _pending_batch.get()
+        if batch is None:
+            return orig_background(*args, **kwargs)
+        obs = _Consolidation()
+        token = _observed.set(obs)
+        records = None
+        try:
+            records = orig_background(*args, **kwargs)
+        finally:
+            _observed.reset(token)
+            try:
+                returned = list(records or ())
+                _settle(capture, batch.key, obs, store, batch.source, batch.agent_id,
+                        batch.session_id, _batch_binds(batch, obs, returned), returned,
+                        batch.writes[0][0])
+            finally:
+                capture.reset(batch.key)
+        return records
 
     for name, fn in (
         ("recall", recall),
         ("remember", remember),
         ("remember_many", remember_many),
+        ("_background_encode_batch", background_encode_batch),
     ):
         setattr(fn, _MARK, True)
         # Memory is a pydantic model, which rejects assigning non-field names.
@@ -327,17 +403,48 @@ def _observe_storage(storage: Any) -> None:
         object.__setattr__(storage, name, wrapper)
 
 
-def _record_compaction(capture, key, obs, store, source, agent_id, session_id) -> None:
+def _settle(capture, key, obs, store, source, agent_id, session_id, binds, returned,
+            content) -> None:
+    """Record a save's compactions and binds in one ledger transaction."""
+    compactions = []
     touched = list(obs.deleted) + list(obs.updated)
-    if not touched:
-        return
-    replaced = [(store, rid) for rid in dict.fromkeys(list(obs.consulted) + touched)]
-    # Rewritten content comes from the consolidation LLM; saved content is the
-    # caller's own.
-    merged = [(r, "agent_inference") for r in obs.updated.values()]
-    merged += [(r, source) for r in obs.saved if r.id not in obs.updated]
-    for record, src in merged:
-        write_id = capture.on_compaction(
-            key, replaced, record.content, store, src, agent_id, session_id
-        )
-        capture.bind(write_id, record.id)
+    if touched:
+        replaced = [(store, rid) for rid in dict.fromkeys(list(obs.consulted) + touched)]
+        # Rewritten content comes from the consolidation LLM; saved content is
+        # the caller's own.
+        merged = [(r, "agent_inference") for r in obs.updated.values()]
+        merged += [(r, source) for r in obs.saved if r.id not in obs.updated]
+        if not merged:
+            # Delete-only: bind the compaction to the record(s) the call
+            # returned, so the deletion is never missing from the ledger.
+            merged = [(r, "agent_inference") for r in returned]
+        compactions = [(replaced, r.content, src, r.id) for r, src in merged]
+        if not compactions:  # the save failed after deleting; nothing to bind
+            compactions = [(replaced, content, "agent_inference", None)]
+    if compactions or binds:
+        capture.on_batch(key, store, compactions, binds, agent_id, session_id)
+
+
+def _batch_binds(batch: _Batch, obs: _Consolidation, returned: list) -> list:
+    """Bind each ``remember_many`` write to the record inserted for it.
+
+    Inserted records carry their item's content. An item merged into an
+    existing record, or dropped as an in-batch duplicate, stays unbound; a
+    merge is still recorded as a compaction. A one-item batch binds to the
+    returned record, as ``remember`` does.
+    """
+    saved: Dict[str, List[str]] = {}
+    for r in obs.saved:
+        saved.setdefault(r.content, []).append(r.id)
+    binds = []
+    for content, write_id in batch.writes:
+        ids = saved.get(content)
+        if ids:
+            binds.append((write_id, ids.pop(0)))
+    if not binds and len(batch.writes) == 1 and len(returned) == 1:
+        binds.append((batch.writes[0][1], returned[0].id))
+    return binds
+
+
+def _text(content: Any) -> Any:
+    return content if isinstance(content, (str, bytes)) else str(content)

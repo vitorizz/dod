@@ -26,7 +26,8 @@ os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 # test_stub_signatures_match_crewai). remember mirrors the real save path: it
 # runs on a one-worker pool through contextvars.copy_context().run, searches
 # storage for similar records, then applies a consolidation plan with
-# storage.delete / update / save.
+# storage.delete / update / save. remember_many submits
+# _background_encode_batch to the same pool and returns [] without waiting.
 
 
 class StubRecord:
@@ -68,6 +69,7 @@ class StubMemory:
         self.read_only = read_only
         self._storage = StubStorage()
         self._save_pool = ThreadPoolExecutor(max_workers=1) if pool else None
+        self._pending = []  # remember_many futures, waited on by drain_writes
         self.results = {}  # query -> [StubRecord]
         # Consolidation plan for the next save: {"update": {id: content},
         # "delete": [id], "insert": bool}. None inserts a new record.
@@ -96,9 +98,30 @@ class StubMemory:
     def remember_many(self, contents, scope=None, categories=None,
                       metadata=None, importance=None, source=None,
                       private=False, agent_role=None, root_scope=None):
+        if not contents or self.read_only:
+            return []
+        if self._save_pool is None:
+            self._background_encode_batch(contents)
+            return []
+        ctx = contextvars.copy_context()
+        self._pending.append(
+            self._save_pool.submit(ctx.run, self._background_encode_batch, contents)
+        )
         return []
 
+    def _background_encode_batch(self, contents):
+        return self._encode_many(contents)
+
+    def drain_writes(self):
+        pending, self._pending = self._pending, []
+        for f in pending:
+            f.exception()
+
     def _encode(self, content):
+        records = self._encode_many([content])
+        return records[0] if records else None
+
+    def _encode_many(self, contents):
         similar = [r for r, _ in self._storage.search([1.0], limit=5)]
         plan, self.plan = self.plan or {"insert": True}, None
         if plan.get("delete"):
@@ -111,10 +134,10 @@ class StubMemory:
         if self.fail:
             raise self.fail
         if plan.get("insert"):
-            rec = StubRecord(content)
-            self._storage.save([rec])
-            return rec
-        return updated[0] if updated else (similar[0] if similar else None)
+            records = [StubRecord(c) for c in contents]
+            self._storage.save(records)
+            return records
+        return updated[:1] or similar[:1]
 
 
 # --- Fixtures and helpers ----------------------------------------------------
@@ -272,11 +295,101 @@ def test_source_otherwise_agent_inference(path, mem, value):
     assert writes(path)[0][2] == "agent_inference"
 
 
-def test_remember_many_raises_and_records_nothing(path, mem):
+# --- remember_many -----------------------------------------------------------
+
+
+def _hold_save_pool(mem):
+    """Block the stub's save pool until the returned event is set."""
+    release = threading.Event()
+    mem._save_pool.submit(release.wait, 5)
+    return release
+
+
+def test_remember_many_records_at_call_and_binds_after_save(path, cap, mem):
+    (a,) = mem.add("A")
+    mem.results["q"] = [a]
+    release = _hold_save_pool(mem)
     with agent_task_scope("agent", "task"):
-        with pytest.raises(NotImplementedError):
-            mem.remember_many(["C", "D"])
+        mem.recall("q")
+        assert mem.remember_many(["C", "D"], source="user") == []
+    # Recorded in the caller's scope before the background save ran.
+    (w_c, *_), (w_d, *_) = rows = writes(path)
+    assert [r[2:] for r in rows] == [("user", "agent", "task")] * 2
+    for wid in (w_c, w_d):
+        assert parents(path, wid) == {"A": "retrieved_in_scope"}
+        assert bound(path, wid) == []
+    release.set()
+    mem.drain_writes()
+    by_content = {r.content: r.id for r in mem._storage.records.values()}
+    assert bound(path, w_c) == [by_content["C"]]
+    assert bound(path, w_d) == [by_content["D"]]
+    assert cap._context == {}  # the batch's context snapshot was released
+
+
+def test_remember_many_consolidation_keeps_callers_context(path, cap, mem):
+    mem.add("A", "K")
+    mem.results["k"] = [mem._storage.records["K"]]
+    mem._storage.similar = ["A"]
+    mem.plan = {"update": {"A": "A merged with C"}, "insert": True}
+    release = _hold_save_pool(mem)
+    with agent_task_scope("agent", "task"):
+        mem.recall("k")
+        mem.remember_many(["C", "D"])
+    release.set()  # the scope ended (and was reset) before the save runs
+    mem.drain_writes()
+    w_c, w_d, *compactions = (w for w, *_ in writes(path))
+    assert len(compactions) == 3  # A rewritten, C and D inserted
+    for wid in compactions:
+        assert parents(path, wid) == {"A": "in_prompt", "K": "retrieved_in_scope"}
+    assert bound(path, compactions[0]) == ["A"]
+    assert cap._context == {}
+
+
+def test_remember_many_one_item_merged_binds_to_returned_record(path, mem):
+    mem.add("A")
+    mem._storage.similar = ["A"]
+    mem.plan = {"update": {"A": "A merged with C"}, "insert": False}
+    with agent_task_scope("agent", "task"):
+        mem.remember_many(["C"])
+    mem.drain_writes()
+    (w_c, *_), (w_merge, *_) = writes(path)
+    assert bound(path, w_c) == ["A"] and bound(path, w_merge) == ["A"]
+
+
+def test_remember_many_read_only_records_unbound_writes(path, cap):
+    m = instrument(StubMemory(read_only=True), cap)
+    with agent_task_scope("agent", "task"):
+        assert m.remember_many(["C", "D"]) == []
+    assert [bound(path, w) for w, *_ in writes(path)] == [[], []]
+    assert cap._context == {}
+
+
+def test_remember_many_empty_records_nothing(path, mem):
+    with agent_task_scope("agent", "task"):
+        assert mem.remember_many([]) == []
     assert writes(path) == []
+
+
+def test_remember_many_outside_scope_warns_and_records_no_parents(path, mem, caplog):
+    (a,) = mem.add("A")
+    mem.results["q"] = [a]
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        mem.recall("q")
+        mem.remember_many(["C"])
+    mem.drain_writes()
+    ((wid, *_rest, agent_id, session_id),) = writes(path)
+    assert parents(path, wid) == {} and (agent_id, session_id) == (None, None)
+    assert any("remember_many() outside agent_task_scope" in r.message for r in caplog.records)
+
+
+def test_remember_many_failed_save_leaves_writes_unbound(path, cap, mem):
+    mem.fail = RuntimeError("storage down")
+    with agent_task_scope("agent", "task"):
+        mem.remember_many(["C"])
+    mem.drain_writes()
+    ((wid, *_),) = writes(path)
+    assert bound(path, wid) == []
+    assert cap._context == {}
 
 
 # --- Parents -----------------------------------------------------------------
@@ -524,6 +637,48 @@ def test_delete_then_insert_is_compaction_of_new_record(path, mem):
     assert src == "user"
 
 
+def test_delete_only_is_compaction_bound_to_returned_record(path, mem):
+    mem.add("A", "B")
+    mem._storage.similar = ["A", "B"]
+    mem.plan = {"delete": ["B"], "insert": False}
+    with agent_task_scope("agent", "task"):
+        rec = mem.remember("C")
+    assert rec.id == "A" and "B" not in mem._storage.records
+    (w_c, *_), (w_del, _, src, *_) = writes(path)
+    assert bound(path, w_c) == ["A"]
+    assert parents(path, w_del) == {"A": "in_prompt", "B": "in_prompt"}
+    assert bound(path, w_del) == ["A"]
+    assert src == "agent_inference"
+
+
+def test_delete_only_then_failure_still_recorded(path, mem):
+    mem.add("A")
+    mem._storage.similar = ["A"]
+    mem.plan = {"delete": ["A"], "insert": False}
+    mem.fail = RuntimeError("after delete")
+    with agent_task_scope("agent", "task"), pytest.raises(RuntimeError):
+        mem.remember("C")
+    (w_c, *_), (w_del, *_) = writes(path)
+    assert parents(path, w_del) == {"A": "in_prompt"}
+    assert bound(path, w_c) == [] and bound(path, w_del) == []
+
+
+def test_consolidating_remember_commits_twice(path, cap):
+    # One commit records the write before the save; one records every
+    # compaction and bind after it.
+    m = instrument(StubMemory(pool=False), cap)
+    m.add("A", "B", "X")
+    m._storage.similar = ["A", "B", "X"]
+    m.plan = {"update": {"A": "a2", "X": "x2"}, "delete": ["B"], "insert": True}
+    commits = []
+    cap._ledger._conn.set_trace_callback(lambda sql: sql == "COMMIT" and commits.append(sql))
+    with agent_task_scope("agent", "task"):
+        m.remember("C")
+    cap._ledger._conn.set_trace_callback(None)
+    assert len(writes(path)) == 4  # the write plus three compactions
+    assert len(commits) == 2
+
+
 def test_no_compaction_without_rewrite_or_delete(path, mem):
     mem.add("A")
     mem._storage.similar = ["A"]  # consulted, but left alone
@@ -566,6 +721,9 @@ def test_stub_signatures_match_crewai():
 
     for name in ("recall", "remember", "remember_many"):
         assert _params(getattr(StubMemory, name)) == _params(getattr(Memory, name)), name
+    # remember_many's background save, wrapped to bind its writes.
+    assert callable(getattr(Memory, "_background_encode_batch"))
+    assert "self._background_encode_batch" in inspect.getsource(Memory.remember_many)
 
 
 class _MemStorage:
@@ -624,13 +782,18 @@ class _PlanLLM:
         return json.dumps(self.plan)
 
 
-def _real_memory(llm=None):
+def _one_hot(texts):
+    # Distinct texts get orthogonal vectors, so in-batch dedup keeps them.
+    return [[float(i == sum(map(ord, t)) % 16) for i in range(16)] for t in texts]
+
+
+def _real_memory(llm=None, embedder=None):
     from crewai.memory.unified_memory import Memory
 
     return Memory(
         storage=_MemStorage(),
         llm=llm or _NoLLM(),
-        embedder=lambda texts: [[1.0, 0.0, 0.0] for _ in texts],
+        embedder=embedder or (lambda texts: [[1.0, 0.0, 0.0] for _ in texts]),
         exploration_budget=0,
     )
 
@@ -643,8 +806,8 @@ def _save(m, content):
 @pytest.mark.crewai
 def test_real_memory_end_to_end(path, cap):
     pytest.importorskip("crewai")
-    m = _real_memory()
-    before = {n: inspect.signature(getattr(m, n)) for n in ("recall", "remember")}
+    m = _real_memory(embedder=_one_hot)
+    before = {n: inspect.signature(getattr(m, n)) for n in ("recall", "remember", "remember_many")}
     assert instrument(m, cap) is m
     assert {n: inspect.signature(getattr(m, n)) for n in before} == before
     m.model_dump(exclude={"embedder", "llm", "storage"})  # pydantic still happy
@@ -657,8 +820,40 @@ def test_real_memory_end_to_end(path, cap):
     assert {x.record.id for x in found} == {a.id, b.id}
     wc = write_for(path, c.id)
     assert parents(path, wc) == {a.id: "retrieved_in_scope", b.id: "retrieved_in_scope"}
-    with pytest.raises(NotImplementedError):
-        m.remember_many(["D"])
+
+    with agent_task_scope("agent", "task-2"):
+        m.recall("anything", depth="shallow")
+        assert m.remember_many(["D", "E"], scope="/", categories=[], importance=0.5) == []
+    m.drain_writes()
+    w_d, w_e = (w for w, *_ in writes(path)[-2:])
+    by_content = {r.content: r.id for r in m._storage.records.values()}
+    assert bound(path, w_d) == [by_content["D"]] and bound(path, w_e) == [by_content["E"]]
+    assert set(parents(path, w_d)) == {a.id, b.id, c.id}
+    assert cap._context == {}
+
+
+@pytest.mark.crewai
+def test_real_delete_only_consolidation(path, cap):
+    pytest.importorskip("crewai")
+    llm = _PlanLLM()
+    m = instrument(_real_memory(llm), cap)
+    with agent_task_scope("setup", "setup"):
+        a, b = _save(m, "A"), _save(m, "B")
+    m._storage.score = 0.95
+    llm.plan = {
+        "actions": [
+            {"action": "keep", "record_id": a.id},
+            {"action": "delete", "record_id": b.id},
+        ],
+        "insert_new": False,
+    }
+    with agent_task_scope("agent", "task"):
+        rec = m.remember("C", scope="/", categories=[], importance=0.5)
+    assert llm.calls == 1 and b.id not in m._storage.records
+    w_c, w_del = (w for w, *_ in writes(path)[2:])
+    # crewai returns the first similar record; the compaction is bound to it.
+    assert bound(path, w_c) == [rec.id] and bound(path, w_del) == [rec.id]
+    assert parents(path, w_del) == {a.id: "in_prompt", b.id: "in_prompt"}
 
 
 @pytest.mark.crewai

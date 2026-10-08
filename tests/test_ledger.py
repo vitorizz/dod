@@ -95,6 +95,58 @@ def test_bind_appends(path, ledger):
     assert rows == [("mem", "rec-1"), ("mem", "rec-2")]
 
 
+def _batch_row(**kw):
+    row = dict(content="x", store="mem", source="user")
+    row.update(kw)
+    return row
+
+
+def test_append_batch_records_writes_and_bindings(path, ledger):
+    earlier = write(ledger)
+    w1, w2 = ledger.append_batch(
+        [
+            _batch_row(content="a", parents=[("mem", "p", "in_prompt")], record_id="rec-a"),
+            _batch_row(content="b", agent_id="a1", session_id="s1", source="tool"),
+        ],
+        [(earlier, "mem", "rec-0")],
+    )
+    conn = raw(path)
+    rows = conn.execute(
+        "SELECT write_id, content_hash, agent_id, session_id, source FROM writes ORDER BY seq"
+    ).fetchall()
+    assert rows[1:] == [
+        (w1, hashlib.sha256(b"a").hexdigest(), None, None, "user"),
+        (w2, hashlib.sha256(b"b").hexdigest(), "a1", "s1", "tool"),
+    ]
+    assert conn.execute("SELECT * FROM parents WHERE write_id=?", (w1,)).fetchall() == [
+        (w1, "mem", "p", "in_prompt")
+    ]
+    assert conn.execute("SELECT write_id, store, record_id FROM bindings ORDER BY record_id").fetchall() == [
+        (earlier, "mem", "rec-0"), (w1, "mem", "rec-a"),
+    ]
+
+
+def test_append_batch_is_one_transaction(ledger):
+    commits = []
+    ledger._conn.set_trace_callback(lambda sql: sql == "COMMIT" and commits.append(sql))
+    ledger.append_batch([_batch_row(record_id=f"r{i}") for i in range(5)])
+    ledger._conn.set_trace_callback(None)
+    assert commits == ["COMMIT"]
+
+
+@pytest.mark.parametrize("bad", [
+    {"writes": [_batch_row(), _batch_row(source="nope")]},
+    {"writes": [_batch_row(), _batch_row(parents=[("mem", "p", "bad-tag")])]},
+    {"writes": [_batch_row()], "bindings": [("no-such-write", "mem", "r")]},
+])
+def test_append_batch_is_all_or_nothing(path, ledger, bad):
+    with pytest.raises((ValueError, sqlite3.IntegrityError)):
+        ledger.append_batch(**bad)
+    conn = raw(path)
+    for table in ("writes", "parents", "bindings"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+
+
 def test_bind_unknown_write_raises(ledger):
     with pytest.raises(sqlite3.IntegrityError):
         ledger.bind("nope", "mem", "rec-1")
