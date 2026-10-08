@@ -48,7 +48,7 @@ each (``dod.integrations.crewai.ReconcileAdapter`` and so on).
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, NamedTuple, Optional, Protocol, Tuple
+from typing import Dict, Iterable, List, Mapping, NamedTuple, Optional, Protocol, Set, Tuple
 
 from dod.ledger import Ledger
 
@@ -96,6 +96,9 @@ class ReconcileReport:
     """Items each store should hold according to the ledger."""
     content_checked: Dict[str, bool]
     """Per store, whether content hashes were compared (``modified``)."""
+    unchecked: List[str] = field(default_factory=list)
+    """Stores the ledger has bindings for that weren't passed in, so weren't
+    checked."""
     cleared: int = 0
     """First-pass findings that resolved within the grace period (writes or
     deletions in flight)."""
@@ -137,8 +140,9 @@ def reconcile(
         seen[name] = items
         hashed[name] = any(h is not None for h in items.values())
 
-    first, live = _check(ledger, seen, None, reads=False)
-    report = ReconcileReport([], {n: len(i) for n, i in seen.items()}, live, hashed, ts=ts)
+    first, live, known = _check(ledger, seen, None, reads=False)
+    report = ReconcileReport([], {n: len(i) for n, i in seen.items()}, live, hashed,
+                             unchecked=sorted(known - set(stores)), ts=ts)
     if not first:
         return report
 
@@ -151,7 +155,7 @@ def reconcile(
         flagged.setdefault(f.store, []).append(f.record_id)
         if present:
             again.setdefault(f.store, {})[f.record_id] = content_hash
-    findings, _ = _check(ledger, again, flagged, reads=True)
+    findings, _, _ = _check(ledger, again, flagged, reads=True)
     report.findings = findings
     report.cleared = len(first) - len(findings)
     if findings:
@@ -179,7 +183,6 @@ _FLAG = (
     "CREATE TEMP TABLE IF NOT EXISTS rec_flag (store TEXT NOT NULL, record_id TEXT NOT NULL,"
     " since INTEGER NOT NULL, PRIMARY KEY (store, record_id)) WITHOUT ROWID"
 )
-_TEMP = ("rec_seen", "rec_scope", "rec_flag")
 
 # The ledger's state for one store's items: the last binding (by append
 # order) with its write's content hash, and the last tombstone's ts. ``{only}``
@@ -223,7 +226,7 @@ _PARTS = (
     " record_id TEXT NOT NULL, since INTEGER NOT NULL,"
     " PRIMARY KEY (part, store, record_id)) WITHOUT ROWID"
 )
-_TEMP = _TEMP + ("rec_parts",)
+_TEMP = ("rec_seen", "rec_scope", "rec_flag", "rec_parts")
 _FILL_PARTS = """
 INSERT OR IGNORE INTO temp.rec_parts
 SELECT m.set_hash, f.store, f.record_id, f.since FROM context_members m
@@ -251,9 +254,10 @@ def _check(
     seen: Mapping[str, Mapping[str, Optional[str]]],
     scope: Optional[Mapping[str, List[str]]],
     reads: bool,
-) -> Tuple[List[Finding], Dict[str, int]]:
+) -> Tuple[List[Finding], Dict[str, int], Set[str]]:
     """Findings for the items in ``seen`` (per store, record ID to content
-    hash), against one ledger snapshot, and the live count per store.
+    hash), against one ledger snapshot, the live count per store, and every
+    store the ledger has bindings for (on the first pass only).
 
     With ``scope`` (per store, the record IDs to re-check), only those items
     are classified: one in ``scope`` but not in ``seen`` is absent from the
@@ -309,18 +313,27 @@ def _check(
                     found.append((name, record_id, "missing", ledger_hash, None))
             live[name] = n
 
+        known: Set[str] = set()
+        if scope is None:
+            # Distinct stores by skipping through bindings_by_record.
+            row = x("SELECT min(store) FROM bindings").fetchone()
+            while row[0] is not None:
+                known.add(row[0])
+                row = x("SELECT min(store) FROM bindings WHERE store > ?", row).fetchone()
         read_into: Dict[Tuple[str, str], List[str]] = {}
         if flags and reads:
             conn.executemany("INSERT INTO temp.rec_flag VALUES (?, ?, ?)", flags)
             x(_FILL_PARTS)
             for s, r, write_id, _ in x(_READ_INTO):
                 read_into.setdefault((s, r), []).append(write_id)
-        for t in _TEMP:
-            x(f"DROP TABLE IF EXISTS temp.{t}")
     finally:
-        release()
+        try:
+            for t in _TEMP:
+                conn.execute(f"DROP TABLE IF EXISTS temp.{t}")
+        finally:
+            release()
     findings = [
         Finding(s, r, kind, lh, sh, tuple(read_into.get((s, r), ())))
         for s, r, kind, lh, sh in sorted(found, key=lambda f: (f[0], f[1]))
     ]
-    return findings, live
+    return findings, live, known

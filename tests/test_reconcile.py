@@ -191,9 +191,11 @@ def test_stores_are_independent(ledger, cap):
     b.items["x"] = "1"
     report = reconcile(ledger, {"a": a, "b": b}, grace=0)
     assert [(f.store, f.kind) for f in report.findings] == [("b", "unrecorded")]
-    # A store not passed in isn't checked.
+    assert report.unchecked == []
+    # A store not passed in isn't checked, and is listed as such.
     write(cap, "c", "y", "2")
-    assert reconcile(ledger, {"a": a}, grace=0).ok
+    report = reconcile(ledger, {"a": a}, grace=0)
+    assert report.ok and report.unchecked == ["c"]
 
 
 def test_in_flight_write_clears_within_grace(ledger, cap):
