@@ -215,3 +215,17 @@ def test_sweep_aggregates_per_use_prob(offline, tmp_path):
     assert [(r["seed"], r["use_prob"]) for r in res["runs"]] == [
         (0, 0.0), (1, 0.0), (0, 1.0), (1, 1.0)]
     assert [(s["use_prob"], s["runs"]) for s in res["summary"]] == [(0.0, 2), (1.0, 2)]
+
+
+def test_llm_agent_sampling_by_provider(monkeypatch):
+    pytest.importorskip("crewai")
+    import crewai
+
+    from experiments.propagation.scenario import Config, LLMAgent
+
+    made = []
+    monkeypatch.setattr(crewai, "LLM", lambda **kw: made.append(kw))
+    LLMAgent(Config(mode="llm", model="anthropic/claude-sonnet-5-5"))
+    LLMAgent(Config(mode="llm", model="openai/gpt-x"))
+    assert made == [{"model": "anthropic/claude-sonnet-5-5"},
+                    {"model": "openai/gpt-x", "temperature": 0}]

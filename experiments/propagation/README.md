@@ -45,8 +45,10 @@ it makes an unrelated mistake instead, so not every wrong output comes from
 the planted fact. Deterministic for a fixed `--seed`.
 
 **LLM agent (`--mode llm`, manual).** The same scenario, but a real model
-picks the value from the same prompt, through CrewAI's `LLM` (any provider
-LiteLLM supports; keys come from the environment). One call per step. It
+picks the value from the same prompt, through CrewAI's `LLM` (keys come from
+the environment). One call per step. Other providers run at temperature 0.
+Current Anthropic models take no sampling parameters, so their replies can
+vary between runs; run several seeds to see the spread. It
 prints the estimated number of calls and stops unless `--yes` is given:
 
 ```bash
