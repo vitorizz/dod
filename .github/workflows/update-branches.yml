@@ -36,15 +36,54 @@ jobs:
             --json number,headRefName,headRepositoryOwner,labels \
             --jq '.[] | [.number, .headRepositoryOwner.login, .headRefName, ([.labels[].name] | index("needs-human") != null)] | @tsv')
           [ -n "$prs" ] || { echo "No open PRs against $BASE."; exit 0; }
+
+          # Conflict comments carry this marker so the label can be traced back to them.
+          MARKER='<!-- update-branches:conflict -->'
+
+          # Sets $rc and $conflicts. merge-tree exits 0 = clean, 1 = conflicts (file names
+          # after the tree OID), >1 = error.
+          check_conflicts() {
+            rc=0
+            git fetch --quiet origin "pull/$1/head" || { rc=2; return; }
+            conflicts=$(git merge-tree --write-tree --name-only --no-messages "origin/$BASE" FETCH_HEAD) || rc=$?
+          }
+
+          # True if the most recent needs-human label on the PR was added right after a conflict
+          # comment from this workflow, i.e. not by the review cap or a blocked Claude run.
+          labeled_for_conflict() {
+            gh api --paginate --slurp "repos/$REPO/issues/$1/timeline?per_page=100" \
+              | jq -e --arg m "$MARKER" '
+                  reduce (add[]) as $e ({prev: null, hit: false};
+                    if $e.event == "labeled" and $e.label.name == "needs-human"
+                    then .hit = (.prev.event == "commented" and ((.prev.body // "") | contains($m)))
+                    else . end
+                    | .prev = $e)
+                  | .hit' > /dev/null
+          }
+
           # Read PRs on fd 3 so gh calls in the loop can't consume the list from stdin.
           while IFS=$'\t' read -r -u 3 pr owner ref blocked; do
+            # A conflict this workflow flagged may have been resolved since; clear the label if so.
+            if [ "$blocked" = "true" ] && labeled_for_conflict "$pr"; then
+              check_conflicts "$pr"
+              if [ "$rc" -eq 0 ]; then
+                echo "#$pr no longer conflicts with $BASE; removing needs-human."
+                gh pr edit "$pr" --repo "$REPO" --remove-label needs-human
+                gh pr comment "$pr" --repo "$REPO" --body "Merge conflict with \`$BASE\` is resolved; removed \`needs-human\`."
+                blocked=false
+              elif [ "$rc" -eq 1 ]; then
+                echo "#$pr still conflicts with $BASE."
+              else
+                echo "::error::Couldn't check #$pr for conflicts."; failed=1
+              fi
+            fi
             if ! behind=$(gh api "repos/$REPO/compare/$BASE...$owner:$ref" --jq '.behind_by'); then
               echo "::error::Couldn't compare #$pr with $BASE."; failed=1; continue
             fi
             if [ "$behind" = "0" ]; then
               echo "#$pr is up to date."; continue
             fi
-            # Already handed to a human (e.g. an earlier conflict); don't re-comment on every push.
+            # Handed to a human (unresolved conflict, review cap, blocked run); don't re-comment on every push.
             if [ "$blocked" = "true" ]; then
               echo "#$pr is $behind behind but labeled needs-human; skipping."; continue
             fi
@@ -52,10 +91,7 @@ jobs:
             if gh pr update-branch "$pr" --repo "$REPO"; then
               continue
             fi
-            git fetch --quiet origin "pull/$pr/head"
-            # merge-tree exits 0 = clean, 1 = conflicts (file names after the tree OID), >1 = error.
-            rc=0
-            conflicts=$(git merge-tree --write-tree --name-only --no-messages "origin/$BASE" FETCH_HEAD) || rc=$?
+            check_conflicts "$pr"
             if [ "$rc" -ne 1 ]; then
               echo "::error::Updating #$pr failed, and it isn't a merge conflict; check the log above."
               failed=1; continue
@@ -65,7 +101,10 @@ jobs:
 
           $files
 
-          Resolve the conflicts (merge \`$BASE\` into this branch) and push; CI and review will rerun."
+          Resolve the conflicts (merge \`$BASE\` into this branch) and push; CI and review will rerun.
+          \`needs-human\` is removed automatically on the next push to \`$BASE\` once the conflict is gone.
+
+          $MARKER"
             gh pr comment "$pr" --repo "$REPO" --body "$body"
             gh pr edit "$pr" --repo "$REPO" --add-label needs-human
           done 3<<< "$prs"
