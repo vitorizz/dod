@@ -762,11 +762,34 @@ def test_future_version_raises(path):
     assert user_version(path) == SCHEMA_VERSION + 1
 
 
-def test_version_3_migrates_in_place(path):
-    # Version 3 differs only by the derived child_edges index, which version 4
-    # drops (the lineage file replaces it).
+def _as_version_4(path):
+    """Turn a current ledger into a version-4 file: no bindings.content_hash."""
+    conn = raw(path)
+    conn.execute("ALTER TABLE bindings DROP COLUMN content_hash")
+    conn.execute("PRAGMA user_version=4")
+    conn.close()
+
+
+def test_version_4_migrates_in_place(path):
     with Ledger(path) as led:
         first = write(led)
+        led.bind(first, "mem", "r1")
+    _as_version_4(path)
+    with Ledger(path) as led:
+        second = write(led)
+        led.bind(second, "mem", "r2", content_hash="h2")
+    assert user_version(path) == SCHEMA_VERSION == 5
+    assert raw(path).execute(
+        "SELECT write_id, record_id, content_hash FROM bindings ORDER BY rowid").fetchall() == [
+        (first, "r1", None), (second, "r2", "h2")]
+
+
+def test_version_3_migrates_in_place(path):
+    # Version 3 differs by the derived child_edges index, which version 4
+    # drops (the lineage file replaces it), and by bindings.content_hash.
+    with Ledger(path) as led:
+        first = write(led)
+    _as_version_4(path)
     conn = raw(path)
     conn.executescript("""
     CREATE TABLE child_edges (parent_store TEXT, parent_record_id TEXT, seq INTEGER,
@@ -779,9 +802,11 @@ def test_version_3_migrates_in_place(path):
     conn.close()
     with Ledger(path) as led:
         write(led)
-    assert user_version(path) == SCHEMA_VERSION == 4
+    assert user_version(path) == SCHEMA_VERSION
     names = {r[0] for r in raw(path).execute("SELECT name FROM sqlite_master")}
     assert not any(n.startswith("child_edges") for n in names)
+    cols = [r[1] for r in raw(path).execute("PRAGMA table_info(bindings)")]
+    assert cols[-1] == "content_hash"
     assert count(path, "writes") == 2
     assert raw(path).execute("SELECT 1 FROM writes WHERE write_id = ?", (first,)).fetchone()
 

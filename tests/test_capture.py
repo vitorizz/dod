@@ -327,6 +327,26 @@ def test_on_batch_records_writes_compactions_and_binds(path, cap):
     cap.bind(w_unbound, "rec-c")
 
 
+def test_binds_carry_an_optional_content_hash(path, ledger):
+    from dod.capture import BindEvent
+
+    events = []
+
+    class Rec:
+        def on_bind(self, e):
+            events.append(e)
+
+    cap = Capture(ledger, observers=[Rec()])
+    a, b, c = (write(cap) for _ in range(3))
+    cap.bind(a, "ra", content_hash="ha")
+    cap.on_batch("k", "mem", binds=[(b, "rb", "hb"), (c, "rc")])
+    assert raw(path).execute(
+        "SELECT write_id, record_id, content_hash FROM bindings ORDER BY rowid").fetchall() == [
+        (a, "ra", "ha"), (b, "rb", "hb"), (c, "rc", None)]
+    assert events == [BindEvent(a, "mem", "ra", "ha"), BindEvent(b, "mem", "rb", "hb"),
+                      BindEvent(c, "mem", "rc", None)]
+
+
 def test_on_batch_unknown_or_duplicate_bind_records_nothing(path, cap):
     wid = write(cap)
     for binds in ([("missing", "r")], [(wid, "r1"), (wid, "r2")]):
