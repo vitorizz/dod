@@ -58,9 +58,29 @@ def test_consolidating_remember_p99_under_1ms(tmp_path):
             mem.recall("q")
             p99 = p99_ms(
                 _consolidating_remember(mem),
+                n=5_000,
+                rounds=3,
                 label="instrumented consolidating remember (on-disk)",
             )
     print(f"consolidating remember p99={p99:.4f} ms (stub alone p99={base:.4f} ms)")
+    assert p99 < 1.0
+
+
+def test_update_p99_under_1ms(tmp_path):
+    # Two commits, like remember: the compaction before the store write, the
+    # bind after it.
+    mem = StubMemory(pool=False)
+    mem.results["q"] = mem.add(*(f"rec-{i}" for i in range(10)))
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        instrument(mem, Capture(ledger))
+        with agent_task_scope("agent", "task"):
+            mem.recall("q")
+            p99 = p99_ms(
+                lambda: mem.update("rec-0", "the user prefers aisle seats"),
+                n=5_000,
+                rounds=3,
+                label="instrumented update (10 context parents, on-disk)",
+            )
     assert p99 < 1.0
 
 
@@ -69,6 +89,8 @@ def test_remember_many_p99_under_1ms(tmp_path):
     # time and the binds after the save. Each call writes ~80 KB of WAL; back
     # to back that is ~200 MB/s and the kernel throttles writeback, so pause
     # between calls (a real batch spends far longer embedding and in the LLM).
+    # Even paced, a shared CI runner's disk can stall one round past 1 ms, so
+    # take the median of three rounds' p99.
     items = [f"fact {i}" for i in range(5)]
     mem = StubMemory(pool=False)
     mem.results["q"] = mem.add(*(f"rec-{i}" for i in range(10)))
@@ -78,8 +100,9 @@ def test_remember_many_p99_under_1ms(tmp_path):
             mem.recall("q")
             p99 = p99_ms(
                 lambda: mem.remember_many(items),
-                n=3_000,
+                n=2_000,
                 pause_s=0.002,
+                rounds=3,
                 label="instrumented remember_many (5 items, 10 parents, on-disk)",
             )
     assert p99 < 1.0

@@ -54,8 +54,17 @@ Compaction
     compaction is bound to the record ``remember`` returned (crewai returns
     the first similar record, which may be one it just deleted). The
     compactions and the write's bind go to the ledger in one transaction.
-    ``Memory.update()`` called directly writes outside ``remember`` and is not
-    captured.
+
+Direct edits and deletions
+    ``update(record_id, ...)`` is recorded as a compaction of that record, with
+    the scope's context, before the store write, and bound to it after. A
+    metadata-only update hashes the record's unchanged content.
+    ``forget(record_ids=...)`` is recorded as an unbound compaction whose
+    parents are the given IDs (with filters too, they over-include the deleted
+    set). Both are tagged ``agent_inference``: the method takes no source.
+    ``forget`` without ``record_ids``, ``reset`` and ``reset_all`` delete by
+    filter, and the storage API doesn't report which IDs it deleted, so they
+    pass through and log a warning on every call.
 
 ``remember_many``
     Saves in the background and returns ``[]``. Each item is recorded as a
@@ -138,7 +147,8 @@ class _Batch:
 
 
 def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
-    """Wrap ``memory``'s ``recall``, ``remember`` and ``remember_many`` in place.
+    """Wrap ``memory``'s ``recall``, ``remember``, ``remember_many``, ``update``,
+    ``forget``, ``reset`` and ``reset_all`` in place.
 
     Signatures, return values and exceptions are unchanged. Instrumenting an already instrumented memory is a no-op.
     """
@@ -255,12 +265,73 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
                 capture.reset(batch.key)
         return records
 
-    for name, fn in (
+    wrapped = [
         ("recall", recall),
         ("remember", remember),
         ("remember_many", remember_many),
         ("_background_encode_batch", background_encode_batch),
-    ):
+    ]
+
+    orig_update = getattr(memory, "update", None)
+    if orig_update is not None:
+
+        @functools.wraps(orig_update)
+        def update(*args, **kwargs):
+            if getattr(memory, "read_only", False):
+                return orig_update(*args, **kwargs)  # returns the record unchanged
+            record_id = _arg(args, kwargs, 0, "record_id")
+            content = _arg(args, kwargs, 1, "content")
+            if content is None:
+                # Metadata-only update: the record keeps its content.
+                existing = storage.get_record(record_id)
+                if existing is None:
+                    return orig_update(*args, **kwargs)  # raises: not found
+                content = existing.content
+            ctx_key, agent_id, session_id = scope("update")
+            # Recorded before the store write, like remember; bound after it.
+            (write_id,) = capture.on_batch(
+                ctx_key, store,
+                [([(store, record_id)], _text(content), "agent_inference", None)],
+                agent_id=agent_id, session_id=session_id,
+            )
+            record = orig_update(*args, **kwargs)
+            capture.bind(write_id, record.id)
+            return record
+
+        wrapped.append(("update", update))
+
+    orig_forget = getattr(memory, "forget", None)
+    if orig_forget is not None:
+
+        @functools.wraps(orig_forget)
+        def forget(*args, **kwargs):
+            record_ids = list(_arg(args, kwargs, 4, "record_ids") or ())
+            if not record_ids:
+                _warn_uncaptured("forget")
+                return orig_forget(*args, **kwargs)
+            ctx_key, agent_id, session_id = scope("forget")
+            # Nothing survives a deletion, so the compaction stays unbound.
+            capture.on_batch(
+                ctx_key, store,
+                [([(store, r) for r in record_ids], "", "agent_inference", None)],
+                agent_id=agent_id, session_id=session_id,
+            )
+            return orig_forget(*args, **kwargs)
+
+        wrapped.append(("forget", forget))
+
+    for name in ("reset", "reset_all"):
+        orig = getattr(memory, name, None)
+        if orig is None:
+            continue
+
+        def reset(*args, _orig=orig, _name=name, **kwargs):
+            _warn_uncaptured(_name)
+            return _orig(*args, **kwargs)
+
+        wrapped.append((name, functools.update_wrapper(reset, orig)))
+
+    for name, fn in wrapped:
         setattr(fn, _MARK, True)
         # Memory is a pydantic model, which rejects assigning non-field names.
         object.__setattr__(memory, name, fn)
@@ -444,6 +515,15 @@ def _batch_binds(batch: _Batch, obs: _Consolidation, returned: list) -> list:
     if not binds and len(batch.writes) == 1 and len(returned) == 1:
         binds.append((batch.writes[0][1], returned[0].id))
     return binds
+
+
+def _warn_uncaptured(method: str) -> None:
+    # Every call: these are rare, and each one is a gap in the ledger.
+    logger.warning(
+        "dod: %s() deletes by filter; the deleted record IDs are unknown, so the "
+        "deletion is not in the ledger. Pass record_ids to forget() to record it.",
+        method,
+    )
 
 
 def _text(content: Any) -> Any:

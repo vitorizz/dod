@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+import hashlib
 import inspect
 import json
 import logging
@@ -63,6 +64,9 @@ class StubStorage:
             self.records.pop(rid, None)
         return len(record_ids or ())
 
+    def get_record(self, record_id):
+        return self.records.get(record_id)
+
 
 class StubMemory:
     def __init__(self, read_only=False, pool=True):
@@ -111,6 +115,29 @@ class StubMemory:
 
     def _background_encode_batch(self, contents):
         return self._encode_many(contents)
+
+    def update(self, record_id, content=None, scope=None, categories=None,
+               metadata=None, importance=None):
+        existing = self._storage.get_record(record_id)
+        if existing is None:
+            raise ValueError(f"Record not found: {record_id}")
+        if self.read_only:
+            return existing
+        rec = StubRecord(existing.content if content is None else content, id=record_id)
+        self._storage.update(rec)
+        return rec
+
+    def forget(self, scope=None, categories=None, older_than=None,
+               metadata_filter=None, record_ids=None):
+        return self._storage.delete(scope_prefix=scope, categories=categories,
+                                    record_ids=record_ids, older_than=older_than,
+                                    metadata_filter=metadata_filter)
+
+    def reset(self, scope=None):
+        self._storage.records.clear()
+
+    def reset_all(self):
+        self._storage.records.clear()
 
     def drain_writes(self):
         pending, self._pending = self._pending, []
@@ -707,6 +734,98 @@ def test_storage_calls_outside_remember_not_observed(path, mem):
     assert writes(path) == []
 
 
+# --- Direct edits and deletions ----------------------------------------------
+
+
+def content_hash(path, write_id):
+    (h,) = raw(path).execute(
+        "SELECT content_hash FROM writes WHERE write_id=?", (write_id,)
+    ).fetchone()
+    return h
+
+
+def test_update_is_compaction_recorded_before_store_write(path, mem):
+    a, k = mem.add("A", "K")
+    mem.results["k"] = [k]
+    seen = []
+    orig = mem._storage.update
+    mem._storage.update = lambda record: (seen.append(len(writes(path))), orig(record))
+    with agent_task_scope("agent", "task"):
+        mem.recall("k")
+        rec = mem.update("A", "corrected A")
+    assert rec.content == "corrected A" and seen == [1]
+    ((wid, store, src, agent_id, session_id),) = writes(path)
+    assert (store, src, agent_id, session_id) == ("crewai", "agent_inference", "agent", "task")
+    assert parents(path, wid) == {"A": "in_prompt", "K": "retrieved_in_scope"}
+    assert bound(path, wid) == ["A"]
+    assert content_hash(path, wid) == hashlib.sha256(b"corrected A").hexdigest()
+
+
+def test_metadata_only_update_hashes_unchanged_content(path, mem):
+    mem.add("A")
+    with agent_task_scope("agent", "task"):
+        mem.update("A", importance=0.9)
+    ((wid, *_),) = writes(path)
+    assert content_hash(path, wid) == hashlib.sha256(b"content of A").hexdigest()
+    assert bound(path, wid) == ["A"]
+
+
+def test_update_missing_record_raises_and_records_nothing(path, mem):
+    with agent_task_scope("agent", "task"), pytest.raises(ValueError):
+        mem.update("nope")
+    assert writes(path) == []
+
+
+def test_failed_update_leaves_compaction_unbound(path, mem):
+    mem.add("A")
+
+    def boom(record):
+        raise RuntimeError("store down")
+
+    mem._storage.update = boom
+    with agent_task_scope("agent", "task"), pytest.raises(RuntimeError):
+        mem.update("A", "new")
+    ((wid, *_),) = writes(path)
+    assert bound(path, wid) == []
+
+
+def test_read_only_update_records_nothing(path, cap):
+    m = instrument(StubMemory(read_only=True), cap)
+    m.add("A")
+    with agent_task_scope("agent", "task"):
+        assert m.update("A", "new").content == "content of A"
+    assert writes(path) == []
+
+
+def test_forget_by_ids_is_unbound_compaction(path, mem):
+    _, _, k = mem.add("A", "B", "K")
+    mem.results["k"] = [k]
+    with agent_task_scope("agent", "task"):
+        mem.recall("k")
+        assert mem.forget(record_ids=["A", "B"]) == 2
+    assert "A" not in mem._storage.records
+    ((wid, _, src, *_),) = writes(path)
+    assert src == "agent_inference"
+    assert parents(path, wid) == {"A": "in_prompt", "B": "in_prompt", "K": "retrieved_in_scope"}
+    assert bound(path, wid) == []
+
+
+@pytest.mark.parametrize("call", [
+    lambda m: m.forget(scope="/x"),
+    lambda m: m.forget(record_ids=[]),
+    lambda m: m.reset(),
+    lambda m: m.reset_all(),
+], ids=["forget-filter", "forget-empty-ids", "reset", "reset_all"])
+def test_filter_deletes_pass_through_and_warn_every_call(path, mem, caplog, call):
+    mem.add("A")
+    with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+        with agent_task_scope("agent", "task"):
+            call(mem)
+            call(mem)
+    assert writes(path) == []
+    assert len([r for r in caplog.records if "deletes by filter" in r.message]) == 2
+
+
 # --- Real crewai 1.15.22 -----------------------------------------------------
 
 
@@ -719,7 +838,7 @@ def test_stub_signatures_match_crewai():
     pytest.importorskip("crewai")
     from crewai.memory.unified_memory import Memory
 
-    for name in ("recall", "remember", "remember_many"):
+    for name in ("recall", "remember", "remember_many", "update", "forget", "reset", "reset_all"):
         assert _params(getattr(StubMemory, name)) == _params(getattr(Memory, name)), name
     # remember_many's background save, wrapped to bind its writes.
     assert callable(getattr(Memory, "_background_encode_batch"))
@@ -754,6 +873,11 @@ class _MemStorage:
 
     def get_record(self, record_id):
         return self.records.get(record_id)
+
+    def reset(self, scope_prefix=None):
+        for rid, r in list(self.records.items()):
+            if scope_prefix is None or r.scope.startswith(scope_prefix):
+                del self.records[rid]
 
     def list_scopes(self, path="/"):
         return []
@@ -830,6 +954,28 @@ def test_real_memory_end_to_end(path, cap):
     assert bound(path, w_d) == [by_content["D"]] and bound(path, w_e) == [by_content["E"]]
     assert set(parents(path, w_d)) == {a.id, b.id, c.id}
     assert cap._context == {}
+
+
+@pytest.mark.crewai
+def test_real_update_and_forget_recorded(path, cap, caplog):
+    pytest.importorskip("crewai")
+    m = instrument(_real_memory(embedder=_one_hot), cap)
+    with agent_task_scope("setup", "setup"):
+        a, b = _save(m, "A"), _save(m, "B")
+    with agent_task_scope("agent", "task"):
+        m.recall("anything", depth="shallow")
+        rec = m.update(a.id, "corrected A")
+        assert m.forget(record_ids=[b.id]) == 1
+        # MemoryScope delegates to the instance, so its deletes are seen too.
+        with caplog.at_level(logging.WARNING, logger="dod.integrations.crewai"):
+            m.scope("/elsewhere").reset()
+    assert m._storage.records[a.id].content == "corrected A"
+    w_upd, w_del = (w for w, *_ in writes(path)[2:])
+    assert bound(path, w_upd) == [rec.id] == [a.id]
+    assert parents(path, w_upd) == {a.id: "in_prompt", b.id: "retrieved_in_scope"}
+    assert bound(path, w_del) == []
+    assert parents(path, w_del) == {b.id: "in_prompt", a.id: "retrieved_in_scope"}
+    assert any("reset() deletes by filter" in r.message for r in caplog.records)
 
 
 @pytest.mark.crewai
