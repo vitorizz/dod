@@ -78,7 +78,7 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 
 ## Test commands
 ```bash
-pip install -e ".[dev,crewai,langgraph]"   # what CI runs: package, test deps, real integrations
+pip install -e ".[dev,crewai,langgraph,anthropic]"   # what CI runs: package, test deps, real integrations
 pip install -e ".[dev]"              # core only (CI also runs this, as test-core)
 pytest -q                            # full suite, including p99 < 1 ms capture benchmarks
 pytest -q tests/test_*_perf.py -s    # benchmarks only, printing p50/p99
@@ -86,6 +86,8 @@ pip install -e ".[dev,crewai]"       # add the real CrewAI dependency
 pytest -q -m crewai                  # CrewAI integration tests (skipped without crewai)
 pip install -e ".[dev,langgraph]"    # add LangGraph (InMemoryStore needs no service)
 pytest -q -m langgraph               # LangGraph + cross-store tests (skipped without langgraph)
+pip install -e ".[dev,anthropic]"    # add the Anthropic SDK (memory tool; no API calls in tests)
+pytest -q -m anthropic               # Anthropic memory tool tests (skipped without anthropic)
 pip install -e ".[dev,anthropic]"    # add the Anthropic SDK (memory tool; no API calls in tests)
 pytest -q -m anthropic               # memory tool tests (skipped without anthropic)
 ```
