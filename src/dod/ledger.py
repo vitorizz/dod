@@ -63,11 +63,13 @@ Parent = Tuple[str, str, str]
 # Stored in the file's ``PRAGMA user_version``. Bump it on any change to
 # tables, columns, triggers or views, and ship a migration (or a "recreate"
 # note in docs/decisions.md) with the bump.
-SCHEMA_VERSION = 4  # 4: child_edges dropped; 3: delta context sets (#52); 2: child_edges (#34)
-# Version 3 files migrate in place: version 4 only drops the derived
-# child_edges index, which the lineage file replaces.
+SCHEMA_VERSION = 5  # 5: bindings.content_hash; 4: child_edges dropped; 3: delta context sets (#52)
+# Older files migrate in place, one version at a time: version 4 only drops
+# the derived child_edges index, which the lineage file replaces; version 5
+# adds a nullable column.
 _MIGRATIONS = {
     3: ("DROP TABLE IF EXISTS child_edges", "DROP TABLE IF EXISTS child_edges_filled"),
+    4: ("ALTER TABLE bindings ADD COLUMN content_hash TEXT",),
 }
 # The lineage file's ``PRAGMA user_version``. It is derived, so a file at
 # another version is rebuilt rather than migrated.
@@ -280,10 +282,11 @@ SELECT write_id, parent_store, parent_record_id, tag FROM direct_parents
 UNION ALL
 SELECT w.write_id, m.store, m.record_id, m.tag""" + _CONTEXT_EDGES + """;
 CREATE TABLE IF NOT EXISTS bindings (
-    write_id  TEXT NOT NULL REFERENCES writes (write_id),
-    store     TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    ts        INTEGER NOT NULL
+    write_id     TEXT NOT NULL REFERENCES writes (write_id),
+    store        TEXT NOT NULL,
+    record_id    TEXT NOT NULL,
+    ts           INTEGER NOT NULL,
+    content_hash TEXT
 );
 CREATE TABLE IF NOT EXISTS tombstones (
     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -412,6 +415,10 @@ CREATE TABLE IF NOT EXISTS lineage.index_filled (
     },
 )
 
+
+_INSERT_BINDING = (
+    "INSERT INTO bindings (write_id, store, record_id, ts, content_hash) VALUES (?, ?, ?, ?, ?)"
+)
 
 # The last write ID issued in this process. Taken inside a Ledger's _lock
 # (always in that order), so IDs strictly increase within the process and,
@@ -920,7 +927,7 @@ class Ledger:
     def append_batch(
         self,
         writes: Iterable[dict] = (),
-        bindings: Iterable[Tuple[str, str, str]] = (),
+        bindings: Iterable[Tuple[str, ...]] = (),
         tombstones: Iterable[dict] = (),
     ) -> List[str]:
         """Record several writes, bindings and tombstones in one transaction.
@@ -928,7 +935,8 @@ class Ledger:
         Each of ``writes`` is a dict of ``append_write``'s keyword arguments
         (writes passing the same ``context`` object have it hashed once),
         plus an optional ``record_id`` that binds the new write in the same
-        transaction. ``bindings`` are ``(write_id, store, record_id)`` tuples
+        transaction. ``bindings`` are ``(write_id, store, record_id)`` tuples,
+        optionally with a fourth item, the binding's ``content_hash`` (see ``bind``),
         for writes recorded earlier. ``tombstones`` are dicts as for
         ``append_tombstones``. Returns the new write IDs in order. All or
         nothing: if anything is invalid or fails, nothing is recorded.
@@ -975,7 +983,8 @@ class Ledger:
                 for s, r, t in _dedupe_parents(w.get("parents", ()))
             ]
             prepared.append((row, direct, w["store"], w.get("record_id")))
-        later_bindings = [(wid, s, r, ts) for wid, s, r in bindings]
+        later_bindings = [(b[0], b[1], b[2], ts, b[3] if len(b) > 3 else None)
+                          for b in bindings]
         tombstone_rows = [_tombstone_row(t, ts) for t in tombstones]
         with self._lock:
             # IDs are issued under the lock, so they increase with seq across
@@ -990,7 +999,7 @@ class Ledger:
                     write_rows.append((write_id,) + row)
                     parent_rows += [(write_id, s, r, t) for s, r, t in direct]
                     if record_id is not None:
-                        binding_rows.append((write_id, store, record_id, ts))
+                        binding_rows.append((write_id, store, record_id, ts, None))
                     write_ids.append(write_id)
                 _last_id = last
             binding_rows += later_bindings
@@ -1037,7 +1046,7 @@ class Ledger:
                 if parent_rows:
                     conn.executemany("INSERT INTO direct_parents VALUES (?, ?, ?, ?)", parent_rows)
                 if binding_rows:
-                    conn.executemany("INSERT INTO bindings VALUES (?, ?, ?, ?)", binding_rows)
+                    conn.executemany(_INSERT_BINDING, binding_rows)
                 if tombstone_rows:
                     conn.executemany(
                         "INSERT INTO tombstones (store, record_id, ts, reason, write_id,"
@@ -1067,13 +1076,18 @@ class Ledger:
         """
         self.append_batch(tombstones=tombstones)
 
-    def bind(self, write_id: str, store: str, record_id: str) -> None:
-        """Append a binding from a write to the record ID its store assigned."""
+    def bind(
+        self, write_id: str, store: str, record_id: str, content_hash: Optional[str] = None
+    ) -> None:
+        """Append a binding from a write to the record ID its store assigned.
+
+        ``content_hash``, if the integration knows it, is the hash of what the
+        store holds for the record right after the write, where that differs
+        from (or can't be derived from) the write's own content hash.
+        """
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO bindings VALUES (?, ?, ?, ?)",
-                (write_id, store, record_id, time.time_ns()),
-            )
+            self._conn.execute(_INSERT_BINDING, (write_id, store, record_id, time.time_ns(),
+                                                 content_hash))
 
     def quarantine(
         self, items: Iterable[Item], reason: Optional[str] = None,

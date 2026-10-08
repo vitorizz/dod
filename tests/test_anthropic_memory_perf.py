@@ -89,3 +89,48 @@ def test_str_replace_overhead_p99_under_1ms(tmp_path):
             )
     print(f"str_replace overhead p99 ~ {overhead:.4f} ms (raw str_replace p99 {raw:.4f} ms)")
     assert overhead < 1.0
+
+
+class TimedWithRead(Timed):
+    """Adds the view that follows each str_replace (the hash read) to that
+    call's raw time, so one raw time is recorded per call."""
+
+    def view(self, command):
+        start = time.perf_counter_ns()
+        try:
+            return BetaLocalFilesystemMemoryTool.view(self, command)
+        finally:
+            if self.timing:
+                self.inner[-1] += time.perf_counter_ns() - start
+
+
+def test_str_replace_overhead_with_file_hashes_p99_under_1ms(tmp_path):
+    # As above, plus hash_files=True: after each edit the file is read back
+    # through the tool's view and hashed. The read is the store's own work
+    # (I/O that varies like the edit's), so it is subtracted with the raw
+    # edit; what remains is capture's cost, parsing and hashing included.
+    # The opt-in's full price is that plus one view, printed below.
+    inner = []
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        tool = instrument(_seeded(TimedWithRead(str(tmp_path / "mem"), inner)),
+                          Capture(ledger), hash_files=True)
+        versions = itertools.count()
+
+        def run():
+            i = next(versions)
+            tool.call({"command": "str_replace", "path": "/memories/edit.md",
+                       "old_str": f"v{i}\n", "new_str": f"v{i + 1}\n"})
+
+        with agent_task_scope("agent", "task"):
+            tool.timing = False
+            for i in range(10):
+                tool.call({"command": "view", "path": f"/memories/facts/f{i}.md"})
+            tool.timing = True  # the hash read counts as the tool's work
+            overhead, raw = split_p99_ms(
+                run, inner, n=2_000, warmup=200, rounds=3,
+                labels=("capture overhead (str_replace + file hash, on-disk)",
+                        "raw str_replace + hash read"),
+            )
+    print(f"str_replace + hash overhead p99 ~ {overhead:.4f} ms"
+          f" (raw edit + read p99 {raw:.4f} ms)")
+    assert overhead < 1.0

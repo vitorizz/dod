@@ -146,7 +146,7 @@ The four kinds of finding:
 - `unrecorded`: in the store but never recorded. It was written outside capture.
 - `resurrected`: in the store, but recorded as deleted.
 - `missing`: recorded as live, but gone from the store. It was deleted outside capture, for example by a TTL sweep.
-- `modified`: content differs from the last recorded write. Not checked for the memory tool, whose ledger hash is a command's payload rather than the file.
+- `modified`: content differs from the last recorded write. For the memory tool this needs `anthropic_memory.instrument(tool, capture, hash_files=True)` (off by default). That records each written file's hash after the command, at the cost of one extra `view` per file written. Without it, the memory tool is checked for existence only.
 
 For `unrecorded` and `resurrected` items, `read_into` lists the recorded writes that already used the item as a parent. Those are the points where `trace` currently stops.
 

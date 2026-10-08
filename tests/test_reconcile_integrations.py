@@ -282,3 +282,52 @@ def test_one_pass_over_several_stores(path, ledger, cap, tmp_path):
     # Trace breaks at the planted file: the LangGraph write that used it.
     assert len(f.read_into) == 1
     assert report.scanned == {"langgraph": 2, "anthropic_memory": 2}
+
+
+@pytest.mark.anthropic
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_memory_tool_with_file_hashes_finds_hand_edits(path, ledger, cap, tmp_path, asynchronous):
+    pytest.importorskip("anthropic.tools.memory")
+    from anthropic.tools.memory import (
+        BetaAsyncLocalFilesystemMemoryTool,
+        BetaLocalFilesystemMemoryTool,
+    )
+
+    from dod.integrations import anthropic_memory
+
+    base = tmp_path / "mem"
+    cls = BetaAsyncLocalFilesystemMemoryTool if asynchronous else BetaLocalFilesystemMemoryTool
+
+    def caller(tool):
+        def call(command):
+            result = tool.call(command)
+            return asyncio.run(result) if asynchronous else result
+        return call
+
+    # Written before hashing was turned on: no binding hash.
+    old = caller(anthropic_memory.instrument(cls(base_path=str(base)), cap))
+    with agent_task_scope("agent", "t0"):
+        old({"command": "create", "path": "/memories/old.md", "file_text": "old\n"})
+    tool = anthropic_memory.instrument(cls(base_path=str(base)), cap, hash_files=True)
+    call = caller(tool)
+    with agent_task_scope("agent", "t1"):
+        call({"command": "create", "path": "/memories/a.md", "file_text": "a\n"})
+        call({"command": "create", "path": "/memories/b.md", "file_text": "b\n"})
+        call({"command": "str_replace", "path": "/memories/b.md", "old_str": "b", "new_str": "B"})
+    adapter = anthropic_memory.ReconcileAdapter(tool)  # follows the tool: hashes on
+    assert adapter.hash_files and adapter.compare_bound_hash
+    report = reconcile(ledger, {"anthropic_memory": adapter}, grace=0)
+    assert report.ok, report.findings
+    assert report.content_checked == {"anthropic_memory": True}
+
+    files = base / "memories"
+    (files / "a.md").write_text("edited by hand\n")
+    (files / "old.md").write_text("edited by hand\n")  # no binding hash: existence only
+    (f,) = reconcile(ledger, {"anthropic_memory": adapter}, grace=0).findings
+    assert (f.record_id, f.kind) == ("/memories/a.md", "modified")
+    assert f.ledger_hash == hashlib.sha256(b"a\n").hexdigest()
+    assert f.store_hash == hashlib.sha256(b"edited by hand\n").hexdigest()
+
+    # An existence-only adapter on the same tool reports nothing.
+    assert reconcile(ledger, {"anthropic_memory": anthropic_memory.ReconcileAdapter(
+        tool, hash_files=False)}, grace=0).ok

@@ -70,6 +70,11 @@ class ReconcileAdapter(Protocol):
     def get(self, record_id: str) -> Tuple[bool, Optional[str]]:
         """``(present, content_hash)`` for one item, read the same way."""
 
+    # Optional: ``compare_bound_hash = True`` compares content only with the
+    # hash recorded on the item's last binding (``Ledger.bind(content_hash=)``)
+    # and skips items whose binding has none. By default the binding's hash
+    # is used when present, else the bound write's content hash.
+
 
 class Finding(NamedTuple):
     store: str
@@ -77,7 +82,8 @@ class Finding(NamedTuple):
     kind: str
     """One of ``KINDS``."""
     ledger_hash: Optional[str]
-    """Content hash of the last write bound to the item, if any."""
+    """The recorded hash the store was compared with: the last binding's
+    ``content_hash`` if it has one, else its write's content hash."""
     store_hash: Optional[str]
     """The store's current content hash, if present and known."""
     read_into: Tuple[str, ...]
@@ -140,7 +146,8 @@ def reconcile(
         seen[name] = items
         hashed[name] = any(h is not None for h in items.values())
 
-    first, live, known = _check(ledger, seen, None, reads=False)
+    bound_only = {n: bool(getattr(a, "compare_bound_hash", False)) for n, a in stores.items()}
+    first, live, known = _check(ledger, seen, None, False, bound_only)
     report = ReconcileReport([], {n: len(i) for n, i in seen.items()}, live, hashed,
                              unchecked=sorted(known - set(stores)), ts=ts)
     if not first:
@@ -155,7 +162,7 @@ def reconcile(
         flagged.setdefault(f.store, []).append(f.record_id)
         if present:
             again.setdefault(f.store, {})[f.record_id] = content_hash
-    findings, _, _ = _check(ledger, again, flagged, reads=True)
+    findings, _, _ = _check(ledger, again, flagged, True, bound_only)
     report.findings = findings
     report.cleared = len(first) - len(findings)
     if findings:
@@ -185,11 +192,13 @@ _FLAG = (
 )
 
 # The ledger's state for one store's items: the last binding (by append
-# order) with its write's content hash, and the last tombstone's ts. ``{only}``
-# limits it to the items in rec_scope on a re-check.
+# order) with the hash to compare against (``{expected}``: the binding's own
+# hash, else its write's, or for ``compare_bound_hash`` adapters the
+# binding's only), and the last tombstone's ts. ``{only_b}``/``{only_t}``
+# limit it to the items in rec_scope on a re-check.
 _STATE = """
 WITH bound AS (
-    SELECT b.record_id, b.ts, w.content_hash FROM bindings b
+    SELECT b.record_id, b.ts, {expected} AS content_hash FROM bindings b
     CROSS JOIN writes w ON w.write_id = b.write_id
     WHERE b.store = :s {only_b} AND b.rowid = (
         SELECT max(b2.rowid) FROM bindings b2
@@ -210,7 +219,8 @@ LEFT JOIN gone ON gone.record_id = r.record_id
 WHERE r.store = :s AND (
     bound.ts IS NULL
     OR gone.ts >= bound.ts
-    OR (r.hash IS NOT NULL AND r.hash IS NOT bound.content_hash)
+    OR (r.hash IS NOT NULL AND bound.content_hash IS NOT NULL
+        AND r.hash IS NOT bound.content_hash)
 )"""
 
 # Items live in the ledger: bound, and not tombstoned since.
@@ -254,6 +264,7 @@ def _check(
     seen: Mapping[str, Mapping[str, Optional[str]]],
     scope: Optional[Mapping[str, List[str]]],
     reads: bool,
+    bound_only: Mapping[str, bool],
 ) -> Tuple[List[Finding], Dict[str, int], Set[str]]:
     """Findings for the items in ``seen`` (per store, record ID to content
     hash), against one ledger snapshot, the live count per store, and every
@@ -263,6 +274,7 @@ def _check(
     are classified: one in ``scope`` but not in ``seen`` is absent from the
     store. Without it, every item of each store in ``seen`` is. ``reads``
     fills ``Finding.read_into``, which costs a pass over the parent tables.
+    ``bound_only`` names the stores compared with binding hashes only.
     """
     from dod.query import _walk_connection  # a read snapshot on its own connection
 
@@ -288,13 +300,15 @@ def _check(
                       " WHERE q.store = b.store AND q.record_id = b.record_id)")
             only_t = ("AND EXISTS (SELECT 1 FROM temp.rec_scope q"
                       " WHERE q.store = t.store AND q.record_id = t.record_id)")
-        in_store = _IN_STORE.format(only_b=only_b, only_t=only_t)
-        live_sql = _LIVE.format(only_b=only_b, only_t=only_t)
 
         found: List[Tuple[str, str, str, Optional[str], Optional[str]]] = []
         flags: List[Tuple[str, str, int]] = []
         live: Dict[str, int] = {}
         for name in names:
+            expected = ("b.content_hash" if bound_only.get(name)
+                        else "coalesce(b.content_hash, w.content_hash)")
+            fmt = dict(only_b=only_b, only_t=only_t, expected=expected)
+            in_store, live_sql = _IN_STORE.format(**fmt), _LIVE.format(**fmt)
             for record_id, store_hash, bound_ts, ledger_hash, gone_ts in x(
                 in_store, {"s": name}
             ):
