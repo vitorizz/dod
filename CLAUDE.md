@@ -71,7 +71,7 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 ## Stack
 - Python >= 3.9 (CI runs 3.12). Package `dod` in `src/` layout, built with hatchling (`pyproject.toml`).
 - Ledger: stdlib `sqlite3`, append-only, WAL mode. No ORM.
-- Tests: pytest. Benchmarks are plain pytest tests using `tests/perf.py` (p50/p99 via `time.perf_counter_ns`).
+- Tests: pytest. Benchmarks are plain pytest tests using `tests/perf.py` (p50/p99 via `time.perf_counter_ns`). Bars are CI's; `DOD_PERF_SCALE` (default 1.0) divides measured times so a slower dev machine can scale them, and benchmarks that time themselves multiply their bar by `perf.SCALE`.
 - Framework integrations are optional extras, never core dependencies: `[crewai]` pins `crewai==1.15.22`; `[langgraph]` pins `langgraph==1.2.14` and `langgraph-checkpoint==4.2.0` (where `BaseStore` lives); `[anthropic]` pins `anthropic==1.12.1` (memory tool `memory_20250818`, `anthropic.tools.memory`); `[otel]` pins `opentelemetry-api==1.45.1` and `opentelemetry-sdk==1.45.1` (the SDK for tests).
 - Exporters are `Capture` observers in `dod.export` (`Capture(ledger, observers=[...])`, called after the ledger commit, failing open). `dod.export.otel.OTelObserver` emits `dod.*` span events only, never `gen_ai.*`.
 - The context scope (`agent_task_scope`) lives in `dod.scope` and is shared by every integration, so one scope links retrievals and writes across stores.
@@ -83,6 +83,7 @@ pip install -e ".[dev,crewai,langgraph,anthropic,otel]"   # what CI runs: packag
 pip install -e ".[dev]"              # core only (CI also runs this, as test-core)
 pytest -q                            # full suite, including p99 < 1 ms capture benchmarks
 pytest -q tests/test_*_perf.py -s    # benchmarks only, printing p50/p99
+DOD_PERF_SCALE=2 pytest -q           # slow dev machine: every benchmark bar x2 (CI never sets it)
 pip install -e ".[dev,crewai]"       # add the real CrewAI dependency
 pytest -q -m crewai                  # CrewAI integration tests (skipped without crewai)
 pip install -e ".[dev,langgraph]"    # add LangGraph (InMemoryStore needs no service)

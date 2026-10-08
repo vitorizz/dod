@@ -9,9 +9,12 @@ queries never see how they are stored. ``blast_radius`` reads the same edges
 by parent from ``child_edges`` plus the not-yet-indexed tail.
 """
 
+import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
+from functools import partial
+from operator import itemgetter
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 from .ledger import _EDGES_BETWEEN, TAGS, Ledger
 
@@ -64,6 +67,10 @@ class Tombstone(NamedTuple):
     agent_id: Optional[str]
     session_id: Optional[str]
 
+
+# Build a NamedTuple from a row in C, skipping its generated Python __new__.
+_traced_write = partial(tuple.__new__, TracedWrite)
+_edge = partial(tuple.__new__, Edge)
 
 Item = Tuple[str, str]
 
@@ -284,6 +291,102 @@ def trace(
     )
 
 
+# The forward walk runs inside SQLite, over temp tables private to its
+# connection, appended level by level so each level is a rowid range:
+# walk_reach holds each reached write, keyed by seq, at its minimum depth;
+# walk_items the distinct items bound to each reached write; walk_edges the
+# edges walked from them; walk_tail the edges of writes past the child_edges
+# watermark. Python reads only the result.
+_WALK_TABLES = """
+CREATE TEMP TABLE walk_reach (
+    seq INTEGER PRIMARY KEY, write_id TEXT NOT NULL, depth INTEGER NOT NULL
+);
+CREATE INDEX temp.walk_reach_by_depth ON walk_reach (depth);
+CREATE TEMP TABLE walk_items (seq INTEGER, write_id TEXT, store TEXT, record_id TEXT);
+CREATE TEMP TABLE walk_edges (
+    seq INTEGER, write_id TEXT, store TEXT, record_id TEXT, tag TEXT, parent TEXT
+);
+CREATE TEMP TABLE walk_tail (
+    parent_store TEXT, parent_record_id TEXT, seq INTEGER, write_id TEXT, tag TEXT
+);
+CREATE INDEX temp.walk_tail_by_parent ON walk_tail (parent_store, parent_record_id);
+"""
+
+# The children of the walk_items rows in (:lo, :hi], from child_edges (at or
+# below the watermark) and the tail, as walk_edges rows. CROSS JOIN fixes the
+# join order: the items drive every lookup.
+_CHILDREN = " UNION ALL ".join(
+    "SELECT c.seq, c.write_id, i.store, i.record_id, c.tag, i.write_id"
+    f" FROM walk_items i CROSS JOIN {table} c"
+    " ON c.parent_store = i.store AND c.parent_record_id = i.record_id"
+    f"{cond} WHERE i.rowid > :lo AND i.rowid <= :hi"
+    for table, cond in (("child_edges", " AND c.seq <= :wm"), ("walk_tail", ""))
+)
+_ADD_EDGES = f"INSERT INTO walk_edges {_CHILDREN}"
+# INSERT OR IGNORE keeps each write's first, so minimum, depth.
+_ADD_REACHED = (
+    "INSERT OR IGNORE INTO walk_reach SELECT seq, write_id, :d FROM walk_edges"
+    " WHERE rowid > :lo"
+)
+# DISTINCT drops a binding appended twice; a write's bindings are all read
+# at its one depth.
+_ADD_ITEMS = (
+    "INSERT INTO walk_items SELECT DISTINCT f.seq, b.write_id, b.store, b.record_id"
+    " FROM walk_reach f CROSS JOIN bindings b ON b.write_id = f.write_id"
+    " WHERE f.depth = :d"
+)
+_UNREACHED_CHILD = (
+    f"SELECT EXISTS (SELECT 1 FROM ({_CHILDREN}) e"
+    " WHERE e.seq NOT IN (SELECT seq FROM walk_reach))"
+)
+_REACHED = (
+    "SELECT w.write_id, f.depth, w.seq, w.content_hash, w.ts, w.store,"
+    " w.agent_id, w.session_id, w.source"
+    " FROM walk_reach f CROSS JOIN writes w ON w.seq = f.seq"
+)
+_DELETED = (
+    f"SELECT {_TOMBSTONE_COLS} FROM tombstones WHERE seq IN ("
+    " SELECT t.seq FROM walk_items i CROSS JOIN tombstones t"
+    " ON t.store = i.store AND t.record_id = i.record_id)"
+)
+
+
+def _walk_connection(ledger: Ledger) -> Tuple[sqlite3.Connection, Callable[[], None]]:
+    """A connection to walk on and the function that releases it.
+
+    A file-backed ledger gets a connection of its own, so the walk runs in
+    one read transaction (a consistent snapshot) and never holds the
+    ledger's lock: appends aren't held up by a long walk. An in-memory
+    ledger has no file to open twice, so the walk holds the ledger's lock
+    and uses its connection, dropping the temp tables afterwards.
+    """
+    path = next(
+        (f for _, name, f in _run(ledger, "PRAGMA database_list", ()) if name == "main"), ""
+    )
+    if path:
+        conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("BEGIN")
+        except BaseException:
+            conn.close()
+            raise
+        return conn, conn.close
+
+    ledger._lock.acquire()
+    conn = ledger._conn
+
+    def release() -> None:
+        try:
+            for t in ("walk_reach", "walk_items", "walk_edges", "walk_tail"):
+                conn.execute(f"DROP TABLE IF EXISTS temp.{t}")
+        finally:
+            ledger._lock.release()
+
+    return conn, release
+
+
 def blast_radius(
     ledger: Ledger, store: str, record_id: str, max_depth: Optional[int] = None
 ) -> BlastResult:
@@ -295,121 +398,82 @@ def blast_radius(
     appears once at its minimum depth and cycles terminate. ``max_depth``
     (``None`` for no limit) bounds descendant depth; 1 is direct children.
 
-    Breadth-first over the ledger's ``child_edges`` index, one indexed query
-    per level over the current frontier, so only the reached subgraph is
-    read. The ledger's background thread fills that index; writes it hasn't
-    reached yet (past its watermark) are read from the source tables once,
-    in memory, and merged, so results are always current. A deleted item is
-    still walked: its tombstone is reported in ``deleted``, and what was
-    derived from it stays in the result.
+    Breadth-first over the ledger's ``child_edges`` index, a few indexed
+    statements per level over the current frontier, so only the reached
+    subgraph is read. The levels run inside SQLite, in temp tables on the
+    walk's own connection, so Python builds only the result, not per-level
+    state. The ledger's background thread fills that index; writes it hasn't
+    reached yet (past its watermark) are read from the source tables once
+    and merged, so results are always current. A deleted item is still walked:
+    its tombstone is reported in ``deleted``, and what was derived from it
+    stays in the result.
 
     Raises ``KeyError`` if the item has no binding in the ledger.
     """
     if max_depth is not None and max_depth < 0:
         raise ValueError("max_depth must be >= 0")
 
-    start_ids = sorted(
-        {r[0] for r in _run(
-            ledger,
-            "SELECT write_id FROM bindings WHERE store = ? AND record_id = ?",
-            (store, record_id),
-        )}
-    )
-    if not start_ids:
-        raise KeyError((store, record_id))
+    conn, release = _walk_connection(ledger)
+    try:
+        def run(sql: str, **args) -> sqlite3.Cursor:
+            return conn.execute(sql, args)
 
-    # Edges at or below the watermark come from child_edges, the rest from
-    # the tail, so a fill committing mid-walk changes nothing.
-    ((wm,),) = _run(ledger, "SELECT coalesce(max(upto), 0) FROM child_edges_filled", ())
-    tail: Dict[Item, List[Tuple[int, str, str]]] = {}
-    for pstore, prec, seq, child, tag in _run(
-        ledger, _EDGES_BETWEEN, {"lo": wm, "hi": 2**63 - 1}
-    ):
-        tail.setdefault((pstore, prec), []).append((seq, child, tag))
-    for edges_of in tail.values():
-        edges_of.sort()
+        for stmt in _WALK_TABLES.split(";"):
+            if stmt.strip():
+                conn.execute(stmt)
+        if not run(
+            "INSERT INTO walk_reach SELECT seq, write_id, 0 FROM writes WHERE write_id IN"
+            " (SELECT write_id FROM bindings WHERE store = :s AND record_id = :r)",
+            s=store, r=record_id,
+        ).rowcount:
+            raise KeyError((store, record_id))
+        # Edges at or below the watermark come from child_edges, the rest
+        # from the tail, so a fill committing mid-walk changes nothing.
+        ((wm,),) = run("SELECT coalesce(max(upto), 0) FROM child_edges_filled").fetchall()
+        run(
+            "INSERT INTO walk_tail SELECT parent_store, parent_record_id, seq, write_id, tag"
+            f" FROM ({_EDGES_BETWEEN})",
+            lo=wm, hi=2**63 - 1,
+        )
 
-    items_of: Dict[str, List[Item]] = {}
-    # Each item's (child write_id, tag), in child seq order: indexed edges
-    # first, then the tail, whose seqs are all above the watermark.
-    children: Dict[Item, List[Tuple[str, str]]] = {}
+        # The frontier's items are walk_items rows (lo, hi].
+        lo, hi = 0, run(_ADD_ITEMS, d=0).rowcount
+        n_edges = 0
+        depth = 0
+        exhausted = False
+        while max_depth is None or depth < max_depth:
+            depth += 1
+            added = run(_ADD_EDGES, lo=lo, hi=hi, wm=wm).rowcount
+            new = run(_ADD_REACHED, d=depth, lo=n_edges).rowcount
+            n_edges += added
+            if not new:
+                exhausted = True
+                break
+            lo, hi = hi, hi + run(_ADD_ITEMS, d=depth).rowcount
+        # Stopped by max_depth, the last level wasn't expanded: check whether
+        # it has children the walk hasn't reached.
+        truncated = not exhausted and bool(
+            run(_UNREACHED_CHILD, lo=lo, hi=hi, wm=wm).fetchone()[0]
+        )
 
-    def expand(write_ids: List[str]) -> None:
-        """Load the bindings of ``write_ids`` and their items' children."""
-        new = [w for w in write_ids if w not in items_of]
-        for w in new:
-            items_of[w] = []
-        for chunk in _chunks(new):
-            for wid, s, r in _run(
-                ledger,
-                "SELECT write_id, store, record_id FROM bindings"
-                f" WHERE write_id IN ({_marks(len(chunk))}) ORDER BY rowid",
-                chunk,
-            ):
-                if (s, r) not in items_of[wid]:  # the same binding appended twice
-                    items_of[wid].append((s, r))
-        by_store: Dict[str, Set[str]] = {}
-        fresh: List[Item] = []
-        for w in new:
-            for item in items_of[w]:
-                if item not in children:
-                    children[item] = []
-                    by_store.setdefault(item[0], set()).add(item[1])
-                    fresh.append(item)
-        for s, ids in sorted(by_store.items()):
-            for chunk in _chunks(sorted(ids)):
-                for prec, child, tag in _run(
-                    ledger,
-                    "SELECT parent_record_id, write_id, tag FROM child_edges"
-                    f" WHERE parent_store = ? AND parent_record_id IN ({_marks(len(chunk))})"
-                    " AND seq <= ? ORDER BY parent_record_id, seq",
-                    [s, *chunk, wm],
-                ):
-                    children[(s, prec)].append((child, tag))
-        for item in fresh:
-            children[item] += [(child, tag) for _, child, tag in tail.get(item, ())]
+        edges = list(map(_edge, run(
+            "SELECT write_id, store, record_id, tag, parent FROM walk_edges"
+        )))
+        reached = list(map(_traced_write, run(_REACHED)))
+        bound = run("SELECT write_id, store, record_id FROM walk_items").fetchall()
+        # walk_items holds the queried item, bound to every depth-0 write.
+        deleted = _group(run(_DELETED))
+    finally:
+        release()
 
-    seen: Dict[str, int] = dict.fromkeys(start_ids, 0)
-    edges: List[Edge] = []
-    frontier = start_ids
-    depth = 0
-
-    while frontier and (max_depth is None or depth < max_depth):
-        depth += 1
-        expand(frontier)
-        nxt: List[str] = []
-        for wid in frontier:
-            for item in items_of[wid]:
-                for child, tag in children[item]:
-                    edges.append(Edge(child, item[0], item[1], tag, wid))
-                    if child not in seen:
-                        seen[child] = depth
-                        nxt.append(child)
-        frontier = nxt
-
-    # Stopped by max_depth: the last level wasn't expanded, so check whether
-    # it has children the walk hasn't reached.
-    expand(frontier)
-    truncated = any(
-        child not in seen
-        for wid in frontier
-        for item in items_of[wid]
-        for child, _ in children[item]
-    )
-    reached = []
-    for chunk in _chunks(list(seen)):
-        reached += [
-            TracedWrite(r[1], seen[r[1]], r[0], *r[2:])
-            for r in _run(
-                ledger,
-                f"SELECT {_WRITE_COLS} FROM writes WHERE write_id IN ({_marks(len(chunk))})",
-                chunk,
-            )
-        ]
-    reached.sort(key=lambda w: (w.depth, w.seq))
+    reached.sort(key=itemgetter(1, 2))  # (depth, seq)
+    bindings: Dict[str, List[Item]] = {w.write_id: [] for w in reached}
+    for wid, s, r in bound:
+        bindings[wid].append((s, r))
+    for items_of in bindings.values():
+        if len(items_of) > 1:
+            items_of.sort()
     descendants = [w for w in reached if w.depth]
-    bindings = {w: sorted(items_of[w]) for w in seen}
-    deleted = _tombstones(ledger, {(store, record_id)}.union(*bindings.values()))
     return BlastResult(
         store=store,
         record_id=record_id,
