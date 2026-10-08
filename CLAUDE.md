@@ -84,7 +84,7 @@ pip install -e ".[dev,crewai]"       # add the real CrewAI dependency
 pytest -q -m crewai                  # CrewAI integration tests (skipped without crewai)
 ```
 In agent runs, use these exact forms. Don't create a venv or call pip through `python -m`: they are not in the allowed tools and get denied. (`python -m pytest` is allowed.)
-Benchmark files and the `crewai` marker arrive with #11 and #13.
+CrewAI unit tests use a stub mirroring the pinned `Memory` signatures, so CI doesn't need crewai. Tests that need the real package are marked `crewai` and skip without it.
 
 ## Workflow
 1. Every change starts as an issue using the agent-task template (Goal / Acceptance criteria / Files involved), sized for one PR. New issues go on the board as Backlog with Priority and Size.
