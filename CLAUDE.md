@@ -79,7 +79,7 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 
 ## Test commands
 ```bash
-pip install -e ".[dev,crewai,langgraph,anthropic]"   # what CI runs: package, test deps, real integrations
+pip install -e ".[dev,crewai,langgraph,anthropic,otel]"   # what CI runs: package, test deps, real integrations
 pip install -e ".[dev]"              # core only (CI also runs this, as test-core)
 pytest -q                            # full suite, including p99 < 1 ms capture benchmarks
 pytest -q tests/test_*_perf.py -s    # benchmarks only, printing p50/p99
@@ -95,7 +95,7 @@ pip install -e ".[dev,otel]"         # add the OpenTelemetry API + SDK (in-memor
 pytest -q -m otel                    # OTel export tests (skipped without otel)
 ```
 In agent runs, use these exact forms. Don't create a venv or call pip through `python -m`: they are not in the allowed tools and get denied. (`python -m pytest` is allowed.)
-CI's `test` job installs both integrations, so every test runs; `test-core` runs without them to keep the core dependency-free. CrewAI unit tests use a stub mirroring the pinned `Memory` signatures; tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore`, are marked `langgraph`, and skip without it. Memory tool tests run `BetaLocalFilesystemMemoryTool` in a temp dir via `tool.call({...})` (no network), are marked `anthropic`, and skip without it; CI's `test` job doesn't install `[anthropic]` yet (#54 needs a separate `ci.yml` change). OTel tests use the SDK's `InMemorySpanExporter` with their own `TracerProvider` (never the global one), clear `OTEL_SDK_DISABLED` (which `test_crewai` sets process-wide), are marked `otel`, and skip without it; CI doesn't install `[otel]` yet (#59 needs a separate `ci.yml` change).
+CI's `test` job installs every integration (`crewai`, `langgraph`, `anthropic`, `otel`), so every test runs; `test-core` runs without them to keep the core dependency-free. CrewAI unit tests use a stub mirroring the pinned `Memory` signatures; tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore`, are marked `langgraph`, and skip without it. Memory tool tests run `BetaLocalFilesystemMemoryTool` in a temp dir via `tool.call({...})` (no network), are marked `anthropic`, and skip without it. OTel tests use the SDK's `InMemorySpanExporter` with their own `TracerProvider` (never the global one), clear `OTEL_SDK_DISABLED` (which `test_crewai` sets process-wide), are marked `otel`, and skip without it.
 
 ## Workflow
 1. Every change starts as an issue using the agent-task template (Goal / Acceptance criteria / Files involved), sized for one PR. New issues go on the board as Backlog with Priority and Size.
