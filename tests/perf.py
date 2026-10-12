@@ -55,6 +55,15 @@ def _report(name, r, rounds, n, p50, p99):
     print(f"{name}{tag}: p50={p50:.4f} ms p99={p99:.4f} ms (n={n}{scaled})")
 
 
+def p50_p99_ms(fn, n=10_000, warmup=1_000, label=None):
+    """One timed loop like ``p99_ms``; returns ``(p50, p99)`` in ms, both divided by ``SCALE``."""
+    name = label or getattr(fn, "__name__", "fn")
+    samples = next(_rounds(fn, n, warmup, 0.0, 1, []))
+    p50, p99 = _p50_p99(samples)
+    _report(name, 0, 1, n, p50, p99)
+    return p50 / SCALE, p99 / SCALE
+
+
 def p99_ms(fn, n=10_000, warmup=1_000, label=None, pause_s=0.0, rounds=1):
     """Call ``fn`` ``warmup`` times untimed, then ``n`` times timed.
 
