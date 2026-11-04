@@ -125,6 +125,36 @@ def test_unknown_tools_are_writes_and_read_only_can_be_named(ledger):
     assert [s for _, s in writes(ledger)] == ["agent_inference", "tool"]
 
 
+def test_writes_overrides_a_read_only_hint(ledger):
+    cap = Capture(ledger)
+
+    async def main():
+        async with connect(crm_server()._mcp_server) as session:
+            dmcp.instrument(session, cap, "crm", writes=["get_customer"])
+            await session.list_tools()
+            with agent_task_scope("support", "t1"):
+                await session.call_tool("get_customer", {"name": "ana"})
+
+    run(main)
+    assert [s for _, s in writes(ledger)] == ["agent_inference"]
+    with pytest.raises(ValueError, match="both"):
+        dmcp.instrument(object.__new__(type("S", (), {
+            "call_tool": lambda *a: None, "read_resource": lambda *a: None,
+            "list_tools": lambda *a: None})), cap, "x", read_only=["a"], writes=["a"])
+
+
+def test_gateway_reads_a_resource_it_has_not_listed(ledger):
+    cap = Capture(ledger)
+
+    async def main():
+        async with connect(crm_server()._mcp_server) as upstream:
+            gw = dmcp.Gateway(cap, {"crm": upstream})
+            async with connect(gw.server) as client:
+                return (await client.read_resource("policy://refunds")).contents[0].text
+
+    assert run(main) == "refunds within 30 days"
+
+
 def test_failed_calls_stay_unbound(ledger):
     cap = Capture(ledger)
 

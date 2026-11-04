@@ -20,10 +20,11 @@ Store and record IDs
     ID). Returning ``None`` falls back to the call ID.
 
 Reads and writes
-    A tool annotated ``readOnlyHint: true`` (as listed by ``list_tools``) or
-    named in ``read_only`` is a read; every other tool is a write. Unknown
-    tools are writes: recording a write for a read costs one row, while
-    missing a write breaks lineage.
+    A tool named in ``read_only``, or annotated ``readOnlyHint: true`` (as
+    listed by ``list_tools``) and not named in ``writes``, is a read; every
+    other tool is a write. ``writes`` overrides a server's hint, which is
+    the server's claim, not a guarantee. Unknown tools are writes: recording
+    a write for a read costs one row, while missing a write breaks lineage.
 
     - ``read_resource(uri)`` adds ``(store, uri)`` to the scope's context as
       ``retrieved_in_scope``: the harness, not the model, decides whether the
@@ -115,10 +116,15 @@ class _Recorder:
         read_only: Iterable[str] = (),
         record_id: Optional[RecordIdFn] = None,
         deleted: Optional[DeletedFn] = None,
+        writes: Iterable[str] = (),
     ) -> None:
         self.capture = capture
         self.store = store_name(server)
         self.read_only = set(read_only)
+        self.writes = set(writes)
+        overlap = self.read_only & self.writes
+        if overlap:
+            raise ValueError(f"tools both read_only and writes: {sorted(overlap)}")
         self.annotated_read_only: set = set()
         self.record_id = record_id
         self.deleted = deleted
@@ -137,7 +143,9 @@ class _Recorder:
                     self.annotated_read_only.discard(tool.name)
 
     def is_read(self, tool: str) -> bool:
-        return tool in self.read_only or tool in self.annotated_read_only
+        if tool in self.read_only:
+            return True
+        return tool not in self.writes and tool in self.annotated_read_only
 
     def _key(self):
         key = _scope.current_key()
@@ -232,6 +240,7 @@ def instrument(
     read_only: Iterable[str] = (),
     record_id: Optional[RecordIdFn] = None,
     deleted: Optional[DeletedFn] = None,
+    writes: Iterable[str] = (),
 ) -> Any:
     """Wrap ``session``'s ``call_tool``, ``read_resource`` and ``list_tools``
     in place; see the module docs. ``session`` is an ``mcp.ClientSession``
@@ -243,7 +252,7 @@ def instrument(
     for name in ("call_tool", "read_resource", "list_tools"):
         if not callable(getattr(session, name, None)):
             raise TypeError(f"{type(session).__name__} has no {name}() to wrap")
-    rec = _Recorder(capture, server, read_only, record_id, deleted)
+    rec = _Recorder(capture, server, read_only, record_id, deleted, writes)
     orig_call, orig_read, orig_list = session.call_tool, session.read_resource, session.list_tools
 
     async def call_tool(name, arguments=None, *args, **kwargs):
@@ -346,6 +355,9 @@ class Gateway:
             from mcp.server.lowlevel.helper_types import ReadResourceContents
 
             s = self._resources.get(str(uri))
+            if s is None:
+                await list_resources()  # a client may read a URI it didn't list
+                s = self._resources.get(str(uri))
             if s is None:
                 raise McpError(types.ErrorData(code=RESOURCE_NOT_FOUND,
                                                message=f"Resource not found: {uri}"))
