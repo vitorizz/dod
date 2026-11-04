@@ -42,6 +42,7 @@ pip install -e ".[anthropic]"   # Anthropic memory tool (anthropic==1.12.1)
 pip install -e ".[crewai,langgraph]"   # both, for the quickstart
 pip install -e ".[otel]"        # OpenTelemetry export (opentelemetry-api/sdk==1.45.1)
 pip install -e ".[mcp]"         # MCP client sessions and gateway (mcp==1.28.1)
+pip install -e ".[pydantic_ai]" # Pydantic AI tool calls (pydantic-ai-slim==2.66.0)
 ```
 
 The core library has no dependencies; integrations are optional extras.
@@ -142,6 +143,15 @@ await gateway.run_stdio()
 ```
 
 Each server is a store (`mcp:<server>`). Tools annotated `readOnlyHint` are reads: their result is recorded as an item (source `tool`) and enters the context `in_prompt`, so what the model writes from it traces back to the call. Every other tool is a write, recorded before the call and bound after it succeeds (to the ID `record_id` returns, or the call's own). Resource reads are context items keyed by URI; quarantined resources read as "not found". Through the gateway, each client connection is one unit of work, unless a request names its own with `_meta` keys `dod/agent_id` and `dod/task_id`.
+## Pydantic AI
+Pydantic AI agents remember through tools and through the message history passed back into each run. Wrap the agent's toolset:
+from pydantic_ai import Agent
+from dod.integrations.pydantic_ai import CaptureToolset
+tools = CaptureToolset(my_toolset, cap, read_only=["lookup_customer"],
+                       passthrough=["remember"],  # writes to an instrumented store
+                       record_id=lambda tool, args, result: result.get("id"))
+agent = Agent(model, toolsets=[tools])
+Each run is a unit of work. Read tools' results are recorded as items, and every read result still in the message history, including from earlier runs, is a parent (`in_prompt`) of the run's writes. Other tools are writes, recorded before the call and bound after it. `passthrough` tools are only scoped, so stores they use through another dod integration link to the run's context.
 ## LangGraph agents
 `langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
 from dod.integrations import langgraph, langgraph_graph
@@ -223,9 +233,10 @@ Supported:
 - **LangGraph graphs** (langgraph 1.2.14): `invoke`/`ainvoke`/`stream`/`astream` scoped per thread; input, node updates and loaded thread state as `langgraph_state` items.
 - `reconcile`: finds writes, edits and deletions made outside capture, in all three stores.
 - **MCP** (mcp 1.28.1): `ClientSession` `call_tool`, `read_resource` and `list_tools`, and a proxying `Gateway` server.
+- **Pydantic AI** (pydantic-ai-slim 2.66.0): any toolset, through `CaptureToolset`, with message history as context across runs.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
 
-Next: more integrations (LangGraph agents, Pydantic AI).
+Next: more integrations (other frameworks, more MCP-reachable stores).
 
 ## Demo
 
