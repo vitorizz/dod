@@ -152,6 +152,13 @@ tools = CaptureToolset(my_toolset, cap, read_only=["lookup_customer"],
                        record_id=lambda tool, args, result: result.get("id"))
 agent = Agent(model, toolsets=[tools])
 Each run is a unit of work. Read tools' results are recorded as items, and every read result still in the message history, including from earlier runs, is a parent (`in_prompt`) of the run's writes. Other tools are writes, recorded before the call and bound after it. `passthrough` tools are only scoped, so stores they use through another dod integration link to the run's context.
+## LangGraph agents
+`langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
+from dod.integrations import langgraph, langgraph_graph
+store = langgraph.instrument(InMemoryStore(), cap)
+app = langgraph_graph.instrument_graph(builder.compile(checkpointer=saver, store=store), cap)
+app.invoke({"messages": [user_msg]}, {"configurable": {"thread_id": "ana"}})
+Every run is scoped to `(graph name, thread_id)`, so no `agent_task_scope` is needed around it. Each state channel of a thread is an item (`langgraph_state`): the run's input is recorded with source `user`, each node's update as a write, and the thread's saved state is context for the run. A memory a node writes to the store then traces back to the user message it came from.
 
 ## Reconcile
 
@@ -223,12 +230,13 @@ Supported:
 - **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`).
 - **Anthropic memory tool** (anthropic 1.12.1, `memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and `clear_all_memory`, on `BetaAbstractMemoryTool`/`BetaAsyncAbstractMemoryTool` subclasses that keep the default `call` (such as `BetaLocalFilesystemMemoryTool`). A viewed file is an `in_prompt` parent; the record ID is the memory path.
 - `trace`, `blast_radius`, quarantine/release, `excise` (quarantine or delete) and `regenerate` (callback rewrite), across all three stores through one ledger.
+- **LangGraph graphs** (langgraph 1.2.14): `invoke`/`ainvoke`/`stream`/`astream` scoped per thread; input, node updates and loaded thread state as `langgraph_state` items.
 - `reconcile`: finds writes, edits and deletions made outside capture, in all three stores.
 - **MCP** (mcp 1.28.1): `ClientSession` `call_tool`, `read_resource` and `list_tools`, and a proxying `Gateway` server.
 - **Pydantic AI** (pydantic-ai-slim 2.66.0): any toolset, through `CaptureToolset`, with message history as context across runs.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
 
-Next: more integrations (LangGraph agents).
+Next: more integrations (other frameworks, more MCP-reachable stores).
 
 ## Demo
 
