@@ -56,6 +56,12 @@ Quarantine
 
 Store
     All calls go to one store, ``store`` (default ``"pydantic_ai"``).
+
+Excision and reconciliation
+    There is no ``DeleteAdapter`` or ``ReconcileAdapter``: the records live
+    in whatever systems the tools reach. Quarantine needs no adapter, and
+    stores used through another dod integration (``passthrough`` tools) have
+    their own adapters.
 """
 
 import json

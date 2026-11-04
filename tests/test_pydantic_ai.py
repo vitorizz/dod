@@ -176,6 +176,20 @@ def test_quarantined_results_leave_the_context(ledger):
     assert trace(ledger, S, "T1").edges == []
 
 
+def test_raising_callbacks_fall_back_and_never_fail_the_call(ledger, caplog):
+    def boom(tool, args, result):
+        raise RuntimeError("callback bug")
+
+    model, _ = scripted(("create_ticket", {"text": "x"}))
+    agent = Agent(model, toolsets=[CaptureToolset(tools(), Capture(ledger), record_id=boom,
+                                                  deleted=boom)])
+    assert agent.run_sync("go").output == "done"
+    (only,) = bound(ledger)
+    assert only[0].endswith(":c0")  # fell back to the call ID
+    assert "record_id('create_ticket') failed" in caplog.text
+    assert "deleted('create_ticket') failed" in caplog.text
+
+
 def test_bad_arguments(ledger):
     with pytest.raises(TypeError):
         CaptureToolset(tools(), object())
