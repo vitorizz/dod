@@ -40,6 +40,7 @@ pip install -e ".[langgraph]"   # LangGraph Store (langgraph==1.2.14)
 pip install -e ".[anthropic]"   # Anthropic memory tool (anthropic==1.12.1)
 pip install -e ".[crewai,langgraph]"   # both, for the quickstart
 pip install -e ".[otel]"        # OpenTelemetry export (opentelemetry-api/sdk==1.45.1)
+pip install -e ".[pydantic_ai]" # Pydantic AI tool calls (pydantic-ai-slim==2.66.0)
 ```
 
 The core library has no dependencies; integrations are optional extras.
@@ -124,6 +125,22 @@ with tracer.start_as_current_span("agent-step"):
 
 Attributes are IDs, hashes and tags only (`dod.write.id`, `dod.write.content_hash`, `dod.parents.store`/`record_id`/`tag`, ...; see `dod/export/otel.py`), never memory content, and never `gen_ai.*` names. The observer only calls the OpenTelemetry API: where the data goes is decided by your own SDK and exporter configuration, and without one nothing is sent. Observers run after the ledger commit; one that raises is logged and never breaks capture.
 
+## Pydantic AI
+
+Pydantic AI agents remember through tools and through the message history passed back into each run. Wrap the agent's toolset:
+
+```python
+from pydantic_ai import Agent
+from dod.integrations.pydantic_ai import CaptureToolset
+
+tools = CaptureToolset(my_toolset, cap, read_only=["lookup_customer"],
+                       passthrough=["remember"],  # writes to an instrumented store
+                       record_id=lambda tool, args, result: result.get("id"))
+agent = Agent(model, toolsets=[tools])
+```
+
+Each run is a unit of work. Read tools' results are recorded as items, and every read result still in the message history, including from earlier runs, is a parent (`in_prompt`) of the run's writes. Other tools are writes, recorded before the call and bound after it. `passthrough` tools are only scoped, so stores they use through another dod integration link to the run's context.
+
 ## Reconcile
 
 Capture only sees writes that go through an instrumented call. `reconcile` checks that nothing else changed your stores. It reads each store, compares it with the ledger, and reports every item they disagree on:
@@ -174,6 +191,7 @@ Supported:
 - **Anthropic memory tool** (anthropic 1.12.1, `memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and `clear_all_memory`, on `BetaAbstractMemoryTool`/`BetaAsyncAbstractMemoryTool` subclasses that keep the default `call` (such as `BetaLocalFilesystemMemoryTool`). A viewed file is an `in_prompt` parent; the record ID is the memory path.
 - `trace`, `blast_radius`, quarantine/release, and `excise` (quarantine or delete), across all three stores through one ledger.
 - `reconcile`: finds writes, edits and deletions made outside capture, in all three stores.
+- **Pydantic AI** (pydantic-ai-slim 2.66.0): any toolset, through `CaptureToolset`, with message history as context across runs.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
 
 Next: regenerate (rewrite derived items without the bad parent) and more integrations (LangGraph agents, Pydantic AI, an MCP gateway).
