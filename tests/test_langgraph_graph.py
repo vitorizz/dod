@@ -68,6 +68,25 @@ def sources(ledger):
             " JOIN writes w ON w.write_id = b.write_id ORDER BY b.rowid").fetchall()
 
 
+def bound(ledger, store, record_id):
+    """``(write_id, source)`` of each write bound to an item, in order."""
+    with ledger._lock:
+        return ledger._conn.execute(
+            "SELECT w.write_id, w.source FROM bindings b JOIN writes w"
+            " ON w.write_id = b.write_id WHERE b.store = ? AND b.record_id = ?"
+            " ORDER BY b.rowid", (store, record_id)).fetchall()
+
+
+def parents(ledger, write_id, direct=False):
+    """A write's ``(store, record_id, tag)`` parents: direct ones (a
+    compaction's replaced item) or all, context included."""
+    table = "direct_parents" if direct else "parents"
+    with ledger._lock:
+        return set(ledger._conn.execute(
+            f"SELECT parent_store, parent_record_id, tag FROM {table} WHERE write_id = ?",
+            (write_id,)).fetchall())
+
+
 def test_store_write_in_a_node_traces_to_the_user_input(ledger):
     cap = Capture(ledger)
     seen = []
@@ -90,12 +109,36 @@ def test_later_runs_load_the_thread_state_as_context(ledger):
     cap = Capture(ledger)
     app, _ = build(cap)
     app.invoke({"messages": ["bad fact"]}, cfg())
-    first_input = [w for w in sources(ledger) if w[2] == "user"]
     app.invoke({"messages": ["second"]}, cfg())
-    # The second input overwrites the channel: a compaction of the first.
+    msgs = bound(ledger, STATE, item("messages"))
+    notes = bound(ledger, STATE, item("note"))
+    facts = bound(ledger, "langgraph", langgraph.record_id(NS, "fact"))
+    # messages: run 1 input, run 1 node update, run 2 input, run 2 node update.
+    assert [s for _, s in msgs] == ["user", "agent_inference"] * 2
+    assert len(notes) == 2 and len(facts) == 2  # one per run
+    run1_input, run1_update, run2_input, _ = (w for w, _ in msgs)
+    # Overwriting a channel already in context is a compaction of it: a
+    # direct parent, within a run (node update after the input) ...
+    assert parents(ledger, run1_update, direct=True) == {
+        (STATE, item("messages"), "in_prompt")}
+    # ... and across runs, where the channel is only in context because the
+    # thread's saved state was loaded when run 2 started.
+    assert parents(ledger, run2_input, direct=True) == {
+        (STATE, item("messages"), "in_prompt")}
+    assert parents(ledger, run1_input) == set()  # nothing loaded on a new thread
+    # The saved state is run 2's starting context: `note`, written by run 1's
+    # node and not yet by run 2's when it writes to the store, is a parent of
+    # that store write in run 2 (and not of run 1's).
+    assert (STATE, item("note"), "retrieved_in_scope") in parents(ledger, facts[1][0])
+    assert (STATE, item("note")) not in {(s, r) for s, r, _ in parents(ledger, facts[0][0])}
+    # So run 2's fact traces back through `note` to run 1's write of it, and
+    # the bad first input reaches run 2's fact.
+    t = trace(ledger, "langgraph", langgraph.record_id(NS, "fact"))
+    note_edges = [e for e in t.edges if e.child_write_id == facts[1][0]
+                  and (e.parent_store, e.parent_record_id) == (STATE, item("note"))]
+    assert notes[0][0] in {e.parent_write_id for e in note_edges}
     b = blast_radius(ledger, STATE, item("messages"))
-    assert b.store_counts.get("langgraph", 0) >= 1
-    assert len(first_input) == 1
+    assert facts[1][0] in {w.write_id for w in b.descendants}
 
 
 def test_threads_are_separate(ledger):
