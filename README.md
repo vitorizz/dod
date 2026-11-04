@@ -41,6 +41,7 @@ pip install -e ".[langgraph]"   # LangGraph Store (langgraph==1.2.14)
 pip install -e ".[anthropic]"   # Anthropic memory tool (anthropic==1.12.1)
 pip install -e ".[crewai,langgraph]"   # both, for the quickstart
 pip install -e ".[otel]"        # OpenTelemetry export (opentelemetry-api/sdk==1.45.1)
+pip install -e ".[mcp]"         # MCP client sessions and gateway (mcp==1.28.1)
 ```
 
 The core library has no dependencies; integrations are optional extras.
@@ -125,6 +126,23 @@ with tracer.start_as_current_span("agent-step"):
 
 Attributes are IDs, hashes and tags only (`dod.write.id`, `dod.write.content_hash`, `dod.parents.store`/`record_id`/`tag`, ...; see `dod/export/otel.py`), never memory content, and never `gen_ai.*` names. The observer only calls the OpenTelemetry API: where the data goes is decided by your own SDK and exporter configuration, and without one nothing is sent. Observers run after the ledger commit; one that raises is logged and never breaks capture.
 
+## MCP
+
+Agents increasingly write through MCP tools (tickets, CRM records, documents) rather than a memory store. `dod.integrations.mcp` captures those calls, either by instrumenting a `ClientSession` your harness owns or by running a gateway in front of your MCP servers, so any MCP client is captured without changes:
+
+```python
+from dod.integrations import mcp
+
+# In your harness:
+mcp.instrument(session, cap, "crm", record_id=lambda tool, args, result: ...)
+
+# Or as a proxy: clients connect to the gateway; tools appear as crm__<tool>.
+gateway = mcp.Gateway(cap, {"crm": crm_session, "docs": docs_session})
+await gateway.run_stdio()
+```
+
+Each server is a store (`mcp:<server>`). Tools annotated `readOnlyHint` are reads: their result is recorded as an item (source `tool`) and enters the context `in_prompt`, so what the model writes from it traces back to the call. Every other tool is a write, recorded before the call and bound after it succeeds (to the ID `record_id` returns, or the call's own). Resource reads are context items keyed by URI; quarantined resources read as "not found". Through the gateway, each client connection is one unit of work, unless a request names its own with `_meta` keys `dod/agent_id` and `dod/task_id`.
+
 ## Reconcile
 
 Capture only sees writes that go through an instrumented call. `reconcile` checks that nothing else changed your stores. It reads each store, compares it with the ledger, and reports every item they disagree on:
@@ -196,9 +214,10 @@ Supported:
 - **Anthropic memory tool** (anthropic 1.12.1, `memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and `clear_all_memory`, on `BetaAbstractMemoryTool`/`BetaAsyncAbstractMemoryTool` subclasses that keep the default `call` (such as `BetaLocalFilesystemMemoryTool`). A viewed file is an `in_prompt` parent; the record ID is the memory path.
 - `trace`, `blast_radius`, quarantine/release, `excise` (quarantine or delete) and `regenerate` (callback rewrite), across all three stores through one ledger.
 - `reconcile`: finds writes, edits and deletions made outside capture, in all three stores.
+- **MCP** (mcp 1.28.1): `ClientSession` `call_tool`, `read_resource` and `list_tools`, and a proxying `Gateway` server.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
 
-Next: more integrations (LangGraph agents, Pydantic AI, an MCP gateway).
+Next: more integrations (LangGraph agents, Pydantic AI).
 
 ## Demo
 
