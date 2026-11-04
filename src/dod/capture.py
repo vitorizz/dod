@@ -202,8 +202,9 @@ class Capture:
         ]
         with self._lock:
             ctx = self._context.get(key)
-            parents = [(s, r, t) for (s, r), t in ctx.items()] if ctx else []
-            ids = [w for w, _, _ in binds]
+            # Only new writes take the context; a bind-only batch skips the copy.
+            parents = [(s, r, t) for (s, r), t in ctx.items()] if ctx and writes else []
+            ids =[w for w, _, _ in binds]
             if len(set(ids)) != len(ids) or any(w in self._binding for w in ids):
                 raise KeyError(f"bind already in progress for one of {ids!r}")
             bindings = [(w, self._pending[w], r, h) for w, r, h in binds]

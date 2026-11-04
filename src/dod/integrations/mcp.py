@@ -51,7 +51,9 @@ Scoping
     ``("mcp-client", <connection id>)``, kept for the connection's lifetime
     and cleared when the connection's session is garbage-collected. A client
     can name its own unit per request with ``_meta`` keys ``dod/agent_id``
-    and ``dod/task_id``.
+    and ``dod/task_id``. A connection's context is not capped: every call
+    adds an item, and each later write's cost grows with it (p99 < 1 ms
+    benchmarked to 500 items), so name long-running units via ``_meta``.
 
 Quarantine
     Reading a quarantined resource raises ``McpError`` with the
