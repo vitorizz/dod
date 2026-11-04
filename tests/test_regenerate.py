@@ -206,6 +206,13 @@ def test_then_delete_removes_old_targets_through_adapters(path, ledger, chain):
     assert reasons == [("excision",)]
 
 
+def test_an_existing_record_is_not_a_replacement(ledger, chain):
+    cap, mem, bad, good, d1, d2, g1 = chain
+    r = dod.regenerate(ledger, "crewai", bad.id, lambda task: ("crewai", g1.id))
+    assert all("existed before" in f.reason for f in r.failed) and r.replaced == {}
+    assert ("crewai", g1.id) not in ledger.quarantined()
+
+
 def test_bad_arguments(path, ledger, chain):
     cap, mem, bad, *_ = chain
     before = dict(mem._storage.records)
@@ -229,9 +236,15 @@ def test_cycles_are_broken_and_every_item_is_visited(ledger, chain):
         mem.results["q4"] = [d2]
         mem.recall("q4")
         mem.update(d1.id, "avoid Thai and Italian")
-    r = dod.regenerate(ledger, "crewai", bad.id, rewriter(mem))
+    log = []
+    r = dod.regenerate(ledger, "crewai", bad.id, rewriter(mem, log))
     assert sorted(t.record_id for t in r.tasks) == sorted([d1.id, d2.id])
     assert len(r.replaced) == 2 and r.failed == []
+    # The first task visited sees its cycle partner as dropped (not yet rewritten).
+    first_rid, first_parents, _ = log[0]
+    partner = d2.id if first_rid == d1.id else d1.id
+    assert ("crewai", partner) in {(p.store, p.record_id) for p in first_parents}
+    assert {p.status for p in first_parents if p.record_id == partner} == {"dropped"}
 
 
 def test_across_stores(ledger):

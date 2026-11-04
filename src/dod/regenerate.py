@@ -29,7 +29,8 @@ Steps:
    have no contaminated direct parent. Its parents are then clean by
    induction: every other parent is outside the blast radius, or a
    replacement checked the same way. A replacement that fails the check
-   (not captured, written in place over a target, or derived from a target)
+   (not captured, an existing record, written in place over a target, or
+   derived from a target)
    is quarantined too and reported in ``failed``; so is a callback that
    raises. Later tasks see that item as ``dropped``.
 4. ``then="delete"`` deletes the old targets through their stores' delete
@@ -182,6 +183,8 @@ def regenerate(
     if dry_run:
         return result
 
+    with ledger._lock:
+        (start,) = ledger._conn.execute("SELECT coalesce(max(seq), 0) FROM writes").fetchone()
     # Quarantine every old target first: no rewrite can retrieve one.
     shim = ExciseResult(store, record_id, "quarantine", False, result.targets)
     _quarantine(ledger, old, shim)
@@ -201,11 +204,13 @@ def regenerate(
             lost.add(task.item)
             continue
         new = (str(new[0]), str(new[1]))
-        problem = _check(ledger, new, contaminated)
+        problem = _check(ledger, new, contaminated, start)
         if problem:
             result.failed.append(Failed(*task.item, problem))
             lost.add(task.item)
-            if new not in contaminated:
+            # A refused new record is quarantined; an existing one (outside
+            # the targets) is someone else's and is left alone.
+            if new not in contaminated and "existed before" not in problem:
                 ledger.quarantine([new], reason="failed regeneration of " + repr(task.item))
             continue
         result.replaced[task.item] = new
@@ -313,19 +318,23 @@ def _parents(ledger: Ledger, write_ids: List[str]) -> Dict[str, List[Tuple[str, 
     return out
 
 
-def _check(ledger: Ledger, new: Item, contaminated: set) -> Optional[str]:
-    """Why ``new`` isn't a clean replacement, or None if it is."""
+def _check(ledger: Ledger, new: Item, contaminated: set, start: int) -> Optional[str]:
+    """Why ``new`` isn't a clean replacement, or None if it is. ``start`` is
+    the last write ``seq`` before this call: a replacement must be written
+    by it, not an existing record."""
     if new in contaminated:
         return f"replacement {new!r} is a target (rewrite as a new record, not in place)"
     with ledger._lock:
         row = ledger._conn.execute(
-            "SELECT write_id FROM bindings WHERE store = ? AND record_id = ?"
-            " ORDER BY rowid DESC LIMIT 1",
+            "SELECT b.write_id, w.seq FROM bindings b JOIN writes w ON w.write_id = b.write_id"
+            " WHERE b.store = ? AND b.record_id = ? ORDER BY b.rowid DESC LIMIT 1",
             new,
         ).fetchone()
     if row is None:
         return (f"replacement {new!r} has no recorded write"
                 " (write it through an instrumented store)")
+    if row[1] <= start:
+        return f"replacement {new!r} existed before regenerate (write a new record)"
     for s, r, _ in _parents(ledger, [row[0]]).get(row[0], ()):
         if (s, r) in contaminated:
             return f"replacement {new!r} was derived from target {(s, r)!r}"
