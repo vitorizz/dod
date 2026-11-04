@@ -124,6 +124,20 @@ with tracer.start_as_current_span("agent-step"):
 
 Attributes are IDs, hashes and tags only (`dod.write.id`, `dod.write.content_hash`, `dod.parents.store`/`record_id`/`tag`, ...; see `dod/export/otel.py`), never memory content, and never `gen_ai.*` names. The observer only calls the OpenTelemetry API: where the data goes is decided by your own SDK and exporter configuration, and without one nothing is sent. Observers run after the ledger commit; one that raises is logged and never breaks capture.
 
+## LangGraph agents
+
+`langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
+
+```python
+from dod.integrations import langgraph, langgraph_graph
+
+store = langgraph.instrument(InMemoryStore(), cap)
+app = langgraph_graph.instrument_graph(builder.compile(checkpointer=saver, store=store), cap)
+app.invoke({"messages": [user_msg]}, {"configurable": {"thread_id": "ana"}})
+```
+
+Every run is scoped to `(graph name, thread_id)`, so no `agent_task_scope` is needed around it. Each state channel of a thread is an item (`langgraph_state`): the run's input is recorded with source `user`, each node's update as a write, and the thread's saved state is context for the run. A memory a node writes to the store then traces back to the user message it came from.
+
 ## Reconcile
 
 Capture only sees writes that go through an instrumented call. `reconcile` checks that nothing else changed your stores. It reads each store, compares it with the ledger, and reports every item they disagree on:
@@ -172,6 +186,7 @@ Supported:
 - **CrewAI 1.15.22** `Memory`: `recall`, `remember`, `remember_many`, `update`, `forget`, `reset`, `reset_all`, and consolidation on save. Rewrites are recorded as compactions; every deleted record gets an append-only tombstone, so `trace` and `blast_radius` report what was deleted and why.
 - **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`).
 - **Anthropic memory tool** (anthropic 1.12.1, `memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and `clear_all_memory`, on `BetaAbstractMemoryTool`/`BetaAsyncAbstractMemoryTool` subclasses that keep the default `call` (such as `BetaLocalFilesystemMemoryTool`). A viewed file is an `in_prompt` parent; the record ID is the memory path.
+- **LangGraph graphs** (langgraph 1.2.14): `invoke`/`ainvoke`/`stream`/`astream` scoped per thread; input, node updates and loaded thread state as `langgraph_state` items.
 - `trace`, `blast_radius`, quarantine/release, and `excise` (quarantine or delete), across all three stores through one ledger.
 - `reconcile`: finds writes, edits and deletions made outside capture, in all three stores.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
