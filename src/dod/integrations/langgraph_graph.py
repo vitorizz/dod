@@ -264,8 +264,7 @@ def instrument_graph(graph: Any, capture: Capture, store: str = "langgraph_state
         return call
 
     def wrap_stream(orig):
-        @functools.wraps(orig)
-        def stream(*args, **kwargs):
+        def body(*args, **kwargs):
             if id(graph) in _active.get():
                 yield from orig(*args, **kwargs)
                 return
@@ -275,6 +274,25 @@ def instrument_graph(graph: Any, capture: Capture, store: str = "langgraph_state
                 yield from orig(*args, **kwargs)
             finally:
                 leave()
+
+        @functools.wraps(orig)
+        def stream(*args, **kwargs):
+            # A generator runs in its caller's context, so the scope and
+            # ``_active`` it sets would leak to the caller between chunks: a
+            # run started while this one is suspended would take this run's
+            # key and context. Each step runs in the stream's own copy of
+            # the context instead.
+            ctx = contextvars.copy_context()
+            gen = body(*args, **kwargs)
+            try:
+                while True:
+                    try:
+                        chunk = ctx.run(next, gen)
+                    except StopIteration:
+                        return
+                    yield chunk
+            finally:
+                ctx.run(gen.close)
         return stream
 
     def wrap_astream(orig):

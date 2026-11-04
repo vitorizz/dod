@@ -86,16 +86,132 @@ def test_store_write_in_a_node_traces_to_the_user_input(ledger):
     assert cap._context == {}  # the run's scope was cleared
 
 
+def writes_for(ledger, store, record_id, source=None):
+    """Write IDs bound to an item, in order (optionally of one source)."""
+    sql = ("SELECT w.write_id FROM bindings b JOIN writes w ON w.write_id = b.write_id"
+           " WHERE b.store = ? AND b.record_id = ?")
+    args = [store, record_id]
+    if source is not None:
+        sql += " AND w.source = ?"
+        args.append(source)
+    with ledger._lock:
+        return [r[0] for r in ledger._conn.execute(sql + " ORDER BY b.rowid", args)]
+
+
+def parents_of(ledger, store, record_id, write_id):
+    """``{(parent store, parent record, tag)}`` of one write of an item."""
+    t = trace(ledger, store, record_id)
+    return {(e.parent_store, e.parent_record_id, e.tag)
+            for e in t.edges if e.child_write_id == write_id}
+
+
 def test_later_runs_load_the_thread_state_as_context(ledger):
     cap = Capture(ledger)
     app, _ = build(cap)
     app.invoke({"messages": ["bad fact"]}, cfg())
-    first_input = [w for w in sources(ledger) if w[2] == "user"]
     app.invoke({"messages": ["second"]}, cfg())
-    # The second input overwrites the channel: a compaction of the first.
-    b = blast_radius(ledger, STATE, item("messages"))
-    assert b.store_counts.get("langgraph", 0) >= 1
-    assert len(first_input) == 1
+    first, second = writes_for(ledger, STATE, item("messages"), "user")
+    # The second input overwrites the channel: a compaction of its last value.
+    p = parents_of(ledger, STATE, item("messages"), second)
+    assert (STATE, item("messages"), "in_prompt") in p
+    # The thread's saved channels, loaded by get_state, are its context.
+    assert (STATE, item("note"), "retrieved_in_scope") in p
+    # Run 2's store write takes the loaded state as parents: `note` was only
+    # written by run 1's node, so it reaches run 2 through get_state alone.
+    fact = langgraph.record_id(NS, "fact")
+    _, fact2 = writes_for(ledger, "langgraph", fact)
+    assert (STATE, item("note"), "retrieved_in_scope") in parents_of(
+        ledger, "langgraph", fact, fact2)
+    # And the bad first input reaches run 2's write.
+    assert fact2 in {w.write_id for w in blast_radius(ledger, STATE, item("messages")).descendants}
+
+
+def test_a_failed_state_read_is_logged_and_the_run_continues(ledger, caplog):
+    cap = Capture(ledger)
+    app, _ = build(cap)
+    app.invoke({"messages": ["first"]}, cfg())
+
+    def broken(config, *a, **k):
+        raise RuntimeError("checkpointer down")
+
+    object.__setattr__(app, "get_state", broken)
+    out = app.invoke({"messages": ["second"]}, cfg())
+    assert out["messages"][-1] == "noted"
+    assert "couldn't read the thread's state" in caplog.text
+    _, second = writes_for(ledger, STATE, item("messages"), "user")
+    p = parents_of(ledger, STATE, item("messages"), second)
+    assert (STATE, item("note"), "retrieved_in_scope") not in p
+    assert cap._context == {}
+
+
+def test_interleaved_streams_do_not_share_a_scope(ledger):
+    cap = Capture(ledger)
+    seen = []
+    app, _ = build(cap, seen=seen)
+    a = app.stream({"messages": ["a"]}, cfg("t1"))
+    next(a)  # t1 is suspended mid-run, inside its scope
+    assert current_key() is None  # ... which doesn't leak to the caller
+    list(app.stream({"messages": ["b"]}, cfg("t2")))
+    list(a)
+    assert sorted(seen) == [("bot", "t1"), ("bot", "t2")]
+    # t2 recorded its own state, and its store write has only t2 parents.
+    assert (STATE, item("messages", "t2"), "user") in sources(ledger)
+    fact = langgraph.record_id(NS, "fact")
+    for w in writes_for(ledger, "langgraph", fact):
+        threads = {json.loads(r)[0] for s, r, _ in parents_of(ledger, "langgraph", fact, w)
+                   if s == STATE}
+        assert len(threads) == 1
+    assert cap._context == {}
+
+
+@pytest.mark.parametrize("how", ["keyword", "list", "manager"])
+def test_config_forms_and_user_callbacks(ledger, how):
+    from langchain_core.callbacks import BaseCallbackHandler, CallbackManager
+
+    class Count(BaseCallbackHandler):
+        def __init__(self):
+            self.starts = 0
+
+        def on_chain_start(self, *a, **k):
+            self.starts += 1
+
+    cap = Capture(ledger)
+    app, _ = build(cap)
+    mine = Count()
+    config = cfg()
+    if how == "list":
+        config["callbacks"] = [mine]
+    elif how == "manager":
+        config["callbacks"] = CallbackManager([mine])
+    if how == "keyword":
+        app.invoke({"messages": ["hi"]}, config=config)
+    else:
+        app.invoke({"messages": ["hi"]}, config)
+        assert mine.starts > 0  # the caller's handler still runs
+        assert config["callbacks"] == [mine] or how == "manager"  # not mutated
+    rows = sources(ledger)
+    assert (STATE, item("messages"), "user") in rows
+    assert (STATE, item("note"), "agent_inference") in rows
+
+
+def test_non_dict_updates_are_not_recorded(ledger):
+    from langgraph.types import Command
+
+    cap = Capture(ledger)
+
+    def cmd(state):
+        return Command(update={"note": "via command"})
+
+    g = StateGraph(S)
+    g.add_node("cmd", cmd)
+    g.add_edge(START, "cmd")
+    g.add_edge("cmd", END)
+    app = langgraph_graph.instrument_graph(
+        g.compile(checkpointer=InMemorySaver(), name="bot"), cap)
+    out = app.invoke({"messages": ["hi"]}, cfg())
+    assert out["note"] == "via command"
+    # Documented gap: the input is recorded, the Command's update is not.
+    assert sources(ledger) == [(STATE, item("messages"), "user")]
 
 
 def test_threads_are_separate(ledger):
