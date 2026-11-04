@@ -130,7 +130,7 @@ After every push to `main`, `scripts/update-branches.sh` updates each open PR th
 3. A real conflict gets a comment listing the files plus `needs-human`; the label is removed automatically once the conflict is gone.
 
 ## CI
-- `test` installs every integration (`[dev,crewai,langgraph,anthropic,otel,mcp]`) so integration, cross-store, quickstart and demo tests run; `test-core` runs with `[dev]` only to keep the core dependency-free.
+- `test` installs every integration (`[dev,crewai,langgraph,anthropic,otel,mcp,pydantic_ai]`) so integration, cross-store, quickstart and demo tests run; `test-core` runs with `[dev]` only to keep the core dependency-free.
 - Capture-path benchmarks assert p99 < 1 ms (median of 3 rounds). A few worst-case benchmarks sit near 1 ms on slow dev machines and pass on CI's faster runners (#52 tracks the structural fix).
 
 ## Responsibility chart

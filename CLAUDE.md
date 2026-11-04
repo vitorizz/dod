@@ -85,7 +85,7 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 
 ## Test commands
 ```bash
-pip install -e ".[dev,crewai,langgraph,anthropic,otel,mcp]"   # what CI runs: package, test deps, real integrations
+pip install -e ".[dev,crewai,langgraph,anthropic,otel,mcp,pydantic_ai]"   # what CI runs: package, test deps, real integrations
 pip install -e ".[dev]"              # core only (CI also runs this, as test-core)
 pytest -q                            # full suite, including p99 < 1 ms capture benchmarks
 pytest -q tests/test_*_perf.py -s    # benchmarks only, printing p50/p99
@@ -96,17 +96,15 @@ pip install -e ".[dev,langgraph]"    # add LangGraph (InMemoryStore needs no ser
 pytest -q -m langgraph               # LangGraph + cross-store tests (skipped without langgraph)
 pip install -e ".[dev,anthropic]"    # add the Anthropic SDK (memory tool; no API calls in tests)
 pytest -q -m anthropic               # Anthropic memory tool tests (skipped without anthropic)
-pip install -e ".[dev,anthropic]"    # add the Anthropic SDK (memory tool; no API calls in tests)
-pytest -q -m anthropic               # memory tool tests (skipped without anthropic)
 pip install -e ".[dev,otel]"         # add the OpenTelemetry API + SDK (in-memory exporter; no network)
 pytest -q -m otel                    # OTel export tests (skipped without otel)
 pip install -e ".[dev,mcp]"          # add the MCP SDK (in-memory transport; no network)
 pytest -q -m mcp                     # MCP session + gateway tests (skipped without mcp)
-```
-In agent runs, use these exact forms. Don't create a venv or call pip through `python -m`: they are not in the allowed tools and get denied. (`python -m pytest` is allowed.)
-CI's `test` job installs every integration (`crewai`, `langgraph`, `anthropic`, `otel`, `mcp`), so every test runs; `test-core` runs without them to keep the core dependency-free. CrewAI unit tests use a stub mirroring the pinned `Memory` signatures; tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore` (and compiled `StateGraph`s with `InMemorySaver`), are marked `langgraph`, and skip without it. Memory tool tests run `BetaLocalFilesystemMemoryTool` in a temp dir via `tool.call({...})` (no network), are marked `anthropic`, and skip without it. OTel tests use the SDK's `InMemorySpanExporter` with their own `TracerProvider` (never the global one), clear `OTEL_SDK_DISABLED` (which `test_crewai` sets process-wide), are marked `otel`, and skip without it. MCP tests run FastMCP servers over the SDK's in-memory transport (`create_connected_server_and_client_session`) with `anyio.run`, are marked `mcp`, and skip without it. Pydantic AI tests drive real `Agent` runs with a scripted `FunctionModel` (no network), are marked `pydantic_ai`, and skip without it.
 pip install -e ".[dev,pydantic_ai]"  # add Pydantic AI (FunctionModel; no network)
 pytest -q -m pydantic_ai             # Pydantic AI tests (skipped without pydantic-ai-slim)
+```
+In agent runs, use these exact forms. Don't create a venv or call pip through `python -m`: they are not in the allowed tools and get denied. (`python -m pytest` is allowed.)
+CI's `test` job installs every integration (`crewai`, `langgraph`, `anthropic`, `otel`, `mcp`, `pydantic_ai`), so every test runs; `test-core` runs without them to keep the core dependency-free. CrewAI unit tests use a stub mirroring the pinned `Memory` signatures; tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore` (and compiled `StateGraph`s with `InMemorySaver`), are marked `langgraph`, and skip without it. Memory tool tests run `BetaLocalFilesystemMemoryTool` in a temp dir via `tool.call({...})` (no network), are marked `anthropic`, and skip without it. OTel tests use the SDK's `InMemorySpanExporter` with their own `TracerProvider` (never the global one), clear `OTEL_SDK_DISABLED` (which `test_crewai` sets process-wide), are marked `otel`, and skip without it. MCP tests run FastMCP servers over the SDK's in-memory transport (`create_connected_server_and_client_session`) with `anyio.run`, are marked `mcp`, and skip without it. Pydantic AI tests drive real `Agent` runs with a scripted `FunctionModel` (no network), are marked `pydantic_ai`, and skip without it.
 
 ## Workflow
 1. Every change starts as an issue using the agent-task template (Goal / Acceptance criteria / Files involved), sized for one PR. New issues go on the board as Backlog with Priority and Size.
