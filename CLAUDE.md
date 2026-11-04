@@ -21,6 +21,7 @@ Everything else is a query over this graph:
 - `trace <bad_output>`: walk backward to the originating memory
 - `blast-radius <memory_id>`: walk forward to everything derived from it
 - `excise <memory_ids>`: remove the contaminated subgraph, keep the rest
+- `regenerate <memory_id>`: excise, then rebuild each derived item from its clean inputs through a caller callback
 
 ## Positioning (important)
 - **Lineage for long-lived agent context.** Context managers decide what goes into context; we record what came out because of it, and clean only what's contaminated.
@@ -72,16 +73,18 @@ Background in LLM agents with retrieval memory and a precomputed state graph con
 - Python >= 3.9 (CI runs 3.12). Package `dod` in `src/` layout, built with hatchling (`pyproject.toml`).
 - Ledger: stdlib `sqlite3`, append-only, WAL mode. No ORM. The lineage index (integers, for `blast_radius`) lives in a companion file, `<ledger>-lineage`, filled by the ledger's background thread; it is derived, so it is rebuilt (never migrated) when missing, stale or at another `INDEX_VERSION`.
 - Tests: pytest. Benchmarks are plain pytest tests using `tests/perf.py` (p50/p99 via `time.perf_counter_ns`). Bars are CI's; `DOD_PERF_SCALE` (default 1.0) divides measured times so a slower dev machine can scale them, and benchmarks that time themselves multiply their bar by `perf.SCALE`.
-- Framework integrations are optional extras, never core dependencies: `[crewai]` pins `crewai==1.15.22`; `[langgraph]` pins `langgraph==1.2.14` and `langgraph-checkpoint==4.2.0` (where `BaseStore` lives); `[anthropic]` pins `anthropic==1.12.1` (memory tool `memory_20250818`, `anthropic.tools.memory`); `[otel]` pins `opentelemetry-api==1.45.1` and `opentelemetry-sdk==1.45.1` (the SDK for tests).
+- Framework integrations are optional extras, never core dependencies: `[crewai]` pins `crewai==1.15.22`; `[langgraph]` pins `langgraph==1.2.14` and `langgraph-checkpoint==4.2.0` (where `BaseStore` lives); `[anthropic]` pins `anthropic==1.12.1` (memory tool `memory_20250818`, `anthropic.tools.memory`); `[otel]` pins `opentelemetry-api==1.45.1` and `opentelemetry-sdk==1.45.1` (the SDK for tests); `[mcp]` pins `mcp==1.28.1` (the version crewai 1.15.22 requires, so both install together).
 - Exporters are `Capture` observers in `dod.export` (`Capture(ledger, observers=[...])`, called after the ledger commit, failing open). `dod.export.otel.OTelObserver` emits `dod.*` span events only, never `gen_ai.*`.
-- `dod.reconcile.reconcile(ledger, {store: adapter})` checks capture completeness: each integration has a `ReconcileAdapter` (read-only, around capture, `scan()`/`get()`), alongside its `DeleteAdapter` for `dod.excise`. Bindings carry an optional `content_hash` (schema 5) for integrations whose write hash isn't the stored content; the memory tool fills it only with `hash_files=True` (opt-in, off by default).
+- `dod.reconcile.reconcile(ledger, {store: adapter})` checks capture completeness: each integration has a `ReconcileAdapter` (read-only, around capture, `scan()`/`get()`), alongside its `DeleteAdapter` for `dod.excise` (and `dod.regenerate`'s `then="delete"`). Bindings carry an optional `content_hash` (schema 5) for integrations whose write hash isn't the stored content; the memory tool fills it only with `hash_files=True` (opt-in, off by default).
+- `dod.regenerate.regenerate(ledger, store, record_id, rewrite)` quarantines `excise`'s targets, then calls `rewrite(task)` per derived item (parents first, each in its own scope) and checks each returned replacement is a new, captured record with no contaminated direct parent.
+- `dod.integrations.mcp` wraps an MCP `ClientSession` (`instrument`) or proxies upstream sessions as an MCP server (`Gateway`); each server is store `mcp:<server>`. The gateway keys context per client connection (`dod.scope.use_key`, which sets a key without resetting it) unless a request's `_meta` names `dod/agent_id`/`dod/task_id`.
 - `dod.integrations.langgraph_graph.instrument_graph` scopes a compiled graph's runs to `(graph name, thread_id)` and records state channels (store `langgraph_state`): input as `user`, top-level node updates as `agent_inference`, observed with a LangChain callback (synchronous, unlike checkpointer writes); the thread's saved state (`get_state`) is the run's starting context.
 - The context scope (`agent_task_scope`) lives in `dod.scope` and is shared by every integration, so one scope links retrievals and writes across stores.
 - CI and agents: GitHub Actions (`ci.yml`, `claude.yml`, `claude-code-review.yml`, `project-board.yml`, `update-branches.yml`).
 
 ## Test commands
 ```bash
-pip install -e ".[dev,crewai,langgraph,anthropic,otel]"   # what CI runs: package, test deps, real integrations
+pip install -e ".[dev,crewai,langgraph,anthropic,otel,mcp]"   # what CI runs: package, test deps, real integrations
 pip install -e ".[dev]"              # core only (CI also runs this, as test-core)
 pytest -q                            # full suite, including p99 < 1 ms capture benchmarks
 pytest -q tests/test_*_perf.py -s    # benchmarks only, printing p50/p99
@@ -96,9 +99,11 @@ pip install -e ".[dev,anthropic]"    # add the Anthropic SDK (memory tool; no AP
 pytest -q -m anthropic               # memory tool tests (skipped without anthropic)
 pip install -e ".[dev,otel]"         # add the OpenTelemetry API + SDK (in-memory exporter; no network)
 pytest -q -m otel                    # OTel export tests (skipped without otel)
+pip install -e ".[dev,mcp]"          # add the MCP SDK (in-memory transport; no network)
+pytest -q -m mcp                     # MCP session + gateway tests (skipped without mcp)
 ```
 In agent runs, use these exact forms. Don't create a venv or call pip through `python -m`: they are not in the allowed tools and get denied. (`python -m pytest` is allowed.)
-CI's `test` job installs every integration (`crewai`, `langgraph`, `anthropic`, `otel`), so every test runs; `test-core` runs without them to keep the core dependency-free. CrewAI unit tests use a stub mirroring the pinned `Memory` signatures; tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore` (and compiled `StateGraph`s with `InMemorySaver`), are marked `langgraph`, and skip without it. Memory tool tests run `BetaLocalFilesystemMemoryTool` in a temp dir via `tool.call({...})` (no network), are marked `anthropic`, and skip without it. OTel tests use the SDK's `InMemorySpanExporter` with their own `TracerProvider` (never the global one), clear `OTEL_SDK_DISABLED` (which `test_crewai` sets process-wide), are marked `otel`, and skip without it.
+CI's `test` job installs every integration (`crewai`, `langgraph`, `anthropic`, `otel`, `mcp`), so every test runs; `test-core` runs without them to keep the core dependency-free. CrewAI unit tests use a stub mirroring the pinned `Memory` signatures; tests that need the real package are marked `crewai` and skip without it. LangGraph tests run against the real `InMemoryStore`, are marked `langgraph`, and skip without it. Memory tool tests run `BetaLocalFilesystemMemoryTool` in a temp dir via `tool.call({...})` (no network), are marked `anthropic`, and skip without it. OTel tests use the SDK's `InMemorySpanExporter` with their own `TracerProvider` (never the global one), clear `OTEL_SDK_DISABLED` (which `test_crewai` sets process-wide), are marked `otel`, and skip without it. MCP tests run FastMCP servers over the SDK's in-memory transport (`create_connected_server_and_client_session`) with `anyio.run`, are marked `mcp`, and skip without it.
 
 ## Workflow
 1. Every change starts as an issue using the agent-task template (Goal / Acceptance criteria / Files involved), sized for one PR. New issues go on the board as Backlog with Priority and Size.
