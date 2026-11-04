@@ -67,3 +67,19 @@ def reset(key: Key) -> None:
         captures = list(_captures)
     for cap in captures:
         cap.reset(key)
+
+
+@contextmanager
+def use_key(agent_id: Any, task_id: Any) -> Iterator[Key]:
+    """Make ``(agent_id, task_id)`` the current key without resetting it.
+
+    For a unit of work entered many times, such as one MCP connection whose
+    requests arrive one by one: its context accumulates across entries until
+    the owner calls ``reset(key)``. Restores the previous key on exit.
+    """
+    key = (str(agent_id), str(task_id))
+    token = _key.set(key)
+    try:
+        yield key
+    finally:
+        _key.reset(token)
