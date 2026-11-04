@@ -14,6 +14,7 @@ Everything else is a query over that graph:
 - `blast_radius(ledger, store, record_id)` walks forward to everything derived from an item, across stores.
 - `ledger.quarantine(items)` marks items as contaminated (reversible with `ledger.release`); instrumented stores stop returning them, so they can't become parents of new writes.
 - `excise(ledger, store, record_id)` quarantines (default) or, with `mode="delete"`, deletes an item and its whole blast radius across stores, leaving everything else untouched. `dry_run=True` shows the plan first.
+- `regenerate(ledger, store, record_id, rewrite)` excises the same way, then calls your `rewrite(task)` for each derived item, oldest first, so it can be rebuilt from its clean inputs (see below).
 
 ```mermaid
 flowchart LR
@@ -152,6 +153,27 @@ For `unrecorded` and `resurrected` items, `read_into` lists the recorded writes 
 
 Reconcile is read-only. It never records the reads it makes and never changes a store. Each finding is re-checked after `grace` seconds (default 1), so writes still in flight aren't reported. One pass over 100k items takes about a second. Run it on a schedule to keep the capture guarantee checked.
 
+## Regenerate
+
+Excising loses what the agent learned downstream of the bad item, including the parts that were right. `regenerate` keeps them: it quarantines the bad item and everything derived from it, then hands each derived item to your function, parents first. The library never stores content or calls a model, so the rewrite is yours. Write the replacement as a new record through an instrumented store and return its `(store, record_id)`, or `None` to drop it:
+
+```python
+from dod import regenerate
+
+def rewrite(task):
+    # task.parents: each original parent with its status (clean, bad,
+    # replaced, dropped); task.clean_parents(): the inputs you may use.
+    inputs = [memory._storage.get_record(r) for _, r in task.clean_parents()]
+    memory.recall("...")                      # retrievals here become the new parents
+    new = memory.remember(my_llm_rewrite(inputs), scope="/", categories=[], importance=0.5)
+    return ("crewai", new.id)
+
+result = regenerate(ledger, "crewai", root.id, rewrite)
+print(result.replaced, result.dropped, result.failed)
+```
+
+Each rewrite runs in its own `agent_task_scope`, so capture records it with whatever it retrieved as parents. Quarantined items can't be retrieved, so a rewrite can't pick the bad item back up. After each one, the replacement's recorded parents are checked: a replacement that wasn't captured, overwrites an old item in place, or was derived from a target is quarantined and reported in `failed`. Old items stay quarantined (or `then="delete"` deletes them through delete adapters); `dry_run=True` returns the ordered plan.
+
 ## Guarantees
 
 - **Content-free ledger.** The ledger stores IDs, content hashes, edges, and metadata only. Memory content stays in your stores. (`reason` and `actor` on quarantine are stored as you pass them; keep content out of them.)
@@ -172,11 +194,11 @@ Supported:
 - **CrewAI 1.15.22** `Memory`: `recall`, `remember`, `remember_many`, `update`, `forget`, `reset`, `reset_all`, and consolidation on save. Rewrites are recorded as compactions; every deleted record gets an append-only tombstone, so `trace` and `blast_radius` report what was deleted and why.
 - **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`).
 - **Anthropic memory tool** (anthropic 1.12.1, `memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and `clear_all_memory`, on `BetaAbstractMemoryTool`/`BetaAsyncAbstractMemoryTool` subclasses that keep the default `call` (such as `BetaLocalFilesystemMemoryTool`). A viewed file is an `in_prompt` parent; the record ID is the memory path.
-- `trace`, `blast_radius`, quarantine/release, and `excise` (quarantine or delete), across all three stores through one ledger.
+- `trace`, `blast_radius`, quarantine/release, `excise` (quarantine or delete) and `regenerate` (callback rewrite), across all three stores through one ledger.
 - `reconcile`: finds writes, edits and deletions made outside capture, in all three stores.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
 
-Next: regenerate (rewrite derived items without the bad parent) and more integrations (LangGraph agents, Pydantic AI, an MCP gateway).
+Next: more integrations (LangGraph agents, Pydantic AI, an MCP gateway).
 
 ## Demo
 
