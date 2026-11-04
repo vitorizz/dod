@@ -127,6 +127,33 @@ def test_an_existing_scope_is_kept(ledger):
     with agent_task_scope("planner", "task-9"):
         app.invoke({"messages": ["hi"]}, cfg())
     assert seen == [("planner", "task-9")]
+    # State is still recorded, under the caller's scope.
+    with ledger._lock:
+        rows = ledger._conn.execute(
+            "SELECT DISTINCT agent_id, session_id FROM writes WHERE store = ?", (STATE,)
+        ).fetchall()
+    assert rows == [("planner", "task-9")]
+    fact = trace(ledger, "langgraph", langgraph.record_id(NS, "fact"))
+    assert [w.source for w in fact.roots] == ["user"]
+
+
+def test_inside_an_outer_langchain_run(ledger):
+    from langchain_core.runnables import RunnableLambda
+
+    cap = Capture(ledger)
+    app, _ = build(cap)
+    outer = RunnableLambda(lambda x: app.invoke(x, cfg()))
+    outer.invoke({"messages": ["nested"]})
+    assert (STATE, item("messages"), "user") in sources(ledger)
+
+
+def test_abandoned_stream_frees_its_context(ledger):
+    cap = Capture(ledger)
+    app, _ = build(cap)
+    gen = app.stream({"messages": ["s"]}, cfg("s2"))
+    next(gen)
+    gen.close()
+    assert cap._context == {}
 
 
 def test_stream_and_async(ledger):

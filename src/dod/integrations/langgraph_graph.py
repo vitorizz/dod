@@ -17,8 +17,9 @@ Scoping
     ``agent_task_scope(<graph name>, <thread_id>)`` (thread ``"default"``
     without one), so every instrumented store a node uses links its writes
     to the run's context. A call made inside an existing scope (the
-    caller's, or a parent graph's, for a subgraph) keeps that scope. Nodes
-    run in the caller's context, or a copy of it, so the key reaches them.
+    caller's, or a parent graph's, for a subgraph) keeps that scope, and its
+    state is recorded under it. Nodes run in the caller's context, or a copy
+    of it, so the key reaches them.
 
 State
     Each state channel of a thread is an item in store ``store`` (default
@@ -54,6 +55,7 @@ Quarantine and excision
     bad value from a thread, update its state (``update_state``).
 """
 
+import contextvars
 import functools
 import json
 import logging
@@ -69,6 +71,11 @@ __all__ = ["instrument_graph", "record_id"]
 logger = logging.getLogger(__name__)
 
 _MARK = "_dod_instrumented"
+# Graphs (by id) with a wrapped call in progress in this context: invoke
+# calls stream internally, and only the outer call records.
+_active: "contextvars.ContextVar[frozenset]" = contextvars.ContextVar(
+    "dod_langgraph_active", default=frozenset()
+)
 
 
 def record_id(thread_id: Any, checkpoint_ns: str, channel: str) -> str:
@@ -109,7 +116,9 @@ class _StateRecorder(BaseCallbackHandler):
 
     def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None,
                        metadata=None, **kwargs) -> None:
-        if self.root is None and parent_run_id is None:
+        # The handler is added for this call only, so the first chain it
+        # sees is the graph's own run, whatever outer run (if any) it has.
+        if self.root is None:
             self.root = run_id
             self.record(inputs, "user")
         elif parent_run_id is not None and parent_run_id == self.root and (
@@ -182,7 +191,7 @@ def instrument_graph(graph: Any, capture: Capture, store: str = "langgraph_state
             config, where = args[1], "pos"
         c = _configurable(config)
         thread = str(c.get("thread_id", "default"))
-        key = (agent, thread)
+        key = _scope.current_key() or (agent, thread)
         handler = _StateRecorder(capture, store, key, thread, str(c.get("checkpoint_ns", "")))
         config = _with_handler(config, handler)
         if where == "pos":
@@ -192,8 +201,14 @@ def instrument_graph(graph: Any, capture: Capture, store: str = "langgraph_state
         return args, kwargs, key, handler, c
 
     def enter(handler: _StateRecorder, c: dict, key):
-        scope = _scope.agent_task_scope(*key)
-        scope.__enter__()
+        """Enter the run's scope (none if one is already active) and load the
+        thread's state into its context. Returns the function that leaves it."""
+        active = _active.set(_active.get() | {id(graph)})
+        if _scope.current_key() is not None:
+            scope = None
+        else:
+            scope = _scope.agent_task_scope(*key)
+            scope.__enter__()
         if has_saver and "thread_id" in c:
             try:
                 snap = graph.get_state({"configurable": dict(c)})
@@ -205,62 +220,77 @@ def instrument_graph(graph: Any, capture: Capture, store: str = "langgraph_state
             except Exception:
                 logger.exception("dod: couldn't read the thread's state; its channels"
                                  " aren't parents of this run")
-        return scope
+
+        def leave() -> None:
+            try:
+                _active.reset(active)
+            except ValueError:
+                pass  # another context: it ends with the generator anyway
+            if scope is None:
+                return
+            try:
+                scope.__exit__(None, None, None)
+            except ValueError:
+                # A generator closed from another context can't reset the
+                # ContextVar there; the run is over, so just free its context.
+                _scope.reset(key)
+
+        return leave
 
     def wrap_call(orig):
         @functools.wraps(orig)
         def call(*args, **kwargs):
-            if _scope.current_key() is not None:
+            if id(graph) in _active.get():
                 return orig(*args, **kwargs)
             args, kwargs, key, handler, c = prepare(args, kwargs)
-            scope = enter(handler, c, key)
+            leave = enter(handler, c, key)
             try:
                 return orig(*args, **kwargs)
             finally:
-                scope.__exit__(None, None, None)
+                leave()
         return call
 
     def wrap_acall(orig):
         @functools.wraps(orig)
         async def call(*args, **kwargs):
-            if _scope.current_key() is not None:
+            if id(graph) in _active.get():
                 return await orig(*args, **kwargs)
             args, kwargs, key, handler, c = prepare(args, kwargs)
-            scope = enter(handler, c, key)
+            leave = enter(handler, c, key)
             try:
                 return await orig(*args, **kwargs)
             finally:
-                scope.__exit__(None, None, None)
+                leave()
         return call
 
     def wrap_stream(orig):
         @functools.wraps(orig)
         def stream(*args, **kwargs):
-            if _scope.current_key() is not None:
+            if id(graph) in _active.get():
                 yield from orig(*args, **kwargs)
                 return
             args, kwargs, key, handler, c = prepare(args, kwargs)
-            scope = enter(handler, c, key)
+            leave = enter(handler, c, key)
             try:
                 yield from orig(*args, **kwargs)
             finally:
-                scope.__exit__(None, None, None)
+                leave()
         return stream
 
     def wrap_astream(orig):
         @functools.wraps(orig)
         async def astream(*args, **kwargs):
-            if _scope.current_key() is not None:
+            if id(graph) in _active.get():
                 async for chunk in orig(*args, **kwargs):
                     yield chunk
                 return
             args, kwargs, key, handler, c = prepare(args, kwargs)
-            scope = enter(handler, c, key)
+            leave = enter(handler, c, key)
             try:
                 async for chunk in orig(*args, **kwargs):
                     yield chunk
             finally:
-                scope.__exit__(None, None, None)
+                leave()
         return astream
 
     wrapped: List[Tuple[str, Any]] = [
