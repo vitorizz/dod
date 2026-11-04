@@ -228,7 +228,7 @@ Supported:
 - **Pydantic AI** (pydantic-ai-slim 2.66.0): any toolset, through `CaptureToolset`, with message history as context across runs.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
 
-Next: more integrations (LangGraph agents, Pydantic AI).
+Next: more integrations (LangGraph agents).
 
 ## Demo
 
