@@ -117,7 +117,25 @@ def test_cycle_terminates(path, ledger):
     r = trace(ledger, "mem", "c")
     assert depths(r) == {b: 1, a: 2}
     assert r.roots == []
-    assert Edge(a, "mem", "c", "in_prompt", c) in r.edges
+    # a can't have read c, which was first written after it: the edge has no
+    # earlier version to resolve to, so it's reported, not followed.
+    assert Edge(a, "mem", "c", "in_prompt", None) in r.edges
+    assert UnrecordedAncestor("mem", "c", 3) in r.unrecorded
+
+
+def test_a_later_version_is_never_an_ancestor(ledger):
+    a1 = put(ledger, "mem", "a", source="user")
+    b = put(ledger, "mem", "b", [("mem", "a", "in_prompt")])
+    a2 = put(ledger, "mem", "a", [("mem", "x", "in_prompt")])  # a rewritten later
+    c = put(ledger, "mem", "c", [("mem", "a", "in_prompt")])
+    assert depths(trace(ledger, "mem", "b")) == {a1: 1}
+    assert depths(trace(ledger, "mem", "c")) == {a1: 1, a2: 1}  # both existed before c
+    # A compaction of its own item resolves to the earlier version, not itself.
+    d = put(ledger, "mem", "d")
+    d2 = put(ledger, "mem", "d", [("mem", "d", "in_prompt")])
+    r = trace(ledger, "mem", "d")
+    assert [e for e in r.edges if e.child_write_id == d2] == [Edge(d2, "mem", "d", "in_prompt", d)]
+    assert c
 
 
 def test_max_depth_truncates(ledger):
