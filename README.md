@@ -43,6 +43,7 @@ pip install -e ".[crewai,langgraph]"   # both, for the quickstart
 pip install -e ".[otel]"        # OpenTelemetry export (opentelemetry-api/sdk==1.45.1)
 pip install -e ".[mcp]"         # MCP client sessions and gateway (mcp==1.28.1)
 pip install -e ".[pydantic_ai]" # Pydantic AI tool calls (pydantic-ai-slim==2.66.0)
+pip install -e ".[postgres]"    # Postgres + pgvector through LangGraph's PostgresStore
 ```
 
 The core library has no dependencies; integrations are optional extras.
@@ -143,21 +144,49 @@ await gateway.run_stdio()
 ```
 
 Each server is a store (`mcp:<server>`). Tools annotated `readOnlyHint` are reads: their result is recorded as an item (source `tool`) and enters the context `in_prompt`, so what the model writes from it traces back to the call. Every other tool is a write, recorded before the call and bound after it succeeds (to the ID `record_id` returns, or the call's own). Resource reads are context items keyed by URI; quarantined resources read as "not found". Through the gateway, each client connection is one unit of work, unless a request names its own with `_meta` keys `dod/agent_id` and `dod/task_id`.
+
 ## Pydantic AI
+
 Pydantic AI agents remember through tools and through the message history passed back into each run. Wrap the agent's toolset:
+
+```python
 from pydantic_ai import Agent
 from dod.integrations.pydantic_ai import CaptureToolset
+
 tools = CaptureToolset(my_toolset, cap, read_only=["lookup_customer"],
                        passthrough=["remember"],  # writes to an instrumented store
                        record_id=lambda tool, args, result: result.get("id"))
 agent = Agent(model, toolsets=[tools])
+```
+
 Each run is a unit of work. Read tools' results are recorded as items, and every read result still in the message history, including from earlier runs, is a parent (`in_prompt`) of the run's writes. Other tools are writes, recorded before the call and bound after it. `passthrough` tools are only scoped, so stores they use through another dod integration link to the run's context.
+
+## Postgres
+
+LangGraph's `PostgresStore` (with pgvector semantic search) keeps `BaseStore`'s routing, so the LangGraph integration captures it unchanged:
+
+```python
+from langgraph.store.postgres import PostgresStore
+
+with PostgresStore.from_conn_string(uri, index={"dims": 1536, "embed": embed}) as pg:
+    pg.setup()
+    memory = langgraph.instrument(pg, cap, store_name="postgres")
+```
+
+Vector search results become parents like any other read, quarantined rows drop out of `get` and `search`, `excise(mode="delete")` deletes rows through the store, and `reconcile` reports rows written with raw SQL.
+
 ## LangGraph agents
+
 `langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
+
+```python
 from dod.integrations import langgraph, langgraph_graph
+
 store = langgraph.instrument(InMemoryStore(), cap)
 app = langgraph_graph.instrument_graph(builder.compile(checkpointer=saver, store=store), cap)
 app.invoke({"messages": [user_msg]}, {"configurable": {"thread_id": "ana"}})
+```
+
 Every run is scoped to `(graph name, thread_id)`, so no `agent_task_scope` is needed around it. Each state channel of a thread is an item (`langgraph_state`): the run's input is recorded with source `user`, each node's update as a write, and the thread's saved state is context for the run. A memory a node writes to the store then traces back to the user message it came from.
 
 ## Reconcile
@@ -227,7 +256,7 @@ What it does **not** do:
 Supported:
 
 - **CrewAI 1.15.22** `Memory`: `recall`, `remember`, `remember_many`, `update`, `forget`, `reset`, `reset_all`, and consolidation on save. Rewrites are recorded as compactions; every deleted record gets an append-only tombstone, so `trace` and `blast_radius` report what was deleted and why.
-- **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`).
+- **LangGraph Store** (langgraph 1.2.14, langgraph-checkpoint 4.2.0): `get`, `search`, `put`, `delete`, and async variants, on stores that keep `BaseStore`'s default routing (such as `InMemoryStore`, and `PostgresStore` with pgvector from langgraph-checkpoint-postgres 3.1.2).
 - **LangGraph graphs** (langgraph 1.2.14): `invoke`/`ainvoke`/`stream`/`astream` scoped per thread; input, node updates and loaded thread state as `langgraph_state` items.
 - **Anthropic memory tool** (anthropic 1.12.1, `memory_20250818`): `view`, `create`, `str_replace`, `insert`, `delete`, `rename`, and `clear_all_memory`, on `BetaAbstractMemoryTool`/`BetaAsyncAbstractMemoryTool` subclasses that keep the default `call` (such as `BetaLocalFilesystemMemoryTool`). A viewed file is an `in_prompt` parent; the record ID is the memory path.
 - **MCP** (mcp 1.28.1): `ClientSession` `call_tool`, `read_resource` and `list_tools`, and a proxying `Gateway` server.
