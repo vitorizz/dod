@@ -251,6 +251,11 @@ def trace(
 ) -> TraceResult:
     """Walk backward from ``(store, record_id)`` to every ancestor write.
 
+    A parent item resolves to every write bound to it that came before the
+    child write (by ``seq``): each version that could have been in the
+    child's context, never one written after it. A parent with no earlier
+    write is reported in ``unrecorded``.
+
     Breadth-first, one indexed query per level over the current frontier, so
     only the reached subgraph is read. A visited set gives each write its
     minimum depth and makes cycles terminate. ``max_depth`` (``None`` for no
@@ -286,10 +291,14 @@ def trace(
         for chunk in _chunks(frontier):
             rows = _run(
                 ledger,
+                # A parent item resolves to its versions written before the
+                # child: a later version can't have been in its context.
                 "SELECT DISTINCT p.write_id, p.parent_store, p.parent_record_id,"
                 " p.tag, b.write_id"
-                " FROM parents p LEFT JOIN bindings b"
+                " FROM parents p CROSS JOIN writes c ON c.write_id = p.write_id"
+                " LEFT JOIN bindings b"
                 " ON b.store = p.parent_store AND b.record_id = p.parent_record_id"
+                " AND (SELECT seq FROM writes WHERE write_id = b.write_id) < c.seq"
                 f" WHERE p.write_id IN ({_marks(len(chunk))})",
                 chunk,
             )
