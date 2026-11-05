@@ -171,14 +171,17 @@ def instrument(store: Any, capture: Capture, store_name: str = "langgraph") -> A
         key = _scope.current_key()
         if key is None:
             return results
-        items = []
+        items, values = [], []
         for op, result in zip(ops, results):
             if isinstance(op, GetOp) and result is not None:
                 items.append((store_name, record_id(result.namespace, result.key)))
+                values.append(result.value)
             elif isinstance(op, SearchOp):
-                items += [(store_name, record_id(i.namespace, i.key)) for i in result or ()]
+                for i in result or ():
+                    items.append((store_name, record_id(i.namespace, i.key)))
+                    values.append(i.value)
         if items:
-            capture.on_retrieve(key, items)
+            capture.on_retrieve(key, items, texts=values)
         return results
 
     @functools.wraps(cls.batch)

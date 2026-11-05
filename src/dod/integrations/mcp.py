@@ -160,10 +160,12 @@ class _Recorder:
             raise McpError(types.ErrorData(code=RESOURCE_NOT_FOUND,
                                            message=f"Resource not found: {uri}"))
 
-    def after_resource(self, uri: str) -> None:
+    def after_resource(self, uri: str, result: Any = None) -> None:
         key = _scope.current_key()
         if key is not None:
-            self.capture.on_retrieve(key, [(self.store, uri)])
+            texts = [getattr(c, "text", None) for c in getattr(result, "contents", ()) or ()]
+            self.capture.on_retrieve(key, [(self.store, uri)],
+                                     texts=[[t for t in texts if t]])
 
     def before_call(self, tool: str, arguments: Dict[str, Any]) -> Optional[tuple]:
         """Record a write tool's call before it runs; None for a read tool."""
@@ -265,7 +267,7 @@ def instrument(
     async def read_resource(uri, *args, **kwargs):
         rec.check_resource(str(uri))
         result = await orig_read(uri, *args, **kwargs)
-        rec.after_resource(str(uri))
+        rec.after_resource(str(uri), result)
         return result
 
     async def list_tools(*args, **kwargs):
