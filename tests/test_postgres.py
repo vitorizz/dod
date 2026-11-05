@@ -3,6 +3,7 @@ with pgvector search). Needs a server: set ``DOD_TEST_POSTGRES_URI`` (a
 database the tests may write to, with the ``vector`` extension available)."""
 
 import hashlib
+import json
 import os
 
 import pytest
@@ -96,6 +97,7 @@ def test_delete_and_reconcile_catch_raw_sql(store, ledger):
     langgraph.instrument(s, Capture(ledger), store_name=S)
     with agent_task_scope("support", "t1"):
         s.put(ns, "refunds", {"text": "refunds 90 days"})
+        s.put(ns, "address", {"text": "ana lives in Brooklyn"})
     r = dod.excise(ledger, S, rid(ns, "refunds"), mode="delete",
                    stores={S: langgraph.DeleteAdapter(s)})
     assert r.done == {S: [rid(ns, "refunds")]}
@@ -103,7 +105,10 @@ def test_delete_and_reconcile_catch_raw_sql(store, ledger):
         cur.execute("INSERT INTO store (prefix, key, value) VALUES (%s, %s, %s)",
                     (".".join(ns), "sneaky", '{"text": "x"}'))
     rep = reconcile(ledger, {S: langgraph.ReconcileAdapter(s)}, grace=0.05)
-    mine = [(f.kind, f.record_id) for f in rep.findings if f.record_id.startswith(rid(ns, "")[:-4])]
+    # Only this test's namespace: the database may hold other tests' rows.
+    mine = [(f.kind, f.record_id) for f in rep.findings
+            if tuple(json.loads(f.record_id)[:-1]) == ns]
+    # The raw insert is found; the captured write still there ("address") isn't.
     assert mine == [("unrecorded", rid(ns, "sneaky"))]
 
 

@@ -144,15 +144,23 @@ await gateway.run_stdio()
 ```
 
 Each server is a store (`mcp:<server>`). Tools annotated `readOnlyHint` are reads: their result is recorded as an item (source `tool`) and enters the context `in_prompt`, so what the model writes from it traces back to the call. Every other tool is a write, recorded before the call and bound after it succeeds (to the ID `record_id` returns, or the call's own). Resource reads are context items keyed by URI; quarantined resources read as "not found". Through the gateway, each client connection is one unit of work, unless a request names its own with `_meta` keys `dod/agent_id` and `dod/task_id`.
+
 ## Pydantic AI
+
 Pydantic AI agents remember through tools and through the message history passed back into each run. Wrap the agent's toolset:
+
+```python
 from pydantic_ai import Agent
 from dod.integrations.pydantic_ai import CaptureToolset
+
 tools = CaptureToolset(my_toolset, cap, read_only=["lookup_customer"],
                        passthrough=["remember"],  # writes to an instrumented store
                        record_id=lambda tool, args, result: result.get("id"))
 agent = Agent(model, toolsets=[tools])
+```
+
 Each run is a unit of work. Read tools' results are recorded as items, and every read result still in the message history, including from earlier runs, is a parent (`in_prompt`) of the run's writes. Other tools are writes, recorded before the call and bound after it. `passthrough` tools are only scoped, so stores they use through another dod integration link to the run's context.
+
 ## Postgres
 
 LangGraph's `PostgresStore` (with pgvector semantic search) keeps `BaseStore`'s routing, so the LangGraph integration captures it unchanged:
@@ -168,11 +176,17 @@ with PostgresStore.from_conn_string(uri, index={"dims": 1536, "embed": embed}) a
 Vector search results become parents like any other read, quarantined rows drop out of `get` and `search`, `excise(mode="delete")` deletes rows through the store, and `reconcile` reports rows written with raw SQL.
 
 ## LangGraph agents
+
 `langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
+
+```python
 from dod.integrations import langgraph, langgraph_graph
+
 store = langgraph.instrument(InMemoryStore(), cap)
 app = langgraph_graph.instrument_graph(builder.compile(checkpointer=saver, store=store), cap)
 app.invoke({"messages": [user_msg]}, {"configurable": {"thread_id": "ana"}})
+```
+
 Every run is scoped to `(graph name, thread_id)`, so no `agent_task_scope` is needed around it. Each state channel of a thread is an item (`langgraph_state`): the run's input is recorded with source `user`, each node's update as a write, and the thread's saved state is context for the run. A memory a node writes to the store then traces back to the user message it came from.
 
 ## Reconcile
