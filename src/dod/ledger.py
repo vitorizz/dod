@@ -310,8 +310,8 @@ CREATE TABLE IF NOT EXISTS quarantine (
     actor     TEXT
 );
 CREATE TABLE IF NOT EXISTS audit_chain (
-    seq    INTEGER PRIMARY KEY AUTOINCREMENT,
-    digest TEXT NOT NULL UNIQUE,
+    seq    INTEGER PRIMARY KEY,
+    digest TEXT NOT NULL,
     prev   TEXT,
     ts     INTEGER NOT NULL,
     w_lo INTEGER, w_hi INTEGER, s_lo INTEGER, s_hi INTEGER, b_lo INTEGER, b_hi INTEGER,
@@ -470,8 +470,8 @@ def _statements(script: str):
             buf = ""
 
 
-# 5 -> 6: the audit chain table and its triggers. Rows already in a
-# version-5 file stay unchained; verify() reports them as such.
+# 5 -> 6: the audit chain table and its triggers. The first open with
+# audit=True seals the rows already in the file.
 _MIGRATIONS[5] = tuple(stmt for stmt in _statements(_SCHEMA) if "audit_chain" in stmt)
 
 
@@ -809,8 +809,13 @@ class Ledger:
         path: Union[str, os.PathLike],
         checkpoint_interval: float = 1.0,
         background_index: bool = True,
+        audit: bool = False,
     ):
+        """``audit=True`` hash-chains every transaction (see ``dod.audit``):
+        about 0.04 ms more per append. Open a file with it every time once
+        enabled; rows appended without it are reported by ``verify``."""
         self._lock = threading.Lock()
+        self._audit = audit
         # (agent_id, session_id) -> (chain, members) of the last context set
         # this Ledger stored for it, most recently used last. Guarded by _lock.
         self._chains: "OrderedDict[tuple, Tuple[_Chain, dict]]" = OrderedDict()
@@ -842,8 +847,8 @@ class Ledger:
                     for stmt in _MIGRATIONS[version]:
                         conn.execute(stmt)
                     version += 1
-                if 0 < found < 6:
-                    # The chain is new: seal the rows already in the file.
+                if audit and not conn.execute("SELECT 1 FROM audit_chain LIMIT 1").fetchone():
+                    # First audited open: seal the rows already in the file.
                     _chain_append(conn, _all_rows(conn), time.time_ns())
                 if version != found:
                     conn.execute(f"PRAGMA user_version={version}")
@@ -1182,8 +1187,9 @@ class Ledger:
                         " agent_id, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                         tombstone_rows,
                     )
-                _chain_append(conn, {"w": len(write_rows), "s": new_sets,
-                                     "b": len(binding_rows), "t": len(tombstone_rows)}, ts)
+                if self._audit:
+                    _chain_append(conn, {"w": len(write_rows), "s": new_sets,
+                                         "b": len(binding_rows), "t": len(tombstone_rows)}, ts)
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
@@ -1219,6 +1225,9 @@ class Ledger:
         ts = time.time_ns()
         with self._lock:
             conn = self._conn
+            if not self._audit:
+                conn.execute(_INSERT_BINDING, (write_id, store, record_id, ts, content_hash))
+                return
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute(_INSERT_BINDING, (write_id, store, record_id, ts, content_hash))
@@ -1283,14 +1292,15 @@ class Ledger:
             return
         with self._lock:
             conn = self._conn
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("BEGIN IMMEDIATE" if self._audit else "BEGIN")
             try:
                 conn.executemany(
                     "INSERT INTO quarantine (ts, store, record_id, action, reason, actor)"
                     " VALUES (?, ?, ?, ?, ?, ?)",
                     rows,
                 )
-                _chain_append(conn, {"q": len(rows)}, ts)
+                if self._audit:
+                    _chain_append(conn, {"q": len(rows)}, ts)
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise

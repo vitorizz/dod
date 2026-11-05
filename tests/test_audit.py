@@ -18,7 +18,7 @@ def path(tmp_path):
 
 @pytest.fixture
 def ledger(path):
-    with Ledger(path) as led:
+    with Ledger(path, audit=True) as led:
         yield led
 
 
@@ -153,7 +153,9 @@ def test_migration_seals_existing_rows(path, ledger, chain):
     conn.execute("DROP TABLE audit_chain")
     conn.execute("PRAGMA user_version=5")
     conn.close()
-    with Ledger(path) as led:
+    with Ledger(path) as led:  # not audited: no chain yet
+        assert audit.verify(led).entries == 0
+    with Ledger(path, audit=True) as led:
         v = audit.verify(led)
         assert v.ok and v.entries == 1  # one entry seals the existing rows
         (w,) = raw(path).execute("SELECT w_hi FROM audit_chain").fetchone()
@@ -163,7 +165,7 @@ def test_migration_seals_existing_rows(path, ledger, chain):
             mem.remember("new fact")
         assert audit.verify(led).ok
     tamper(path, "UPDATE writes SET agent_id = 'x' WHERE seq = 1")
-    with Ledger(path) as led:
+    with Ledger(path, audit=True) as led:
         assert not audit.verify(led).ok
 
 
@@ -217,3 +219,22 @@ def test_delta_chained_sets_verify(ledger):
                             context=list(ctx))
     v = audit.verify(ledger)
     assert v.ok, v.problems
+
+
+def test_unaudited_ledger_writes_no_chain(tmp_path):
+    with Ledger(tmp_path / "plain.db") as led:
+        led.append_write(content="x", store="mem", source="user")
+        led.bind(led.append_write(content="y", store="mem", source="user"), "mem", "r")
+        led.quarantine([("mem", "r")])
+        v = audit.verify(led)
+        assert v.entries == 0 and not v.ok  # every row is unchained
+        assert all("in no chain entry" in p for p in v.problems)
+
+
+def test_rows_appended_without_audit_are_reported(path, ledger, chain):
+    ledger.close()
+    with Ledger(path) as led:
+        led.append_write(content="x", store="mem", source="user")
+    with Ledger(path, audit=True) as led:
+        v = audit.verify(led)
+        assert not v.ok and any("writes: 1 row" in p for p in v.problems)

@@ -240,7 +240,7 @@ Each rewrite runs in its own `agent_task_scope`, so capture records it with what
 
 ## Audit
 
-`dod.audit.report(ledger, store, record_id)` is the evidence for an excision: the item and everything derived from it, each with its writes, quarantine actions and deletions (time, reason, actor), the audit entry that recorded each, and the chain's verification at report time. Like the ledger, it holds IDs, hashes and timestamps only. `dod.audit.to_markdown(report)` renders it.
+Open the ledger with `Ledger(path, audit=True)` (every time, once enabled) to hash-chain it; the first audited open seals the rows already in the file. `dod.audit.report(ledger, store, record_id)` is the evidence for an excision: the item and everything derived from it, each with its writes, quarantine actions and deletions (time, reason, actor), the audit entry that recorded each, and the chain's verification at report time. Like the ledger, it holds IDs, hashes and timestamps only. `dod.audit.to_markdown(report)` renders it.
 
 ```python
 from dod import audit
@@ -255,7 +255,7 @@ print(audit.to_markdown(rep))
 
 - **Content-free ledger.** The ledger stores IDs, content hashes, edges, and metadata only. Memory content stays in your stores. (`reason` and `actor` on quarantine are stored as you pass them; keep content out of them.)
 - **Append-only.** Writes, parents, bindings, deletions (tombstones), and quarantine actions are only ever inserted; schema triggers reject updates, deletes, and `INSERT OR REPLACE`. Quarantine and release are new rows, so every action stays auditable.
-- **Tamper-evident.** Every transaction also appends a hash-chained audit entry over the rows it added. `dod.audit.verify(ledger)` recomputes the chain and reports edited or deleted rows, broken links, and rows inserted outside the library. Anchor `dod.audit.head(ledger)` somewhere outside the file (your logs, an audit export) and `verify(ledger, expected_head=...)` also proves nothing was cut off the end.
+- **Tamper-evident (opt-in).** With `Ledger(path, audit=True)`, every transaction also appends a hash-chained audit entry over the rows it added (about 0.04 ms per append). `dod.audit.verify(ledger)` recomputes the chain and reports edited or deleted rows, broken links, and rows inserted outside the library. Anchor `dod.audit.head(ledger)` somewhere outside the file (your logs, an audit export) and `verify(ledger, expected_head=...)` also proves nothing was cut off the end.
 - **No network calls home.** The library makes no telemetry or network calls. (Framework packages may have their own telemetry; the example turns off crewai's.)
 - **p99 < 1 ms capture overhead per write**, asserted by benchmarks in the test suite (`pytest -q tests/test_*_perf.py -s`).
 
