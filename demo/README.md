@@ -9,7 +9,7 @@ A customer-support agent for an online store, built with LangGraph. Its memory l
 | Policy notes | updates the agent records, one file per topic | Anthropic memory tool (files on disk) |
 | CRM | orders, tickets, replies sent to customers | its own MCP server process over SQLite |
 
-On the left of the web app is the customer chat; on the right, the dod console showing what every write was derived from.
+On the left of the web app is the customer chat, one tab per customer. On the right, the dod console: **one row per turn** (a customer message and everything the agent wrote while handling it), **one column per system**. A line ending in a dot means a later turn *read* that box: it was in the agent's context when that turn wrote its row. Press **?** in the app for a walkthrough.
 
 ## The story
 
@@ -20,9 +20,9 @@ On the left of the web app is the customer chat; on the right, the dod console s
 
 Then in the console:
 
-1. Click Chloe's wrong reply (`trace ↗`). The trace runs back across all four stores to two customer messages: Chloe's own question, and Ben's claim.
-2. Click Ben's message: its blast radius is 12 items in 4 stores (the policy note, three customer notes, two tickets, four replies, two conversations).
-3. **Excise & regenerate**: the confirm dialog compares excising (13 contaminated items out, 10 correct items kept) with wiping every store (all 23 lost). dod quarantines the subgraph, then the agent re-answers Ana and Chloe from clean memory ("outside our 30-day refund window"), shown in green. Dev's and Eli's conversations are untouched.
+1. Click Chloe's wrong reply (**where did this come from?**). Everything unrelated fades. Turn 5 (Chloe) read `refunds.md`, which turn 1 (Ben) wrote: the origins are what Ben and Chloe said, plus the handbook. Tracing a customer's message just says it's an origin.
+2. Click Ben's message (**what came from this?**): 13 things in 4 systems, in Ben's, Ana's and Chloe's turns. Dev's and Eli's turns stay faded.
+3. **Excise & regenerate**: the confirmation lists what's removed (13 records) and what's kept (10: the handbook, Dev's and Eli's conversations), against wiping memory (all 23). dod quarantines the subgraph, then the agent re-answers Ana and Chloe from clean memory; a before/after table shows the wrong and corrected replies, and the chat marks them.
 
 Nothing in dod decided that Ben's message was false: a person did, from the trace. dod recorded the edges, so finding and removing everything derived from it is a query.
 
@@ -58,9 +58,9 @@ A real model may not fall for Ben's claim, or may phrase things differently; tha
 
 ## Presenting
 
-- **Run the story** replays the six messages at once. Or type them one by one: the dashed box above the input sends the next story message.
-- Solid edges were in the model's prompt; dashed ones were retrieved in the same task (dod over-includes rather than miss a parent).
-- Grey dashed boxes are quarantined: instrumented reads (Postgres search, file views) no longer return them. Green boxes were written by regenerate.
+- **Run the story** replays the six messages at once. Or send them one by one with the dashed "Next in the story" box; it switches to that customer's tab.
+- In the graph: solid lines were in the model's prompt; dashed ones were retrieved during the turn (dod over-includes rather than miss a parent). Grey dashed boxes are quarantined; green boxes were written by regenerate. **Show everything** clears a trace or blast-radius focus.
+- The console draws dod's records by turn and version: a box is an item as written in one turn, reads resolve to the version that existed when the turn began, and writes within a turn aren't linked to each other. Blast radius and excise use dod's item-level `blast_radius`/`excise` directly, so a conversation thread counts as one record however many turns it has.
 
 ## What's simplified
 

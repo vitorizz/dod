@@ -19,35 +19,53 @@ from demo.support_agent.world import World  # noqa: E402
 
 
 def run(tmp_path, pg=None):
+    from demo.support_agent.lineage import Lineage
+
     async def main():
         w = World(str(tmp_path / "world"), "scripted", pg)
         await w.start()
         try:
             await w.run_story()
-            replies = {e["customer"] + str(i): e for i, e in enumerate(w.log)}
             chloe = next(e for e in w.log if e["customer"] == "chloe")
             assert "90-day" in chloe["reply"]  # the false policy reached her
-            t = w.trace_view("mcp:crm", chloe["reply_id"])
-            users = [r for r in t["roots"] if r["source"] == "user"]
-            assert {r["label"] for r in users} == {"ben's conversation", "chloe's conversation"}
-            ben = next(r for r in users if r["label"] == "ben's conversation")
-            b = w.blast_view(ben["store"], ben["record_id"])
+            lin = Lineage(w)
+            reply = lin.box_for("mcp:crm", chloe["reply_id"])
+
+            # Trace goes turn by turn: Chloe's turn read refunds.md, written in
+            # Ben's turn; the origins are what Ben and Chloe said, and the handbook.
+            t = lin.trace(reply)
+            labels = {lin.boxes[b]["kind"] + ":" + str(lin.boxes[b]["turn"]) for b in t["origins"]}
+            ben_turn = next(x["id"] for x in w.turns if x.get("customer") == "ben")
+            chloe_turn = lin.boxes[reply]["turn"]
+            assert labels == {f"message:{ben_turn}", f"message:{chloe_turn}", "handbook:0"}
+            assert [[lin.boxes[b]["kind"], tid] for b, tid in t["reads"]
+                    if lin.boxes[b]["kind"] == "policy_note"] == [["policy_note", chloe_turn]]
+            # A customer's own message is an origin, not derived from anything.
+            assert lin.trace(f"msg:{ben_turn}")["self_origin"]
+
+            # Blast radius from Ben's message spans all four stores, and spares
+            # the unrelated customers.
+            b = lin.blast(f"msg:{ben_turn}")
             assert set(b["per_store"]) == {"langgraph_state", "memory", "notes", "mcp:crm"}
-            c = w.compare(ben["store"], ben["record_id"])
-            assert c["excise"] < c["live"] and c["kept"] >= 10
-            g = await w.regenerate(ben["store"], ben["record_id"])
+            untouched = {x["id"] for x in w.turns if x.get("customer") in ("dev", "eli")}
+            assert not any(lin.boxes[x]["turn"] in untouched for x in b["boxes"])
+            c = lin.compare(f"msg:{ben_turn}")
+            assert (c["excise"], c["kept"], c["live"]) == (13, 10, 23)
+
+            g = await w.regenerate(*lin._items_of(f"msg:{ben_turn}")[0])
             assert g["failed"] == [] and len(g["replaced"]) == 3
-            new = w.log[-3:]
-            assert all("outside our 30-day" in e["reply"] or "don't see" in e["reply"]
-                       for e in new)
+            new = [e for e in w.log if e["replaces"]]
+            assert len(new) == 3 and all(
+                "outside our 30-day" in e["reply"] or "don't see" in e["reply"] for e in new)
+            view = Lineage(w).view()
             dev = next(e for e in w.log if e["customer"] == "dev")
-            assert not any(n["quarantined"] for n in w.graph_view()["nodes"]
-                           if n["record_id"] == dev["reply_id"])
-            return replies
+            assert not any(x["quarantined"] for x in view["boxes"]
+                           if x["item"] == ["mcp:crm", dev["reply_id"]])
+            assert {x["kind"] for x in view["turns"]} == {"seed", "chat", "regenerated"}
         finally:
             await w.stop()
 
-    return asyncio.run(main())
+    asyncio.run(main())
 
 
 def test_story_trace_blast_and_regenerate(tmp_path):

@@ -105,6 +105,9 @@ class World:
         self.pg_uri = pg_uri
         self.memory_store = "memory"
         self.log: List[dict] = []  # chat transcript for the UI
+        # One entry per unit of work, in order: the handbook seed, then each
+        # customer message. Writes with seq in (start, end] belong to it.
+        self.turns: List[dict] = []
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -177,23 +180,40 @@ class World:
         if self.pg_uri:
             self._pg_cm.__exit__(None, None, None)
 
+    def _seq(self) -> int:
+        with self.ledger._lock:
+            return self.ledger._conn.execute(
+                "SELECT coalesce(max(seq), 0) FROM writes").fetchone()[0]
+
     def _seed(self) -> None:
+        start = self._seq()
         with agent_task_scope("onboarding", "policy-handbook"):
             for topic, text in POLICIES.items():
                 self.memory.put(("policies",), topic, {"text": text})
+        self.turns.append({"id": 0, "kind": "seed", "customer": None,
+                           "message": "Company policy handbook loaded",
+                           "start": start, "end": self._seq()})
 
     # --- the agent -----------------------------------------------------------
 
-    async def chat(self, customer: str, message: str, thread: Optional[str] = None) -> dict:
-        """One customer message through the agent; returns the reply."""
+    async def chat(self, customer: str, message: str, thread: Optional[str] = None,
+                   replaces: Optional[str] = None) -> dict:
+        """One customer message through the agent; returns the reply.
+        ``replaces`` is the reply ID a regenerated answer stands in for."""
+        start = self._seq()
         out = await self.graph.ainvoke(
             {"messages": [{"role": "customer", "customer": customer, "text": message}]},
             {"configurable": {"thread_id": thread or customer}},
         )
         reply = out["messages"][-1]
         entry = {"customer": customer, "message": message, "reply": reply["text"],
-                 "reply_id": reply["reply_id"], "thread": thread or customer}
+                 "reply_id": reply["reply_id"], "thread": thread or customer,
+                 "turn": len(self.turns), "replaces": replaces}
         self.log.append(entry)
+        self.turns.append({"id": len(self.turns), "kind": "regenerated" if replaces else "chat",
+                           "customer": customer, "message": message,
+                           "reply_id": reply["reply_id"], "replaces": replaces,
+                           "start": start, "end": self._seq()})
         return entry
 
     async def run_story(self) -> List[dict]:
@@ -257,121 +277,6 @@ class World:
         self.notes.call({"command": "create", "path": path,
                          "file_text": "\n".join(existing + [text]) + "\n"})
 
-    # --- lineage views for the console ---------------------------------------
-
-    def graph_view(self) -> dict:
-        """Every item and the edges between them, with status and a preview."""
-        conn = sqlite3.connect(f"file:{self.dir / 'ledger.db'}?mode=ro", uri=True)
-        try:
-            items = {}
-            for store, rid, seq, source in conn.execute(
-                "SELECT b.store, b.record_id, min(w.seq), w.source FROM bindings b"
-                " JOIN writes w ON w.write_id = b.write_id GROUP BY b.store, b.record_id"
-                " ORDER BY min(w.seq)"):
-                items[(store, rid)] = {"store": store, "record_id": rid, "seq": seq,
-                                       "source": source}
-            edges = set()
-            for pstore, prid, cstore, crid, tag in conn.execute(
-                "SELECT p.parent_store, p.parent_record_id, b.store, b.record_id, p.tag"
-                " FROM parents p JOIN bindings b ON b.write_id = p.write_id"):
-                if (pstore, prid) in items and (pstore, prid) != (cstore, crid):
-                    edges.add((pstore, prid, cstore, crid, tag))
-            gone = {(s, r) for s, r in conn.execute("SELECT store, record_id FROM tombstones")}
-        finally:
-            conn.close()
-        quarantined = self.ledger.quarantined()
-        nodes = []
-        for key, it in items.items():
-            it.update(label=self.label(*key), preview=self.preview(*key),
-                      quarantined=key in quarantined, deleted=key in gone,
-                      store_label=STORE_LABELS.get(it["store"], it["store"]))
-            nodes.append(it)
-        return {"nodes": nodes,
-                "edges": [{"from": [a, b], "to": [c, d], "tag": t}
-                          for a, b, c, d, t in sorted(edges)],
-                "stores": STORE_LABELS, "backend": self.backend, "model": self.llm.name}
-
-    def label(self, store: str, rid: str) -> str:
-        if store == "mcp:crm":
-            if rid.startswith("call:"):
-                return "order lookup"
-            return {"R": "reply ", "T": "ticket "}.get(rid[:1], "") + rid
-        if store == "langgraph_state":
-            thread = json.loads(rid)[0]
-            if "-regenerated-" in thread:
-                return f"{thread.split('-regenerated-')[0]} (regenerated)"
-            return f"{thread}'s conversation"
-        if store == "notes":
-            return rid.rsplit("/", 1)[-1]
-        parts = json.loads(rid)
-        return "policy: " + parts[-1] if parts[0] == "policies" else f"note on {parts[1]}"
-
-    def preview(self, store: str, rid: str) -> str:
-        try:
-            if store == self.memory_store:
-                *ns, key = json.loads(rid)
-                base = type(self.memory)._dod_base
-                (item,) = base.batch(self.memory, [GetOp(tuple(ns), key, refresh_ttl=False)])
-                return item.value.get("text", "") if item else "(deleted)"
-            if store == "notes":
-                p = self.dir / "notes" / rid.lstrip("/")
-                return p.read_text().strip() if p.exists() else "(deleted)"
-            if store == "mcp:crm":
-                db = sqlite3.connect(self._crm_db)
-                try:
-                    if rid.startswith("R"):
-                        row = db.execute("SELECT customer, text FROM replies WHERE id = ?",
-                                         (rid,)).fetchone()
-                        return f"to {row[0]}: {row[1]}" if row else "(deleted)"
-                    if rid.startswith("T"):
-                        row = db.execute("SELECT action, order_id, summary FROM tickets"
-                                         " WHERE id = ?", (rid,)).fetchone()
-                        return f"{row[0]} #{row[1]}: {row[2]}" if row else "(deleted)"
-                finally:
-                    db.close()
-                return "result of a read-only CRM call"
-            if store == "langgraph_state":
-                thread = json.loads(rid)[0]
-                snap = self.graph.get_state({"configurable": {"thread_id": thread}})
-                msgs = (snap.values or {}).get("messages", [])
-                return " / ".join(f"{m['role']}: {m['text']}" for m in msgs[-4:])
-        except Exception as exc:  # a preview must never break the console
-            return f"(unavailable: {type(exc).__name__})"
-        return ""
-
-    def trace_view(self, store: str, rid: str) -> dict:
-        t = trace(self.ledger, store, rid)
-        reached = {(e.parent_store, e.parent_record_id) for e in t.edges}
-        roots = []
-        for w in t.roots:
-            for s, r in self._bound(w.write_id):
-                roots.append({"store": s, "record_id": r, "source": w.source,
-                              "label": self.label(s, r), "preview": self.preview(s, r)})
-        return {"items": [list(i) for i in sorted(reached)], "roots": roots}
-
-    def blast_view(self, store: str, rid: str) -> dict:
-        b = blast_radius(self.ledger, store, rid)
-        items = sorted({i for its in b.bindings.values() for i in its} - {(store, rid)})
-        items = [i for i in items if not i[1].startswith("call:")]  # tool-call results
-        per_store: Dict[str, int] = {}
-        for s, _ in items:
-            per_store[s] = per_store.get(s, 0) + 1
-        return {"items": [list(i) for i in items], "per_store": per_store}
-
-    def excise(self, store: str, rid: str, dry_run: bool = False) -> dict:
-        r = dod.excise(self.ledger, store, rid, dry_run=dry_run)
-        return {"targets": r.targets, "done": r.done, "compare": self.compare(store, rid)}
-
-    def compare(self, store: str, rid: str) -> dict:
-        """Excise vs. wiping every store, over live items."""
-        view = self.graph_view()
-        live = [(n["store"], n["record_id"]) for n in view["nodes"]
-                if not n["deleted"] and not n["record_id"].startswith("call:")]
-        b = blast_radius(self.ledger, store, rid)
-        hit = {i for its in b.bindings.values() for i in its} | {(store, rid)}
-        return {"live": len(live), "excise": len([i for i in live if i in hit]),
-                "kept": len([i for i in live if i not in hit])}
-
     async def regenerate(self, store: str, rid: str) -> dict:
         """Excise, then re-answer every affected customer from clean memory.
 
@@ -401,7 +306,8 @@ class World:
 
             async def again():
                 with use_key(*key):
-                    return await self.chat(customer, question, thread=thread)
+                    return await self.chat(customer, question, thread=thread,
+                                           replaces=task.record_id)
 
             entry = asyncio.run_coroutine_threadsafe(again(), loop).result()
             return ("mcp:crm", entry["reply_id"])

@@ -21,7 +21,12 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from .world import STORY, World
+import sqlite3
+
+import dod
+
+from .lineage import Lineage
+from .world import STORE_LABELS, STORY, World
 
 STATIC = Path(__file__).parent / "static"
 
@@ -46,8 +51,8 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
 
     def snapshot() -> dict:
         w = state["world"]
-        return {**w.graph_view(), "log": w.log,
-                "customers": ["ana", "ben", "chloe", "dev", "eli"],
+        return {**Lineage(w).view(), "log": w.log, "model": w.llm.name, "backend": w.backend,
+                "stores": STORE_LABELS, "customers": ["ana", "ben", "chloe", "dev", "eli"],
                 "story": [{"customer": c, "message": m} for c, m in STORY]}
 
     async def index(request: Request):
@@ -73,27 +78,35 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
             await fresh()
         return JSONResponse(snapshot())
 
-    async def item_action(request: Request):
+    async def box_action(request: Request):
         body = await request.json()
-        action, store, rid = request.path_params["action"], body["store"], body["record_id"]
+        action, box = request.path_params["action"], body["box"]
         w = state["world"]
         async with lock:
-            try:
-                if action == "trace":
-                    result = w.trace_view(store, rid)
-                elif action == "blast":
-                    result = w.blast_view(store, rid)
-                elif action == "compare":
-                    result = w.compare(store, rid)
-                elif action == "excise":
-                    result = w.excise(store, rid)
-                elif action == "regenerate":
-                    result = await w.regenerate(store, rid)
-                else:
-                    return JSONResponse({"error": f"unknown action {action}"}, status_code=404)
-            except KeyError:
-                return JSONResponse({"error": "no recorded write for that item"},
-                                    status_code=404)
+            lin = Lineage(w)
+            if box not in lin.boxes:
+                return JSONResponse({"error": f"unknown box {box}"}, status_code=404)
+            if action == "trace":
+                result = lin.trace(box)
+            elif action == "blast":
+                result = lin.blast(box)
+            elif action == "compare":
+                result = lin.compare(box)
+            elif action == "excise":
+                before = lin.compare(box)
+                for item in lin._items_of(box):
+                    dod.excise(w.ledger, *item)
+                result = {"compare": before}
+            elif action == "regenerate":
+                before = lin.compare(box)
+                pairs = []
+                for item in lin._items_of(box):
+                    r = await w.regenerate(*item)
+                    for old, new in r["replaced"]:
+                        pairs.append(_pair(w, old[1], new[1]))
+                result = {"compare": before, "pairs": pairs}
+            else:
+                return JSONResponse({"error": f"unknown action {action}"}, status_code=404)
         return JSONResponse({"result": result, **snapshot()})
 
     return Starlette(
@@ -103,10 +116,23 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
             Route("/api/chat", chat, methods=["POST"]),
             Route("/api/story", story, methods=["POST"]),
             Route("/api/reset", reset, methods=["POST"]),
-            Route("/api/item/{action}", item_action, methods=["POST"]),
+            Route("/api/box/{action}", box_action, methods=["POST"]),
         ],
         lifespan=lifespan,
     )
+
+
+def _pair(w: World, old: str, new: str) -> dict:
+    """A regenerated reply next to the one it replaces."""
+    db = sqlite3.connect(w._crm_db)
+    try:
+        rows = {r: db.execute("SELECT customer, question, text FROM replies WHERE id = ?",
+                              (r,)).fetchone() for r in (old, new)}
+    finally:
+        db.close()
+    customer, question, before = rows[old]
+    return {"customer": customer, "question": question, "before": before,
+            "after": rows[new][2], "old": old, "new": new}
 
 
 def main() -> None:
