@@ -56,7 +56,7 @@
   #next:hover { border-color: var(--trace); color: var(--ink); }
 
   /* console */
-  #console { display: grid; grid-template-rows: auto 1fr auto; min-height: 0; min-width: 0; }
+  #console { display: grid; grid-template-rows: auto auto 1fr auto; min-height: 0; min-width: 0; }
   #bar { display: flex; align-items: center; gap: 14px; padding: 10px 18px 6px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
   #bar .title { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; color: var(--muted); }
   #focusbar { display: none; align-items: center; gap: 10px; color: var(--ink); }
@@ -92,6 +92,14 @@
   .lane.blast { stroke: var(--blast); stroke-width: 2.2; }
   .lane.hide, .readdot.hide { opacity: 0; }
   .readdot { fill: #c9c6bb; }
+  .lane.flow { stroke: var(--notes); stroke-width: 2.4; stroke-dasharray: 6 4; animation: flow .8s linear infinite; }
+  .readdot.flow { fill: var(--notes); }
+  @keyframes flow { to { stroke-dashoffset: -20; } }
+  .rowband.new { fill: #fff4dc; }
+  #player { display: none; align-items: center; gap: 10px; padding: 8px 18px; background: #fff8e6; border-bottom: 1px solid #f0dfb0; font-size: 13px; }
+  #player.on { display: flex; }
+  #player .step { font: 12px var(--mono); color: var(--notes); white-space: nowrap; }
+  #player .cap { flex: 1; color: var(--ink); }
   .readdot.trace { fill: var(--trace); }
   .readdot.blast { fill: var(--blast); }
 
@@ -139,7 +147,7 @@
   <span class="spacer"></span>
   <span class="badge" id="model"></span>
   <span class="badge" id="backend"></span>
-  <button id="story" class="primary" title="Start over and play the six story messages">Run the story</button>
+  <button id="story" class="primary" title="Start over and play the story one turn at a time">▶ Play the story</button>
   <button id="reset" title="Start over with empty memory">Reset</button>
   <button class="help" id="helpbtn" title="What is going on here?">?</button>
 </header>
@@ -156,10 +164,14 @@
     </div>
   </section>
   <section id="console">
+    <div id="player">
+      <span class="step" id="pstep"></span><span class="cap" id="pcap"></span>
+      <button id="ppause">Pause</button><button id="pnext">Next step ▶</button><button id="pstop">Stop</button>
+    </div>
     <div id="bar">
       <span class="title">What the agent read and wrote, turn by turn</span>
-      <span class="lg"><i></i>read into the prompt</span>
-      <span class="lg"><i class="dash"></i>retrieved during the turn</span>
+      <span class="lg"><i></i>→ read into the prompt</span>
+      <span class="lg"><i class="dash"></i>→ retrieved during the turn</span>
       <span class="spacer"></span>
       <span id="focusbar"><span id="focustext"></span><button id="clearfocus">Show everything</button></span>
     </div>
@@ -179,7 +191,7 @@
     <li><span class="sw" style="background:var(--crm)"></span><b>CRM</b>: tickets and the replies actually sent to customers, in a separate server the agent reaches over MCP.</li>
   </ul>
   <h3>Rows and lines</h3>
-  <p>Each <b>row is one turn</b>: a customer message, and everything the agent wrote while handling it. A <b>line with a dot</b> means a later turn <b>read</b> that box: it was in the agent's context when it wrote that row. Solid: it was in the prompt; dashed: it was retrieved during the turn.</p>
+  <p>Each <b>row is one turn</b>: a customer message, and everything the agent wrote while handling it. An <b>arrow</b> from a box into a later row means that turn <b>read</b> the box: it was in the agent's context when it wrote that row. Solid: it was in the prompt; dashed: it was retrieved during the turn. When you trace, the arrows flip and point back to where things came from.</p>
   <h3>The story</h3>
   <ol>
     <li><b>Ben</b> falsely claims the refund window was extended to 90 days (it's 30). The agent believes him and writes it down in <code>refunds.md</code>.</li>
@@ -189,7 +201,7 @@
   </ol>
   <h3>Try it</h3>
   <ol>
-    <li>Click <b>Run the story</b> (or send the story one message at a time with the dashed box in the chat).</li>
+    <li>Click <b>▶ Play the story</b>: it plays one turn at a time, narrating each and lighting up the arrows into the new turn (pause or step through it). Or send the story yourself with the dashed box in the chat.</li>
     <li>Click Chloe's wrong reply, then <b>Where did this come from?</b> Everything unrelated fades; the path leads back to Ben's message.</li>
     <li>Click Ben's message, then <b>What came from this?</b> to see everything it contaminated, in all four systems.</li>
     <li><b>Excise &amp; regenerate</b>: quarantine exactly that, then let the agent re-answer the affected customers from clean memory. The before/after shows up below the graph and in the chat.</li>
@@ -222,7 +234,17 @@ const KIND = {
   reply: "A reply the agent sent to the customer through the CRM.",
 };
 const BW = 232, BH = 50, BGAP = 6, CGAP = 28, LANE = 9, ROWPAD = 9, TOP = 46, LEFT = 30;
-let S = null, tab = "all", sel = null, focus = null, lastResult = null;
+let S = null, tab = "all", sel = null, focus = null, lastResult = null, flowTurn = null;
+// The story, narrated one turn at a time.
+const CAPTIONS = [
+  "Ben claims the refund window was extended to 90 days. It's false (the policy is 30), but the agent believes him and writes it down in refunds.md, plus a note on Ben.",
+  "Dev asks about shipping: the agent reads the handbook (arrow) and answers correctly. Nothing to do with Ben.",
+  "Ana asks for a refund 45 days after delivery. Follow the arrow: the agent reads refunds.md, believes the 90 days, and approves it: a wrong reply, a refund ticket and a note.",
+  "Eli asks about warranty: answered from the handbook, unaffected.",
+  "Chloe asks for a refund 50 days after delivery. Same arrow from refunds.md, same wrong approval.",
+  "Ana asks when her refund arrives. The agent reads its own note about her (arrow) and confirms it: the mistake is now building on itself.",
+];
+const player = {on: false, paused: false, i: 0, timer: null};
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
 const clip = (s, n) => { s = String(s || ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
@@ -258,7 +280,7 @@ function renderTabs() {
   const who = tab === "all" ? null : tab;
   $("message").disabled = $("send").disabled = !who;
   $("message").placeholder = who ? `Message from ${cap(who)}…` : "Pick a customer tab to send a message as them";
-  const n = nextStory();
+  const n = player.on ? null : nextStory();
   $("next").style.display = n ? "" : "none";
   if (n) $("next").innerHTML = `Next in the story → <b>${cap(n.customer)}</b>: “${esc(n.message)}”`;
 }
@@ -283,12 +305,13 @@ function renderChat() {
     return `<div class="turn">${q}<div class="a ${bad ? "bad" : ""} ${fixed ? "fixed" : ""}">
       <div class="who">agent → ${cap(e.customer)}</div><div class="bubble">${esc(e.reply)}</div>
       ${note}<div class="chip" data-r="${e.reply_id}">reply ${e.reply_id} · where did this come from? ↗</div></div></div>`;
-  }).join("") || `<p class="empty">${tab === "all" ? "No conversations yet. Click <b>Run the story</b>, or send the first story message below." : "No messages from " + cap(tab) + " yet."}</p>`;
+  }).join("") || `<p class="empty">${tab === "all" ? "No conversations yet. Click <b>▶ Play the story</b>, or send the first story message below." : "No messages from " + cap(tab) + " yet."}</p>`;
   for (const c of $("log").querySelectorAll(".chip")) c.onclick = () => { selectBox(S.replyBox[c.dataset.r]); act("trace"); };
   $("log").scrollTop = $("log").scrollHeight;
 }
 async function send(customer, message) {
   await busy(async () => { load(await api("/api/chat", {customer, message})); });
+  flowTurn = S.turns[S.turns.length - 1].id; renderGraph();
 }
 $("send").onclick = () => { const m = $("message").value.trim(); if (m && tab !== "all") { send(tab, m); $("message").value = ""; } };
 $("message").onkeydown = e => { if (e.key === "Enter") $("send").onclick(); };
@@ -331,10 +354,11 @@ function focusSets() {
 function renderGraph() {
   const L = layout(), F = focusSets(), svg = $("graph");
   svg.setAttribute("width", L.width); svg.setAttribute("height", L.height);
-  let out = "";
+  const mk = (id, color) => `<marker id="${id}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${color}"/></marker>`;
+  let out = `<defs>${mk("ar", "#b3b0a4")}${mk("ar-trace", "#2a5bd7")}${mk("ar-blast", "#c8372d")}${mk("ar-flow", "#b26a00")}</defs>`;
   // row bands + turn numbers
   L.rows.forEach((r, i) => {
-    const t = r.t, cls = F && F.turns.has(t.id) ? F.kind : (i % 2 ? "alt" : "");
+    const t = r.t, cls = F && F.turns.has(t.id) ? F.kind : t.id === flowTurn ? "new" : (i % 2 ? "alt" : "");
     out += `<rect class="rowband ${cls}" x="0" y="${L.rowY[t.id]}" width="${L.width}" height="${L.rowH[t.id]}"/>`;
     out += `<text class="turnno" x="6" y="${L.rowY[t.id] + ROWPAD + 18}">${t.kind === "seed" ? "0" : t.id}</text>`;
   });
@@ -342,25 +366,36 @@ function renderGraph() {
     out += `<text class="colhead" x="${L.colX[c] + L.gutter[c]}" y="18" fill="${COLOR[c]}">${HEAD[c][0]}</text>
             <text class="colsub" x="${L.colX[c] + L.gutter[c]}" y="34">${esc(HEAD[c][1])}</text>`;
   }
-  // read lanes: from the box, left into its lane, down to each reading turn's row (a dot)
+  // Read lanes. Forward (default, blast radius, a new turn): from the box,
+  // into its lane, down to each turn that read it, ending in an arrow into
+  // that turn's row. Trace: the same lines with the arrow at the box instead,
+  // pointing back to where things came from.
   const lanes = {};
   for (const r of S.reads) (lanes[r.from] = lanes[r.from] || []).push(r);
   for (const [from, rs] of Object.entries(lanes)) {
     const p = L.pos[from]; if (!p) continue;
-    const lx = L.laneX[from], y0 = p.y + BH / 2;
+    const lx = L.laneX[from], y0 = p.y + BH / 2, inX = L.colX[p.col] + L.gutter[p.col] - 3;
     const segs = rs.map(r => {
-      const on = F && F.reads.has(from + "|" + r.turn);
+      const on = F ? F.reads.has(from + "|" + r.turn) : r.turn === flowTurn;
       return {r, y: L.rowY[r.turn] + ROWPAD + BH / 2, on};
     }).sort((a, b) => a.y - b.y);
     const anyOn = segs.some(s => s.on);
-    const cls = F ? (anyOn ? F.kind : "hide") : "";
-    const maxY = Math.max(...segs.filter(s => !F || s.on).map(s => s.y), y0);
     const dash = rs.every(r => r.tag !== "in_prompt") ? "ret" : "";
-    out += `<path class="lane ${cls} ${dash}" d="M${p.x},${y0} H${lx} V${maxY}"/>`;
+    const d = y => `M${p.x - 2},${y0} H${lx} V${y}`;
+    if (F) {  // focus: only the involved part of the lane, in the focus colour
+      const maxY = Math.max(...segs.filter(s => s.on).map(s => s.y), y0);
+      const back = F.kind === "trace" && anyOn ? ` marker-start="url(#ar-trace)"` : "";
+      out += `<path class="lane ${anyOn ? F.kind : "hide"} ${dash}" d="${d(maxY)}"${back}/>`;
+    } else {  // everything, plus a flowing overlay into the newest turn
+      out += `<path class="lane ${dash}" d="${d(Math.max(...segs.map(s => s.y)))}"/>`;
+      const fl = segs.find(s => s.on);
+      if (fl) out += `<path class="lane flow" d="${d(fl.y)}"/>`;
+    }
     for (const s of segs) {
-      const dcls = F ? (s.on ? F.kind : "hide") : "";
-      out += `<circle class="readdot ${dcls}" cx="${lx}" cy="${s.y}" r="4"><title>read in turn ${s.r.turn}</title></circle>`;
-      out += `<path class="lane ${dcls} ${s.r.tag === "in_prompt" ? "" : "ret"}" d="M${lx},${s.y} H${lx + 8}"/>`;
+      const dcls = F ? (s.on ? F.kind : "hide") : (s.on ? "flow" : "");
+      const tip = F ? (F.kind === "trace" ? "" : (s.on ? "ar-" + F.kind : "")) : (s.on ? "ar-flow" : "ar");
+      out += `<circle class="readdot ${dcls}" cx="${lx}" cy="${s.y}" r="3.5"><title>read in turn ${s.r.turn}</title></circle>`;
+      out += `<path class="lane ${dcls} ${s.r.tag === "in_prompt" ? "" : "ret"}" d="M${lx},${s.y} H${inX}"${tip ? ` marker-end="url(#${tip})"` : ""}/>`;
     }
   }
   for (const r of L.rows) for (const c of COLS) for (const b of r.cells[c]) {
@@ -388,12 +423,12 @@ function renderGraph() {
 $("clearfocus").onclick = () => { focus = null; renderGraph(); };
 
 /* ---------------- inspector ---------------- */
-function selectBox(id) { sel = id; focus = null; lastResult = null; renderGraph(); renderInspector(); }
+function selectBox(id) { sel = id; focus = null; flowTurn = null; lastResult = null; renderGraph(); renderInspector(); }
 function renderInspector() {
   if (!sel) {
     $("inspector").innerHTML = S && S.log.length
       ? `<span class="empty">Click any box (or a reply in the chat) to see where it came from and what came from it.</span>`
-      : `<span class="empty">Run the story, then click Chloe's reply to start. Press <b>?</b> for a walkthrough.</span>`;
+      : `<span class="empty">Play the story, then click Chloe's reply to start. Press <b>?</b> for a walkthrough.</span>`;
     return;
   }
   const b = S.box[sel], t = S.turns.find(t => t.id === b.turn), gone = b.quarantined || b.deleted;
@@ -478,8 +513,52 @@ async function run(action) {
   load(data);
 }
 
-$("story").onclick = () => busy(async () => { sel = null; focus = null; lastResult = null; tab = "all"; load(await api("/api/story", {})); });
-$("reset").onclick = () => busy(async () => { sel = null; focus = null; lastResult = null; tab = "all"; load(await api("/api/reset", {})); });
+// Play the story: start over, then one turn every few seconds (pausable).
+$("story").onclick = async () => {
+  stopPlayer();
+  await busy(async () => { sel = null; focus = null; lastResult = null; flowTurn = null; tab = "all"; load(await api("/api/reset", {})); });
+  Object.assign(player, {on: true, paused: false, i: 0});
+  $("player").classList.add("on");
+  playStep();
+};
+async function playStep() {
+  clearTimeout(player.timer);
+  if (!player.on) return;
+  if (player.i >= S.story.length) return finishPlayer();
+  const n = S.story[player.i];
+  $("pstep").textContent = `Step ${player.i + 1} of ${S.story.length}`;
+  $("pcap").textContent = CAPTIONS[player.i] || "";
+  $("pnext").disabled = true;
+  await busy(async () => { load(await api("/api/chat", {customer: n.customer, message: n.message})); });
+  flowTurn = S.turns[S.turns.length - 1].id;
+  renderGraph();
+  const wrap = $("graphwrap"); wrap.scrollTop = wrap.scrollHeight;
+  player.i += 1;
+  $("pnext").disabled = false;
+  if (!player.paused) player.timer = setTimeout(playStep, 4500);
+}
+function finishPlayer() {
+  $("pstep").textContent = "Done";
+  $("pcap").innerHTML = "The false claim reached Ana and Chloe across all four systems. Now click Chloe's reply in the chat (<b>where did this come from?</b>) to trace it back.";
+  $("ppause").style.display = "none"; $("pnext").style.display = "none";
+  $("pstop").textContent = "Close";
+  player.on = false;
+}
+function stopPlayer() {
+  clearTimeout(player.timer);
+  player.on = false; flowTurn = null;
+  $("player").classList.remove("on");
+  $("ppause").style.display = ""; $("pnext").style.display = ""; $("ppause").textContent = "Pause"; $("pstop").textContent = "Stop";
+  if (S) renderGraph();
+}
+$("ppause").onclick = () => {
+  player.paused = !player.paused;
+  $("ppause").textContent = player.paused ? "Resume" : "Pause";
+  if (player.paused) clearTimeout(player.timer); else playStep();
+};
+$("pnext").onclick = () => { player.paused = true; $("ppause").textContent = "Resume"; playStep(); };
+$("pstop").onclick = stopPlayer;
+$("reset").onclick = () => busy(async () => { stopPlayer(); sel = null; focus = null; lastResult = null; tab = "all"; load(await api("/api/reset", {})); });
 $("helpbtn").onclick = () => $("help").classList.add("on");
 for (const m of document.querySelectorAll(".modal")) m.onclick = e => { if (e.target === m) m.classList.remove("on"); };
 api("/api/state").then(load);
