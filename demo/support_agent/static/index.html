@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dod: lineage for agent memory</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a64; --line: #e3e1d9;
+    --accent: #2a5bd7; --trace: #2a5bd7; --blast: #c8372d; --ok: #1f7a4d; --warn: #b26a00;
+    --state: #7a5af5; --memory: #0f8b8d; --notes: #b26a00; --crm: #c8372d;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--sans); }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: -0.01em; }
+  header h1 b { font-family: var(--mono); }
+  header .tag { color: var(--muted); font-size: 13px; }
+  header .spacer { flex: 1; }
+  .badge { font: 12px var(--mono); padding: 3px 8px; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); background: var(--bg); }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button:hover { border-color: #c9c6ba; }
+  button.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
+  button.danger { background: var(--blast); color: #fff; border-color: var(--blast); }
+  button.good { background: var(--ok); color: #fff; border-color: var(--ok); }
+  button:disabled { opacity: .5; cursor: default; }
+  main { display: grid; grid-template-columns: 380px 1fr; height: calc(100% - 55px); }
+  #chat { display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); min-height: 0; }
+  #chat h2, #console h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; padding: 14px 18px 8px; }
+  #log { flex: 1; overflow: auto; padding: 4px 18px 12px; }
+  .turn { margin: 10px 0 14px; }
+  .who { font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  .bubble { padding: 8px 11px; border-radius: 10px; max-width: 92%; }
+  .q .bubble { background: var(--bg); }
+  .a { margin-top: 6px; display: flex; flex-direction: column; align-items: flex-end; }
+  .a .bubble { background: #eef2fd; }
+  .a.bad .bubble { background: #fbeceb; text-decoration: line-through; text-decoration-color: #c8372d88; }
+  .a.regen .bubble { background: #e8f5ee; }
+  .chip { font: 11px var(--mono); color: var(--accent); cursor: pointer; margin-top: 3px; }
+  .chip:hover { text-decoration: underline; }
+  #compose { border-top: 1px solid var(--line); padding: 12px 18px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  #compose .row { display: flex; gap: 8px; }
+  #compose select { width: 84px; }
+  #compose button { flex: none; }
+  #compose select, #compose input { font: inherit; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  #compose input { flex: 1; min-width: 0; }
+  #next { font-size: 12px; color: var(--muted); cursor: pointer; border: 1px dashed var(--line); border-radius: 8px; padding: 6px 9px; }
+  #next:hover { border-color: var(--accent); color: var(--ink); }
+  #console { display: grid; grid-template-rows: auto 1fr auto; min-height: 0; min-width: 0; }
+  #legend { display: flex; gap: 14px; align-items: center; padding: 0 18px 8px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; vertical-align: -1px; margin-right: 4px; }
+  #graphwrap { overflow: auto; padding: 0 18px; min-height: 0; }
+  svg text { font: 12px var(--sans); }
+  .node rect.box { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; rx: 8; }
+  .node { cursor: pointer; }
+  .node:hover rect.box { stroke: #9e9b90; }
+  .node.sel rect.box { stroke: var(--ink); stroke-width: 2; }
+  .node.trace rect.box { stroke: var(--trace); stroke-width: 2; fill: #eef2fd; }
+  .node.root rect.box { stroke: var(--trace); stroke-width: 3; fill: #dfe7fc; }
+  .node.blast rect.box { stroke: var(--blast); stroke-width: 2; fill: #fbeceb; }
+  .node.quar { opacity: .38; }
+  .node.quar rect.box { stroke-dasharray: 4 3; }
+  .node.new rect.box { stroke: var(--ok); stroke-width: 2; fill: #e8f5ee; }
+  .node .sub { fill: var(--muted); font-size: 11px; }
+  .node .src { font: 10px var(--mono); }
+  path.edge { fill: none; stroke: #d6d3c8; stroke-width: 1; }
+  path.edge.ret { stroke-dasharray: 3 3; }
+  path.edge.trace { stroke: var(--trace); stroke-width: 1.8; }
+  path.edge.blast { stroke: var(--blast); stroke-width: 1.8; }
+  path.edge.dim { stroke-opacity: .25; }
+  .colhead { font-size: 12px; font-weight: 600; }
+  .colsub { font-size: 11px; fill: var(--muted); }
+  #inspector { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 18px 16px; min-height: 150px; }
+  #inspector .title { font-weight: 600; }
+  #inspector .meta { font: 12px var(--mono); color: var(--muted); margin: 2px 0 8px; }
+  #inspector .preview { background: var(--bg); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; white-space: pre-wrap; }
+  #inspector .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  #result { margin-top: 10px; font-size: 13px; }
+  #result .stat { display: inline-block; margin-right: 14px; }
+  #result .stat b { font-size: 18px; }
+  .origin { padding: 6px 10px; border-left: 3px solid var(--trace); background: #eef2fd; margin: 4px 0; border-radius: 0 6px 6px 0; cursor: pointer; }
+  .origin.user { border-left-color: var(--blast); background: #fbeceb; }
+  .empty { color: var(--muted); }
+  .spin { opacity: .6; pointer-events: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1><b>dod</b> · lineage for agent memory</h1>
+  <span class="tag">A support agent whose memory spans four real stores</span>
+  <span class="spacer"></span>
+  <span class="badge" id="model"></span>
+  <span class="badge" id="backend"></span>
+  <button id="story" class="primary" title="Reset, then run the whole story">Run the story</button>
+  <button id="reset">Reset</button>
+</header>
+<main>
+  <section id="chat">
+    <h2>Customer chat</h2>
+    <div id="log"></div>
+    <div id="compose">
+      <div id="next" title="Send the next message of the story"></div>
+      <div class="row">
+        <select id="customer"></select>
+        <input id="message" placeholder="Message from the customer…" autocomplete="off">
+        <button id="send" class="primary">Send</button>
+      </div>
+    </div>
+  </section>
+  <section id="console">
+    <div>
+      <h2>Lineage: what each write was derived from</h2>
+      <div id="legend"></div>
+    </div>
+    <div id="graphwrap"><svg id="graph"></svg></div>
+    <div id="inspector"><span class="empty">Click any item, or a reply in the chat, to trace it.</span></div>
+  </section>
+</main>
+<script>
+const COLS = ["langgraph_state", "memory", "notes", "mcp:crm"];
+const COLOR = {"langgraph_state": "var(--state)", "memory": "var(--memory)", "notes": "var(--notes)", "mcp:crm": "var(--crm)"};
+const SUB = {"langgraph_state": "LangGraph thread state", "memory": "", "notes": "Anthropic memory tool", "mcp:crm": "separate MCP server · SQLite"};
+const W = 210, H = 50, GAP = 12, COLGAP = 70, TOP = 56;
+let S = null, sel = null, hl = {trace: new Set(), roots: new Set(), blast: new Set()}, fresh = new Set(), storyStep = 0;
+const $ = id => document.getElementById(id);
+const key = (s, r) => s + "\u0000" + r;
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+function busy(on) { document.body.classList.toggle("spin", on); }
+
+function load(data, markNew) {
+  const before = S ? new Set(S.nodes.map(n => key(n.store, n.record_id))) : null;
+  S = data;
+  if (before) for (const n of S.nodes) if (!before.has(key(n.store, n.record_id)) && markNew) fresh.add(key(n.store, n.record_id));
+  $("model").textContent = "model: " + S.model;
+  $("backend").textContent = "memory: " + S.backend;
+  SUB.memory = S.backend.startsWith("Postgres") ? "Postgres + pgvector" : "in-memory store";
+  renderChat(); renderGraph(); renderNext();
+}
+
+function renderNext() {
+  const n = S.log.length < S.story.length && storyStep === S.log.length ? S.story[S.log.length] : null;
+  $("next").style.display = n ? "" : "none";
+  if (n) $("next").textContent = `Next in the story → ${n.customer}: “${n.message}”`;
+}
+
+function renderChat() {
+  const q = new Set(S.nodes.filter(n => n.quarantined || n.deleted).map(n => key(n.store, n.record_id)));
+  $("log").innerHTML = S.log.map(e => {
+    const regen = e.thread.includes("regenerated");
+    const bad = q.has(key("mcp:crm", e.reply_id));
+    return `<div class="turn">${regen ? "" : `<div class="q"><div class="who">${e.customer}</div><div class="bubble">${esc(e.message)}</div></div>`}
+      <div class="a ${bad ? "bad" : ""} ${regen ? "regen" : ""}"><div class="who">agent → ${e.customer}${regen ? " · regenerated" : ""}</div>
+      <div class="bubble">${esc(e.reply)}</div>
+      <div class="chip" data-r="${e.reply_id}">reply ${e.reply_id} · trace ↗</div></div></div>`;
+  }).join("") || `<p class="empty">No conversations yet. Send a message, or run the story.</p>`;
+  for (const c of $("log").querySelectorAll(".chip")) c.onclick = () => select("mcp:crm", c.dataset.r, true);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])); }
+
+function layout() {
+  const pos = new Map(), cols = {};
+  for (const c of COLS) cols[c] = [];
+  for (const n of S.nodes) if (!n.record_id.startsWith("call:") && cols[n.store]) cols[n.store].push(n);
+  COLS.forEach((c, i) => cols[c].forEach((n, j) => pos.set(key(n.store, n.record_id), {x: 10 + i * (W + COLGAP), y: TOP + j * (H + GAP), n})));
+  const rows = Math.max(1, ...COLS.map(c => cols[c].length));
+  return {pos, width: 20 + COLS.length * (W + COLGAP) - COLGAP, height: TOP + rows * (H + GAP) + 10};
+}
+
+function renderGraph() {
+  const {pos, width, height} = layout();
+  const svg = $("graph");
+  svg.setAttribute("width", width); svg.setAttribute("height", height);
+  const focus = hl.trace.size || hl.blast.size;
+  let out = COLS.map((c, i) => `<text class="colhead" x="${10 + i * (W + COLGAP)}" y="20" fill="${COLOR[c]}">${S.stores[c]}</text>
+    <text class="colsub" x="${10 + i * (W + COLGAP)}" y="36">${SUB[c]}</text>`).join("");
+  const edges = [];
+  for (const e of S.edges) {
+    const a = pos.get(key(...e.from)), b = pos.get(key(...e.to));
+    if (!a || !b) continue;
+    const ka = key(...e.from), kb = key(...e.to);
+    let cls = "edge" + (e.tag === "in_prompt" ? "" : " ret");
+    const onTrace = (hl.trace.has(ka) || hl.roots.has(ka)) && (hl.trace.has(kb) || kb === selKey());
+    const onBlast = (hl.blast.has(kb)) && (hl.blast.has(ka) || ka === selKey());
+    if (onTrace) cls += " trace"; else if (onBlast) cls += " blast"; else if (focus) cls += " dim";
+    const x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2;
+    let d;
+    if (a.x === b.x) { const bx = a.x + W + 28; d = `M${x1},${y1} C${bx},${y1} ${bx},${y2} ${a.x + W},${y2}`; }
+    else if (a.x < b.x) { const m = (x1 + x2) / 2; d = `M${x1},${y1} C${m},${y1} ${m},${y2} ${x2},${y2}`; }
+    else { const xa = a.x, xb = b.x + W, m = (xa + xb) / 2; d = `M${xa},${y1} C${m},${y1} ${m},${y2} ${xb},${y2}`; }
+    edges.push([onTrace || onBlast ? 1 : 0, `<path class="${cls}" d="${d}"/>`]);
+  }
+  edges.sort((p, q) => p[0] - q[0]);
+  out += edges.map(e => e[1]).join("");
+  for (const [k, p] of pos) {
+    const n = p.n, cls = ["node"];
+    if (k === selKey()) cls.push("sel");
+    if (hl.roots.has(k)) cls.push("root"); else if (hl.trace.has(k)) cls.push("trace");
+    if (hl.blast.has(k)) cls.push("blast");
+    if (n.quarantined || n.deleted) cls.push("quar");
+    if (fresh.has(k)) cls.push("new");
+    const src = n.source === "user" ? "user" : n.source === "tool" ? "tool" : n.source === "agent_inference" ? "agent" : n.source;
+    out += `<g class="${cls.join(" ")}" data-s="${esc(n.store)}" data-r="${esc(n.record_id)}" transform="translate(${p.x},${p.y})">
+      <rect class="box" width="${W}" height="${H}"/><rect width="4" height="${H}" rx="2" fill="${COLOR[n.store]}"/>
+      <text x="12" y="19">${esc(clip(n.label, n.quarantined ? 18 : 24))}</text>
+      <text class="sub" x="12" y="37">${esc(clip(n.preview, 31))}</text>
+      <text class="src" x="${W - 8}" y="19" text-anchor="end" fill="${n.source === "user" ? "var(--blast)" : "var(--muted)"}">${n.deleted ? "deleted" : n.quarantined ? "quarantined" : src}</text></g>`;
+  }
+  svg.innerHTML = out;
+  for (const g of svg.querySelectorAll(".node")) g.onclick = () => select(g.dataset.s, g.dataset.r, false);
+}
+function clip(s, n) { s = String(s || ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+function selKey() { return sel ? key(sel.store, sel.record_id) : null; }
+
+async function select(store, rid, andTrace) {
+  sel = S.nodes.find(n => n.store === store && n.record_id === rid) || {store, record_id: rid, label: rid, preview: ""};
+  hl = {trace: new Set(), roots: new Set(), blast: new Set()};
+  inspector(); renderGraph();
+  if (andTrace) await act("trace");
+}
+
+function inspector(html) {
+  if (!sel) return;
+  const gone = sel.quarantined || sel.deleted;
+  $("inspector").innerHTML = `<div class="title">${esc(sel.label)}</div>
+    <div class="meta">${esc(S.stores[sel.store] || sel.store)} · ${esc(sel.record_id)} · source: ${esc(sel.source || "?")}${gone ? " · quarantined" : ""}</div>
+    <div class="preview">${esc(sel.preview || "")}</div>
+    <div class="actions">
+      <button onclick="act('trace')">Trace origin ←</button>
+      <button onclick="act('blast')">Blast radius →</button>
+      <button class="danger" onclick="act('excise')" ${gone ? "disabled" : ""}>Excise…</button>
+      <button class="good" onclick="act('regenerate')" ${gone ? "disabled" : ""}>Excise &amp; regenerate…</button>
+    </div><div id="result">${html || ""}</div>`;
+}
+
+async function act(action) {
+  const body = {store: sel.store, record_id: sel.record_id};
+  try {
+    if (action === "excise" || action === "regenerate") {
+      const c = (await api("/api/item/compare", body)).result;
+      const what = action === "excise" ? "Quarantine" : "Quarantine, then re-answer affected customers from clean memory:";
+      if (!confirm(`${what}\n\nExcise removes ${c.excise} contaminated item(s) and keeps ${c.kept}.\nWiping every store would lose all ${c.live}.`)) return;
+    }
+    busy(true);
+    const data = await api("/api/item/" + action, body);
+    const r = data.result;
+    load(data, action === "regenerate");
+    sel = S.nodes.find(n => n.store === sel.store && n.record_id === sel.record_id) || sel;
+    if (action === "trace") {
+      hl.trace = new Set(r.items.map(i => key(...i)));
+      hl.roots = new Set(r.roots.map(o => key(o.store, o.record_id)));
+      const said = r.roots.filter(o => o.source === "user" || o.source === "tool");
+      const docs = r.roots.filter(o => !said.includes(o));
+      inspector(`<div>Derived from ${hl.trace.size} item(s) across stores. Where it came from: what customers said (click one to see everything it reached)…</div>` +
+        said.map(o => `<div class="origin user" data-s="${esc(o.store)}" data-r="${esc(o.record_id)}"><b>${esc(o.label)}</b> · ${esc(o.source)}<br>${esc(clip(o.preview, 160))}</div>`).join("") +
+        (docs.length ? `<div class="origin" style="cursor:default">…and ${docs.length} company record(s): ${docs.map(o => esc(o.label)).join(", ")}</div>` : ""));
+      for (const el of document.querySelectorAll(".origin")) el.onclick = () => select(el.dataset.s, el.dataset.r, false).then(() => act("blast"));
+    } else if (action === "blast") {
+      hl.blast = new Set(r.items.map(i => key(...i)));
+      const per = Object.entries(r.per_store).map(([s, n]) => `<span class="stat"><b>${n}</b> ${esc(S.stores[s] || s)}</span>`).join("");
+      inspector(`<div>${hl.blast.size} item(s) were derived from this, across ${Object.keys(r.per_store).length} store(s):</div><div style="margin-top:6px">${per || '<span class="empty">nothing</span>'}</div>`);
+    } else if (action === "excise") {
+      const n = Object.values(r.targets).reduce((a, b) => a + b.length, 0);
+      inspector(`<div><b>Quarantined ${n} item(s)</b> across ${Object.keys(r.targets).length} store(s). Instrumented reads no longer return them; ${r.compare.kept} correct item(s) untouched.</div>`);
+    } else if (action === "regenerate") {
+      inspector(`<div><b>Re-answered ${r.replaced.length} customer(s)</b> from clean memory (green); dropped ${r.dropped.length} contaminated item(s)${r.failed.length ? `; ${r.failed.length} failed` : ""}. New replies are in the chat.</div>`);
+    }
+    renderGraph();
+  } catch (e) { alert(e.message); }
+  finally { busy(false); }
+}
+
+async function send(customer, message) {
+  busy(true);
+  try { load(await api("/api/chat", {customer, message})); storyStep = S.log.length; }
+  catch (e) { alert(e.message); } finally { busy(false); }
+}
+
+$("send").onclick = () => { const m = $("message").value.trim(); if (m) { send($("customer").value, m); $("message").value = ""; } };
+$("message").onkeydown = e => { if (e.key === "Enter") $("send").onclick(); };
+$("next").onclick = () => { const n = S.story[S.log.length]; send(n.customer, n.message); };
+$("story").onclick = async () => { busy(true); try { reset(); load(await api("/api/story", {})); storyStep = -1; } finally { busy(false); } };
+$("reset").onclick = async () => { busy(true); try { reset(); load(await api("/api/reset", {})); storyStep = 0; } finally { busy(false); } };
+function reset() { sel = null; hl = {trace: new Set(), roots: new Set(), blast: new Set()}; fresh = new Set(); $("inspector").innerHTML = '<span class="empty">Click any item, or a reply in the chat, to trace it.</span>'; }
+
+$("legend").innerHTML = COLS.map(c => `<span><span class="sw" style="background:${COLOR[c]}"></span>${c === "mcp:crm" ? "CRM (MCP)" : c === "langgraph_state" ? "conversation" : c}</span>`).join("") +
+  `<span>— in prompt</span><span>┄ retrieved in scope</span><span style="color:var(--trace)">■ trace</span><span style="color:var(--blast)">■ blast radius</span>`;
+api("/api/state").then(d => { load(d); $("customer").innerHTML = S.customers.map(c => `<option>${c}</option>`).join(""); storyStep = S.log.length; });
+</script>
+</body>
+</html>

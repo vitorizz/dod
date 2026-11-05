@@ -136,11 +136,25 @@ class World:
         params = StdioServerParameters(
             command=sys.executable, args=["-m", "demo.support_agent.crm_server", self._crm_db],
             cwd=str(REPO), env={**os.environ, "PYTHONPATH": str(REPO)})
-        self._stdio = stdio_client(params)
-        read, write = await self._stdio.__aenter__()
-        self._session_cm = ClientSession(read, write)
-        session = await self._session_cm.__aenter__()
-        await session.initialize()
+        # The MCP client's cancel scopes must be entered and exited in one
+        # task, so the connection lives in a task of its own until stop().
+        ready: "asyncio.Future" = asyncio.get_running_loop().create_future()
+        self._closing = asyncio.Event()
+
+        async def connection():
+            try:
+                async with stdio_client(params) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        ready.set_result(session)
+                        await self._closing.wait()
+            except BaseException as exc:
+                if not ready.done():
+                    ready.set_exception(exc)
+                raise
+
+        self._crm_task = asyncio.create_task(connection())
+        session = await ready
         self.crm = dmcp.instrument(session, self.cap, "crm", record_id=_result_id)
         await self.crm.list_tools()  # learn which tools are read-only
 
@@ -154,8 +168,11 @@ class World:
         self._seed()
 
     async def stop(self) -> None:
-        await self._session_cm.__aexit__(None, None, None)
-        await self._stdio.__aexit__(None, None, None)
+        self._closing.set()
+        try:
+            await self._crm_task
+        except Exception:
+            pass
         self.ledger.close()
         if self.pg_uri:
             self._pg_cm.__exit__(None, None, None)
@@ -192,8 +209,10 @@ class World:
             order = json.loads(r.content[0].text)
             if "error" in order:
                 order = None
+        # Semantic search, ranked by relevance. The handbook is small, so
+        # every policy fits in the prompt; a real one would keep the top k.
         policies = [i.value["text"] for i in self.memory.search(("policies",), query=text,
-                                                                 limit=4)]
+                                                                 limit=len(POLICIES))]
         notes_about = [i.value["text"] for i in self.memory.search(("customers", customer),
                                                                     limit=10)]
         topics = [t for t, words in TOPICS.items() if any(w in text.lower() for w in words)]
@@ -279,6 +298,8 @@ class World:
             return {"R": "reply ", "T": "ticket "}.get(rid[:1], "") + rid
         if store == "langgraph_state":
             thread = json.loads(rid)[0]
+            if "-regenerated-" in thread:
+                return f"{thread.split('-regenerated-')[0]} (regenerated)"
             return f"{thread}'s conversation"
         if store == "notes":
             return rid.rsplit("/", 1)[-1]

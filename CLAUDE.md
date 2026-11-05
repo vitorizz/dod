@@ -45,6 +45,8 @@ Everything else is a query over this graph:
 ## Demo to build toward
 Plant a false memory, let the agent derive 3–5 downstream memories across two stores, surface a confirmed bad output, trace to root, show blast radius, excise only the affected subgraph, re-run correctly. Compare side-by-side with "wipe everything."
 
+The demo lives in `demo/support_agent/` (not part of the package): a LangGraph support agent over Postgres/pgvector, an MCP CRM server process, memory-tool files and graph state, with a Starlette web console (`python -m demo.support_agent.app`). `tests/test_demo_support_agent.py` runs its story with the scripted model.
+
 ## Biggest technical risk
 **Capture completeness.** Any write path that bypasses the hook (direct DB insert, out-of-wrapper tool, compaction rewriting memory) silently breaks the guarantee. Make capture the only write path, or continuously reconcile store contents against the ledger.
 

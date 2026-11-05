@@ -240,6 +240,15 @@ Next: more integrations (other frameworks, more MCP-reachable stores).
 
 ## Demo
 
+**The support-agent demo** (`demo/`, see [demo/README.md](demo/README.md)) is the full version: a LangGraph agent whose memory spans Postgres + pgvector, an MCP CRM server, memory-tool files and its own conversation state, with a web console to trace a wrong reply to a customer's false claim, see its blast radius across all four stores, and excise or regenerate only that. It runs with a scripted model, Ollama/any OpenAI-compatible server, or Claude:
+
+```bash
+pip install -e ".[langgraph,anthropic,mcp,postgres]"
+python -m demo.support_agent.app   # then open http://localhost:8000
+```
+
+The original, terminal-only demo:
+
 A support agent keeps memory in CrewAI and a LangGraph store, with 12 correct items. One customer message gets saved as a "policy update" (refunds within 90 days; the real policy is 30), and scripted steps derive four items from it across both stores. The last one is a wrong reply to a customer. The demo traces that reply back to its roots, shows the blast radius per store, quarantines only that subgraph, and re-runs the reply. Then it compares the result with wiping everything.
 
 ```bash
