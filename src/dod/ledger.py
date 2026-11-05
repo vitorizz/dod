@@ -63,13 +63,14 @@ Parent = Tuple[str, str, str]
 # Stored in the file's ``PRAGMA user_version``. Bump it on any change to
 # tables, columns, triggers or views, and ship a migration (or a "recreate"
 # note in docs/decisions.md) with the bump.
-SCHEMA_VERSION = 5  # 5: bindings.content_hash; 4: child_edges dropped; 3: delta context sets (#52)
+SCHEMA_VERSION = 6  # 6: audit_chain; 5: bindings.content_hash; 4: child_edges dropped; 3: delta context sets (#52)
 # Older files migrate in place, one version at a time: version 4 only drops
 # the derived child_edges index, which the lineage file replaces; version 5
 # adds a nullable column.
 _MIGRATIONS = {
     3: ("DROP TABLE IF EXISTS child_edges", "DROP TABLE IF EXISTS child_edges_filled"),
     4: ("ALTER TABLE bindings ADD COLUMN content_hash TEXT",),
+    # 5 -> 6: filled in below (the audit chain table and its triggers).
 }
 # The lineage file's ``PRAGMA user_version``. It is derived, so a file at
 # another version is rebuilt rather than migrated.
@@ -88,7 +89,7 @@ class LedgerSchemaError(Exception):
 
 _TABLES = (
     "writes", "direct_parents", "context_sets", "context_members", "context_chain",
-    "bindings", "tombstones", "quarantine",
+    "bindings", "tombstones", "quarantine", "audit_chain",
 )
 _INDEX_TABLES = (
     "items", "direct_children", "part_items", "set_parts", "set_writes", "write_items",
@@ -308,6 +309,14 @@ CREATE TABLE IF NOT EXISTS quarantine (
     reason    TEXT,
     actor     TEXT
 );
+CREATE TABLE IF NOT EXISTS audit_chain (
+    seq    INTEGER PRIMARY KEY AUTOINCREMENT,
+    digest TEXT NOT NULL UNIQUE,
+    prev   TEXT,
+    ts     INTEGER NOT NULL,
+    w_lo INTEGER, w_hi INTEGER, s_lo INTEGER, s_hi INTEGER, b_lo INTEGER, b_hi INTEGER,
+    t_lo INTEGER, t_hi INTEGER, q_lo INTEGER, q_hi INTEGER
+);
 CREATE INDEX IF NOT EXISTS bindings_by_write ON bindings (write_id);
 CREATE INDEX IF NOT EXISTS bindings_by_record ON bindings (store, record_id);
 CREATE INDEX IF NOT EXISTS tombstones_by_record ON tombstones (store, record_id);
@@ -347,6 +356,7 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
         ("bindings", ""),
         ("tombstones", ""),
         ("quarantine", ""),
+        ("audit_chain", ""),
     )
 ) + """
 CREATE TRIGGER IF NOT EXISTS context_chain_no_replace BEFORE INSERT ON context_chain
@@ -458,6 +468,11 @@ def _statements(script: str):
         if sqlite3.complete_statement(buf):
             yield buf
             buf = ""
+
+
+# 5 -> 6: the audit chain table and its triggers. Rows already in a
+# version-5 file stay unchained; verify() reports them as such.
+_MIGRATIONS[5] = tuple(stmt for stmt in _statements(_SCHEMA) if "audit_chain" in stmt)
 
 
 def _check_schema(conn: sqlite3.Connection, path) -> int:
@@ -654,6 +669,115 @@ def _tombstone_row(t: dict, ts: int) -> tuple:
     )
 
 
+# --- the audit chain ---------------------------------------------------------
+#
+# Every transaction that appends rows also appends one audit_chain entry: the
+# ranges of ids it added to each table, and the sha256 of the previous entry's
+# digest plus every row in those ranges (and the parent, member and chain rows
+# that belong to them), read back from the database in a fixed order. verify()
+# recomputes the chain the same way, so an edited, deleted or hand-inserted
+# row breaks it. Rows have no content to hash: what is chained is the ledger's
+# own IDs, hashes and edges.
+
+# (table, id column, the entry's range columns)
+_CHAINED = (
+    ("writes", "seq", "w"), ("context_sets", "seq", "s"), ("bindings", "rowid", "b"),
+    ("tombstones", "seq", "t"), ("quarantine", "seq", "q"),
+)
+# Each table's rows in an entry's id range, as a JSON array, in a fixed order.
+# context_members isn't hashed: a set's hash is the content address of its
+# members, which ``dod.audit.verify`` recomputes, so the set rows cover them.
+# (name, range key, the subquery: columns, then FROM/WHERE with ? > lo, ? <= hi)
+_CHAIN_ROWS = (
+    ("writes", "w", "seq, write_id, content_hash, ts, store, agent_id, session_id, source,"
+     " context_set", "FROM writes WHERE seq > ? AND seq <= ? ORDER BY seq"),
+    ("direct_parents", "w", "d.write_id, d.parent_store, d.parent_record_id, d.tag",
+     "FROM writes w JOIN direct_parents d ON d.write_id = w.write_id"
+     " WHERE w.seq > ? AND w.seq <= ? ORDER BY d.write_id, d.parent_store, d.parent_record_id"),
+    ("context_sets", "s", "seq, set_hash, size, ts, base, step, upgrades",
+     "FROM context_sets WHERE seq > ? AND seq <= ? ORDER BY seq"),
+    ("context_chain", "s", "c.set_hash, c.part",
+     "FROM context_sets s JOIN context_chain c ON c.set_hash = s.set_hash"
+     " WHERE s.seq > ? AND s.seq <= ? ORDER BY c.set_hash, c.part"),
+    ("bindings", "b", "rowid, write_id, store, record_id, ts, content_hash",
+     "FROM bindings WHERE rowid > ? AND rowid <= ? ORDER BY rowid"),
+    ("tombstones", "t", "seq, store, record_id, ts, reason, write_id, agent_id, session_id",
+     "FROM tombstones WHERE seq > ? AND seq <= ? ORDER BY seq"),
+    ("quarantine", "q", "seq, ts, store, record_id, action, reason, actor",
+     "FROM quarantine WHERE seq > ? AND seq <= ? ORDER BY seq"),
+)
+
+
+def _chain_sql(cols: str, rest: str) -> str:
+    n = len(cols.split(","))
+    return (f"(SELECT coalesce(json_group_array(json_array({', '.join(f'c{i}' for i in range(n))})),"
+            f" '[]') FROM (SELECT {', '.join(f'{c.strip()} AS c{i}' for i, c in enumerate(cols.split(',')))}"
+            f" {rest}))")
+
+
+# One statement per set of non-empty ranges: the rows of every table as a
+# JSON array of arrays ('[]' for a table with no range). SQLite aggregates a
+# subquery's rows in its ORDER BY order.
+_CHAIN_SELECT: dict = {}
+_CHAIN_TOPS: dict = {}
+
+
+def _chain_select(keys: frozenset) -> str:
+    sql = _CHAIN_SELECT.get(keys)
+    if sql is None:
+        sql = _CHAIN_SELECT[keys] = "SELECT json_array(" + ", ".join(
+            _chain_sql(c, r) if k in keys else "json('[]')"
+            for _, k, c, r in _CHAIN_ROWS) + ")"
+    return sql
+
+
+def _chain_tops(keys: tuple) -> str:
+    sql = _CHAIN_TOPS.get(keys)
+    if sql is None:
+        sql = _CHAIN_TOPS[keys] = (
+            "SELECT (SELECT digest FROM audit_chain ORDER BY seq DESC LIMIT 1)"
+            + "".join(f", (SELECT coalesce(max({col}), 0) FROM {table})"
+                      for table, col, k in _CHAINED if k in keys))
+    return sql
+
+
+def _chain_digest(conn: sqlite3.Connection, prev: Optional[str], ranges: dict) -> str:
+    """The digest of an entry: sha256 of ``prev`` and every row in ``ranges``
+    (``{"w": (lo, hi), ...}``; missing for none), read back from the file."""
+    args = []
+    for _, k, _, _ in _CHAIN_ROWS:
+        if k in ranges:
+            args += ranges[k]
+    (rows,) = conn.execute(_chain_select(frozenset(ranges)), args).fetchone()
+    return hashlib.sha256(f"{prev or ''}\n{rows}".encode("utf-8")).hexdigest()
+
+
+def _chain_append(conn: sqlite3.Connection, counts: dict, ts: int) -> None:
+    """Append the audit entry for the rows this transaction just added:
+    ``counts`` is ``{"w": n_writes, "s": n_sets, "b": ..., "t": ..., "q": ...}``.
+    Called inside the transaction, after its inserts; ids are contiguous
+    because the transaction holds the write lock."""
+    keys = tuple(k for _, _, k in _CHAINED if counts.get(k))
+    if not keys:
+        return
+    prev, *tops = conn.execute(_chain_tops(keys)).fetchone()
+    ranges = {k: (hi - counts[k], hi) for k, hi in zip(keys, tops)}
+    vals = []
+    for _, _, k in _CHAINED:
+        vals += ranges.get(k, (None, None))
+    conn.execute(
+        "INSERT INTO audit_chain (digest, prev, ts, w_lo, w_hi, s_lo, s_hi, b_lo, b_hi,"
+        " t_lo, t_hi, q_lo, q_hi) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [_chain_digest(conn, prev, ranges), prev, ts, *vals],
+    )
+
+
+def _all_rows(conn: sqlite3.Connection) -> dict:
+    """Counts for ``_chain_append`` covering every row: ids (0, max]."""
+    return {k: conn.execute(f"SELECT coalesce(max({col}), 0) FROM {table}").fetchone()[0]
+            for table, col, k in _CHAINED}
+
+
 class Ledger:
     """Append-only ledger backed by one persistent SQLite connection.
 
@@ -718,6 +842,9 @@ class Ledger:
                     for stmt in _MIGRATIONS[version]:
                         conn.execute(stmt)
                     version += 1
+                if 0 < found < 6:
+                    # The chain is new: seal the rows already in the file.
+                    _chain_append(conn, _all_rows(conn), time.time_ns())
                 if version != found:
                     conn.execute(f"PRAGMA user_version={version}")
             except BaseException:
@@ -1011,6 +1138,7 @@ class Ledger:
             # upgrade fails with SQLITE_BUSY_SNAPSHOT, which is never retried.
             conn.execute("BEGIN IMMEDIATE")
             hints = {}  # chains this batch stored, by hint key
+            new_sets = 0
             try:
                 for set_hash, (members, key) in sets.items():
                     # Content-addressed and append-only: a set already
@@ -1038,6 +1166,7 @@ class Ledger:
                         "INSERT INTO context_chain VALUES (?, ?)",
                         [(set_hash, part[1]) for part in chain],
                     )
+                    new_sets += 1
                 conn.executemany(
                     "INSERT INTO writes (write_id, content_hash, ts, store, agent_id,"
                     " session_id, source, context_set) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1053,6 +1182,8 @@ class Ledger:
                         " agent_id, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                         tombstone_rows,
                     )
+                _chain_append(conn, {"w": len(write_rows), "s": new_sets,
+                                     "b": len(binding_rows), "t": len(tombstone_rows)}, ts)
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
@@ -1085,9 +1216,17 @@ class Ledger:
         store holds for the record right after the write, where that differs
         from (or can't be derived from) the write's own content hash.
         """
+        ts = time.time_ns()
         with self._lock:
-            self._conn.execute(_INSERT_BINDING, (write_id, store, record_id, time.time_ns(),
-                                                 content_hash))
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(_INSERT_BINDING, (write_id, store, record_id, ts, content_hash))
+                _chain_append(conn, {"b": 1}, ts)
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
 
     def quarantine(
         self, items: Iterable[Item], reason: Optional[str] = None,
@@ -1144,13 +1283,14 @@ class Ledger:
             return
         with self._lock:
             conn = self._conn
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.executemany(
                     "INSERT INTO quarantine (ts, store, record_id, action, reason, actor)"
                     " VALUES (?, ?, ?, ?, ?, ?)",
                     rows,
                 )
+                _chain_append(conn, {"q": len(rows)}, ts)
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
