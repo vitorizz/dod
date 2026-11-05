@@ -29,13 +29,19 @@ S = "postgres"
 rid = langgraph.record_id
 
 
+# PostgresStore creates its vector table once per database, with a fixed
+# dimension, and the demo's test (demo.support_agent.world.embed) shares the
+# database in CI: both use 64.
+DIMS = 64
+
+
 def embed(texts):
-    """Bag of words hashed into 16 dims: deterministic, no model."""
+    """Bag of words hashed into DIMS dims: deterministic, no model."""
     out = []
     for text in texts:
-        v = [0.0] * 16
+        v = [0.0] * DIMS
         for word in text.lower().split():
-            v[hashlib.sha256(word.encode()).digest()[0] % 16] += 1.0
+            v[hashlib.sha256(word.encode()).digest()[0] % DIMS] += 1.0
         out.append(v)
     return out
 
@@ -44,7 +50,7 @@ def embed(texts):
 def store(request):
     ns = ("dodtest", request.node.name)
     with PostgresStore.from_conn_string(
-        URI, index={"dims": 16, "embed": embed, "fields": ["text"]}
+        URI, index={"dims": DIMS, "embed": embed, "fields": ["text"]}
     ) as s:
         s.setup()
         _clear(s, ns)
