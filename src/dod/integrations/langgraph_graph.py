@@ -148,7 +148,7 @@ class _StateRecorder(BaseCallbackHandler):
         batch = [([i] if s else [], _canonical(update[c]), source, i[1])
                  for i, c, s in zip(items, channels, seen)]
         self.capture.on_batch(key, self.store, batch, agent_id=key[0], session_id=key[1])
-        self.capture.on_retrieve(key, items)
+        self.capture.on_retrieve(key, items, texts=[update[c] for c in channels])
 
 
 def _with_handler(config: Optional[dict], handler: BaseCallbackHandler) -> dict:
@@ -213,10 +213,10 @@ def instrument_graph(graph: Any, capture: Capture, store: str = "langgraph_state
             try:
                 snap = graph.get_state({"configurable": dict(c)})
                 values = getattr(snap, "values", None) or {}
-                items = [handler.item(ch) for ch in values
-                         if isinstance(ch, str) and not _internal(ch)]
+                chans = [ch for ch in values if isinstance(ch, str) and not _internal(ch)]
+                items = [handler.item(ch) for ch in chans]
                 if items:
-                    capture.on_retrieve(key, items)
+                    capture.on_retrieve(key, items, texts=[values[ch] for ch in chans])
             except Exception:
                 logger.exception("dod: couldn't read the thread's state; its channels"
                                  " aren't parents of this run")
