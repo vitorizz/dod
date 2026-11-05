@@ -105,3 +105,40 @@ def test_max_depth_and_unknown_store(path, capsys):
     assert data["truncated"] and data["items"] == [["mem", "d1"]]
     with pytest.raises(SystemExit):
         main(["excise", "nostore", "bad", "--ledger", path])
+
+
+@pytest.fixture
+def audited(tmp_path):
+    p = tmp_path / "audited.db"
+    with Ledger(p, audit=True) as led:
+        w = led.append_write(content="bad", store="mem", source="user")
+        led.bind(w, "mem", "bad")
+        w = led.append_write(content="d1", store="mem", source="agent_inference",
+                             parents=[("mem", "bad", "in_prompt")])
+        led.bind(w, "mem", "d1")
+    return str(p)
+
+
+def test_verify_and_report(audited, capsys):
+    run(capsys, "excise", "mem", "bad", "--ledger", audited)
+    code, out = run(capsys, "verify", "--ledger", audited, "--json")
+    data = json.loads(out)
+    assert code == 0 and data["ok"] and data["entries"] == 5  # CLI writes stay chained
+    code, out = run(capsys, "verify", "--ledger", audited, "--expect-head", data["head"])
+    assert code == 0 and out.startswith("verified")
+    _, out = run(capsys, "report", "mem", "bad", "--ledger", audited)
+    assert out.startswith("# Excision report: mem bad") and "quarantined 2" in out
+    _, out = run(capsys, "report", "mem", "bad", "--ledger", audited, "--json")
+    assert json.loads(out)["summary"]["quarantined"] == 2
+    with pytest.raises(SystemExit, match="no recorded write"):
+        main(["report", "mem", "nope", "--ledger", audited])
+
+
+def test_verify_fails_on_tampering(audited, capsys):
+    import sqlite3
+    conn = sqlite3.connect(audited, isolation_level=None)
+    conn.execute("DROP TRIGGER writes_no_update")
+    conn.execute("UPDATE writes SET source = 'document' WHERE seq = 1")
+    conn.close()
+    code, out = run(capsys, "verify", "--ledger", audited)
+    assert code == 1 and out.startswith("NOT VERIFIED") and "digest mismatch" in out

@@ -202,9 +202,11 @@ dod excise notes /memories/policies/refunds.md   # quarantine (reversible)
 dod release notes /memories/policies/refunds.md
 dod quarantined
 dod stats
+dod verify                              # audited ledgers: exit 1 if tampered
+dod report notes /memories/policies/refunds.md > excision.md
 ```
 
-Every command takes `--json`. The CLI only quarantines; deleting through stores needs their adapters, so use `dod.excise(mode="delete", stores=...)` in code.
+Every command takes `--json`. On a ledger with an audit chain, the CLI's own writes extend it. The CLI only quarantines; deleting through stores needs their adapters, so use `dod.excise(mode="delete", stores=...)` in code.
 
 ## Confirming what reached the prompt
 

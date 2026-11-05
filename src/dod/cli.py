@@ -21,6 +21,7 @@ import sys
 from typing import List, Optional
 
 import dod
+from dod import audit
 from dod.ledger import Ledger, LedgerSchemaError, _check_schema
 from dod.query import blast_radius, trace
 
@@ -34,10 +35,21 @@ def _path(args) -> str:
     return path
 
 
+def _audited(path: str) -> bool:
+    """Whether the file's audit chain is in use, so writes must extend it."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return bool(conn.execute("SELECT 1 FROM audit_chain LIMIT 1").fetchone())
+    except sqlite3.Error:
+        return False  # no chain table (an older schema)
+    finally:
+        conn.close()
+
+
 def _ledger(args) -> Ledger:
     path = _path(args)
     try:
-        return Ledger(path)
+        return Ledger(path, audit=_audited(path))
     except LedgerSchemaError as exc:
         raise SystemExit(f"dod: {exc}")
 
@@ -172,6 +184,29 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def cmd_verify(args) -> int:
+    with _ledger(args) as led:
+        v = audit.verify(led, expected_head=args.expect_head)
+    lines = [f"{'verified' if v.ok else 'NOT VERIFIED'}: {v.entries} audit entr"
+             f"{'y' if v.entries == 1 else 'ies'}, head {v.head}"]
+    lines += [f"  {p}" for p in v.problems]
+    _out(args, {"ok": v.ok, "entries": v.entries, "head": v.head, "problems": v.problems}, lines)
+    return 0 if v.ok else 1
+
+
+def cmd_report(args) -> int:
+    with _ledger(args) as led:
+        try:
+            rep = audit.report(led, args.store, args.record_id)
+        except KeyError:
+            raise SystemExit(f"dod: no recorded write for {args.store} {args.record_id}")
+    if args.json:
+        print(json.dumps(rep, indent=2, default=str))
+    else:
+        print(audit.to_markdown(rep), end="")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dod", description="Lineage for agent memory.")
     p.add_argument("--version", action="version", version=f"dod {dod.__version__}")
@@ -210,6 +245,14 @@ def parser() -> argparse.ArgumentParser:
     q.set_defaults(fn=cmd_quarantined)
     s = sub.add_parser("stats", parents=[common], help="what the ledger holds")
     s.set_defaults(fn=cmd_stats)
+    v = sub.add_parser("verify", parents=[common],
+                       help="check the audit chain (exit 1 if tampered)")
+    v.add_argument("--expect-head", help="a digest from an earlier verify: must still be there")
+    v.set_defaults(fn=cmd_verify)
+    rp = sub.add_parser("report", parents=[common],
+                        help="excision evidence for an item (Markdown, or --json)")
+    item(rp)
+    rp.set_defaults(fn=cmd_report)
     return p
 
 
