@@ -17,6 +17,7 @@ anthropic = ["anthropic==1.12.1"]
 otel = ["opentelemetry-api==1.45.1", "opentelemetry-sdk==1.45.1"]
 mcp = ["mcp==1.28.1"]
 pydantic_ai = ["pydantic-ai-slim==2.66.0"]
+postgres = ["langgraph==1.2.14", "langgraph-checkpoint==4.2.0", "langgraph-checkpoint-postgres==3.1.2", "psycopg[binary]==3.3.8"]
 
 [tool.pytest.ini_options]
 markers = [
@@ -26,6 +27,7 @@ markers = [
     "otel: needs the OpenTelemetry API and SDK (pip install -e \".[otel]\")",
     "mcp: needs the MCP SDK (pip install -e \".[mcp]\")",
     "pydantic_ai: needs pydantic-ai-slim (pip install -e \".[pydantic_ai]\")",
+    "postgres: needs a Postgres server (DOD_TEST_POSTGRES_URI) and pip install -e \".[postgres]\"",
 ]
 
 [tool.hatch.build.targets.wheel]
