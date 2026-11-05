@@ -79,3 +79,29 @@ def test_python_dash_m(path):
     out = subprocess.run([sys.executable, "-m", "dod", "stats", "--ledger", path],
                          capture_output=True, text=True, check=True).stdout
     assert "writes: 4" in out
+
+
+def test_release_refuses_items_not_quarantined(path, capsys):
+    run(capsys, "excise", "mem", "d2", "--ledger", path)
+    with pytest.raises(SystemExit, match="not quarantined: mem typo"):
+        main(["release", "mem", "d2", "typo", "--ledger", path])
+    _, out = run(capsys, "quarantined", "--ledger", path, "--json")
+    assert json.loads(out)["quarantined"] == [["mem", "d2"]]  # nothing released
+
+
+def test_stats_does_not_write(path, capsys):
+    import os
+    before = {f: os.stat(f).st_mtime_ns for f in (path, path + "-lineage") if os.path.exists(f)}
+    run(capsys, "stats", "--ledger", path)
+    assert {f: os.stat(f).st_mtime_ns for f in before} == before
+
+
+def test_max_depth_and_unknown_store(path, capsys):
+    _, out = run(capsys, "trace", "mem", "d2", "--ledger", path, "--max-depth", "1", "--json")
+    assert json.loads(out)["truncated"]
+    _, out = run(capsys, "blast-radius", "mem", "bad", "--ledger", path, "--max-depth", "1",
+                 "--json")
+    data = json.loads(out)
+    assert data["truncated"] and data["items"] == [["mem", "d1"]]
+    with pytest.raises(SystemExit):
+        main(["excise", "nostore", "bad", "--ledger", path])

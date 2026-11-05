@@ -21,16 +21,21 @@ import sys
 from typing import List, Optional
 
 import dod
-from dod.ledger import Ledger, LedgerSchemaError
+from dod.ledger import Ledger, LedgerSchemaError, _check_schema
 from dod.query import blast_radius, trace
 
 
-def _ledger(args) -> Ledger:
+def _path(args) -> str:
     path = args.ledger or os.environ.get("DOD_LEDGER")
     if not path:
         raise SystemExit("dod: no ledger given: pass --ledger PATH or set DOD_LEDGER")
     if not os.path.exists(path):
         raise SystemExit(f"dod: no ledger at {path}")
+    return path
+
+
+def _ledger(args) -> Ledger:
+    path = _path(args)
     try:
         return Ledger(path)
     except LedgerSchemaError as exc:
@@ -121,6 +126,11 @@ def cmd_excise(args) -> int:
 def cmd_release(args) -> int:
     with _ledger(args) as led:
         items = [(args.store, r) for r in args.record_ids]
+        quarantined = led.quarantined()
+        missing = [i for i in items if i not in quarantined]
+        if missing:
+            raise SystemExit("dod: not quarantined: " + ", ".join(f"{s} {r}" for s, r in missing)
+                             + "; nothing was released")
         led.release(items, reason=args.reason, actor=args.actor)
         _out(args, {"released": [list(i) for i in items]},
              [f"released {len(items)} item(s)"])
@@ -136,11 +146,13 @@ def cmd_quarantined(args) -> int:
 
 
 def cmd_stats(args) -> int:
-    path = args.ledger or os.environ.get("DOD_LEDGER")
-    with _ledger(args):
-        pass  # validates the schema
+    path = _path(args)
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
+        try:
+            _check_schema(conn, path)
+        except LedgerSchemaError as exc:
+            raise SystemExit(f"dod: {exc}")
         q = lambda sql: conn.execute(sql).fetchall()
         writes = dict(q("SELECT store, count(*) FROM writes GROUP BY store"))
         items = dict(q("SELECT store, count(DISTINCT record_id) FROM bindings GROUP BY store"))
