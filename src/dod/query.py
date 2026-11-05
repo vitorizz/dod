@@ -458,10 +458,15 @@ def _arms(select: str, tables: Iterable[Tuple[str, str]], tail: Set[str]) -> str
     )
 
 
-def _level(tail: Set[str]) -> List[str]:
+def _level(tail: Set[str], in_prompt_only: bool = False) -> List[str]:
     """One breadth-first level's statements, in order. Parameters: :p, the
     frontier's depth; :d = :p + 1; :i, :pt, :st, the rowids of walk_item,
-    walk_part and walk_set before this level."""
+    walk_part and walk_set before this level. ``in_prompt_only`` follows
+    only ``in_prompt`` edges: a direct parent row, or a context-set part
+    whose own row for the item is ``in_prompt`` (an upgrade is stored as such
+    a row in a later part, so sets whose chain includes it are reached and
+    sets before it aren't)."""
+    only = " AND {a}.tag = 1" if in_prompt_only else ""
     return [
         # The frontier's items, each expanded once.
         "INSERT OR IGNORE INTO walk_item (item) " + _arms(
@@ -471,12 +476,12 @@ def _level(tail: Set[str]) -> List[str]:
         # Writes naming a new item as a direct parent.
         "INSERT OR IGNORE INTO walk_reach " + _arms(
             "SELECT c.seq, :d FROM walk_item it CROSS JOIN {t} c ON c.item = it.item"
-            " WHERE it.rowid > :i",
+            " WHERE it.rowid > :i" + only.format(a="c"),
             [("c", "direct_children"), ("c", "tail_direct")], tail),
         # Parts holding a new item, sets using a new part, writes using a new set.
         "INSERT OR IGNORE INTO walk_part (part) " + _arms(
             "SELECT pi.part FROM walk_item it CROSS JOIN {t} pi ON pi.item = it.item"
-            " WHERE it.rowid > :i",
+            " WHERE it.rowid > :i" + only.format(a="pi"),
             [("pi", "part_items"), ("pi", "tail_part_items")], tail),
         "INSERT OR IGNORE INTO walk_set (sid) " + _arms(
             "SELECT sp.sid FROM walk_part p CROSS JOIN {t} sp ON sp.part = p.part"
@@ -574,7 +579,8 @@ def _walk_connection(ledger: Ledger) -> Tuple[sqlite3.Connection, Callable[[], N
 
 
 def blast_radius(
-    ledger: Ledger, store: str, record_id: str, max_depth: Optional[int] = None
+    ledger: Ledger, store: str, record_id: str, max_depth: Optional[int] = None,
+    in_prompt_only: bool = False,
 ) -> BlastResult:
     """Walk forward from ``(store, record_id)`` to every descendant write.
 
@@ -593,6 +599,11 @@ def blast_radius(
     results are always current. A deleted item is still walked: its tombstone
     is reported in ``deleted``, and what was derived from it stays in the
     result. ``edges`` is built when first read (see ``BlastResult``).
+
+    ``in_prompt_only`` follows only edges tagged ``in_prompt``: what was
+    derived from the item through the model's prompt, leaving out items that
+    were only retrieved in the same scope (see ``dod.prompt``). It is the
+    precise view; the default over-includes so no parent is missed.
 
     Raises ``KeyError`` if the item has no binding in the ledger.
     """
@@ -623,7 +634,7 @@ def blast_radius(
         if not seeded:
             raise KeyError((store, record_id))
 
-        item_s, direct_s, part_s, set_s, writes_s = _level(tail)
+        item_s, direct_s, part_s, set_s, writes_s = _level(tail, in_prompt_only)
         # walk_item, walk_part and walk_set rows before this level (rowids
         # run 1..n in insertion order, since nothing is ever deleted).
         marks = {"i": 0, "pt": 0, "st": 0}
@@ -673,10 +684,14 @@ def blast_radius(
         release()
 
     with _gc_paused():
-        return _blast_result(
+        result = _blast_result(
             ledger, store, record_id, max_depth, bounds, reached, bound, truncated,
             deleted_rows,
         )
+    if in_prompt_only:
+        load = result._load_edges
+        result._load_edges = lambda: [e for e in load() if e.tag == "in_prompt"]
+    return result
 
 
 # Walks building their results right now, and whether the collector was
@@ -867,7 +882,9 @@ def _load_edges(
     with _gc_paused():
         for (item, seq), tag in rows.items():
             s, r = names[item]
-            child = wid[seq]
+            child = wid.get(seq)
+            if child is None:
+                continue  # not reached: an in_prompt_only walk didn't follow this edge
             t = _TAG[tag]
             for parent in by_item[item]:
                 append(_edge((child, s, r, t, wid[parent])))

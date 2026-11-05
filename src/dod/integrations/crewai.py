@@ -249,7 +249,8 @@ def instrument(memory: Any, capture: Capture, store: str = "crewai") -> Any:
         key = _key.get()
         if key is not None and results:
             capture.on_retrieve(
-                key, [(store, m.record.id) for m in results], _tag(sys._getframe(1))
+                key, [(store, m.record.id) for m in results], _tag(sys._getframe(1)),
+                texts=[m.record.content for m in results],
             )
         return results
 

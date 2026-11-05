@@ -36,6 +36,7 @@ from typing_extensions import Annotated, TypedDict
 import operator
 
 import dod
+from dod import prompt as dod_prompt
 from dod.capture import Capture
 from dod.integrations import anthropic_memory, langgraph, langgraph_graph
 from dod.integrations import mcp as dmcp
@@ -240,6 +241,8 @@ class World:
         for topic in topics:
             policy_notes += self._read_note(topic)
         ctx = Context(customer, text, policies, policy_notes, notes_about, order)
+        # What actually goes to the model: everything in it becomes in_prompt.
+        dod_prompt.confirm(ctx.prompt())
         decision = await asyncio.to_thread(self.llm.decide, ctx)
 
         for note in decision.remember:
