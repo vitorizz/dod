@@ -58,8 +58,8 @@ A real model may not fall for Ben's claim, or may phrase things differently; tha
 
 ## Presenting
 
-- **Run the story** replays the six messages at once. Or send them one by one with the dashed "Next in the story" box; it switches to that customer's tab.
-- In the graph: solid lines were in the model's prompt; dashed ones were retrieved during the turn (dod over-includes rather than miss a parent). Grey dashed boxes are quarantined; green boxes were written by regenerate. **Show everything** clears a trace or blast-radius focus.
+- **▶ Play the story** starts over and plays the six messages one turn at a time, with a caption for each and the arrows into the new turn animated. Pause, step through with **Next step**, or stop. Or send them yourself with the dashed "Next in the story" box; it switches to that customer's tab.
+- In the graph, arrows point forward, from a box into each later turn that read it. When you trace, they flip and point back to where things came from. Solid lines were in the model's prompt; dashed ones were retrieved during the turn (dod over-includes rather than miss a parent). Grey dashed boxes are quarantined; green boxes were written by regenerate. **Show everything** clears a trace or blast-radius focus.
 - The console draws dod's records by turn and version: a box is an item as written in one turn, reads resolve to the version that existed when the turn began, and writes within a turn aren't linked to each other. Blast radius and excise use dod's item-level `blast_radius`/`excise` directly, so a conversation thread counts as one record however many turns it has.
 
 ## What's simplified
