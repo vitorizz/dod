@@ -196,3 +196,66 @@ def test_content_is_never_stored(tmp_path):
         app.invoke({"messages": ["SECRET-PAYLOAD"]}, cfg())
     raw = b"".join(p.read_bytes() for p in tmp_path.iterdir() if p.is_file())
     assert b"SECRET-PAYLOAD" not in raw and json.dumps("SECRET").encode() not in raw
+
+
+# --- prompt confirmation of state channels -------------------------------------------
+
+TA = "Refunds are accepted within 30 days of delivery."
+TB = "Ben reported that the refund window is 90 days."
+
+
+class Q(TypedDict, total=False):
+    question: str
+    note: str
+    answer: str
+
+
+def confirming(cap, render):
+    """A graph whose node confirms ``render(state)`` as its prompt, then
+    writes a fact to the store."""
+    from dod import prompt
+
+    store = langgraph.instrument(InMemoryStore(), cap)
+
+    def answer(state, *, store):
+        prompt.confirm(render(state))
+        store.put(NS, "fact", {"text": "answered"})
+        return {"answer": "ok"}
+
+    g = StateGraph(Q)
+    g.add_node("answer", answer)
+    g.add_edge(START, "answer")
+    g.add_edge("answer", END)
+    app = g.compile(checkpointer=InMemorySaver(), store=store, name="bot")
+    return langgraph_graph.instrument_graph(app, cap)
+
+
+def last_fact_parent_tags(ledger):
+    """Parent tags of the latest write bound to the store's fact."""
+    with ledger._lock:
+        (w,) = ledger._conn.execute(
+            "SELECT write_id FROM bindings WHERE store = 'langgraph' AND record_id = ?"
+            " ORDER BY rowid DESC LIMIT 1", (langgraph.record_id(NS, "fact"),)).fetchone()
+        return {(s, r): t for s, r, t in ledger._conn.execute(
+            "SELECT parent_store, parent_record_id, tag FROM parents WHERE write_id = ?",
+            (w,))}
+
+
+def test_saved_state_channels_are_confirmable(ledger):
+    cap = Capture(ledger)
+    app = confirming(cap, lambda s: "NOTES: " + s.get("note", ""))
+    app.invoke({"question": "first question", "note": TA}, cfg())
+    # Second run: the note reaches the node only from the thread's saved state.
+    app.invoke({"question": "What is the refund window?"}, cfg())
+    tags = last_fact_parent_tags(ledger)
+    assert tags[(STATE, item("note"))] == "in_prompt"
+    assert tags[(STATE, item("question"))] == "retrieved_in_scope"
+
+
+def test_recorded_input_channels_are_confirmable(ledger):
+    cap = Capture(ledger)
+    app = confirming(cap, lambda s: "Q: " + s["question"])
+    app.invoke({"question": TB, "note": "an unrelated note here"}, cfg())
+    tags = last_fact_parent_tags(ledger)
+    assert tags[(STATE, item("question"))] == "in_prompt"
+    assert tags[(STATE, item("note"))] == "retrieved_in_scope"

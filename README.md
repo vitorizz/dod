@@ -189,6 +189,22 @@ app.invoke({"messages": [user_msg]}, {"configurable": {"thread_id": "ana"}})
 
 Every run is scoped to `(graph name, thread_id)`, so no `agent_task_scope` is needed around it. Each state channel of a thread is an item (`langgraph_state`): the run's input is recorded with source `user`, each node's update as a write, and the thread's saved state is context for the run. A memory a node writes to the store then traces back to the user message it came from.
 
+## Confirming what reached the prompt
+
+Integrations see what the agent retrieved, not what it put in the prompt, so retrievals are tagged `retrieved_in_scope`. Confirm the prompt and the items it actually contains become `in_prompt` for the writes that follow:
+
+```python
+from dod.integrations.llm import instrument_anthropic, instrument_openai
+
+client = instrument_anthropic(anthropic.Anthropic())   # or instrument_openai(OpenAI(...))
+# every messages.create / chat.completions.create now confirms its own prompt
+
+from dod import prompt
+prompt.confirm(rendered_prompt)                        # any other client: call it yourself
+```
+
+Matching is by text (the start of each retrieved string must appear in the prompt), held in memory only while the scope lives; the ledger stays content-free. Unconfirmed items stay parents. To follow only what went through a prompt, pass `in_prompt_only=True` to `blast_radius` or `excise`: the precise blast radius, against the default that over-includes so nothing is missed.
+
 ## Reconcile
 
 Capture only sees writes that go through an instrumented call. `reconcile` checks that nothing else changed your stores. It reads each store, compares it with the ledger, and reports every item they disagree on:
@@ -277,6 +293,7 @@ Supported:
 - **Pydantic AI** (pydantic-ai-slim 2.66.0): any toolset, through `CaptureToolset`, with message history as context across runs.
 - `trace`, `blast_radius`, quarantine/release, `excise` (quarantine or delete) and `regenerate` (callback rewrite), across every store through one ledger.
 - `reconcile`: finds writes, edits and deletions made outside capture, in every store with a reconcile adapter (CrewAI, LangGraph Store, memory tool).
+- **Prompt confirmation**: `dod.prompt.confirm`, and wrappers for Anthropic (`messages.create`/`stream`, sync and async) and OpenAI-compatible clients (`chat.completions.create`, `responses.create`); `in_prompt_only` walks for `blast_radius` and `excise`.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
 
 Next: more integrations (other frameworks, more MCP-reachable stores).

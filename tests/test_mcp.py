@@ -193,6 +193,26 @@ def test_resource_reads_are_context_and_quarantine_blocks_them(ledger):
     assert blocked_retrievals()[(STORE, "policy://refunds")] >= 1
 
 
+def test_resource_reads_are_confirmable_from_the_prompt(ledger):
+    from dod import prompt
+
+    cap = Capture(ledger)
+
+    async def main():
+        async with connect(crm_server()._mcp_server) as session:
+            dmcp.instrument(session, cap, "crm", record_id=ticket_id)
+            with agent_task_scope("support", "t1"):
+                await session.read_resource("policy://refunds")
+                assert prompt.confirm("Q: can I return it?") == []
+                upgraded = prompt.confirm("POLICY: refunds within 30 days\nQ: can I return it?")
+                await session.call_tool("create_ticket", {"text": "30 days"})
+            return upgraded
+
+    assert run(main) == [(STORE, "policy://refunds")]
+    t = trace(ledger, STORE, "T1")
+    assert [(e.parent_record_id, e.tag) for e in t.edges] == [("policy://refunds", "in_prompt")]
+
+
 def test_deleted_records_are_tombstoned(ledger):
     cap = Capture(ledger)
 

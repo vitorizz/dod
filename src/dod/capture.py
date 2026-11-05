@@ -91,6 +91,49 @@ def _content_hash(content: Union[str, bytes]) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+# Prompt confirmation: each retrieved item's text is kept, only in memory and
+# only while its key's context lives, as a few short normalized snippets
+# ("probes"). A prompt containing any probe confirms the item ``in_prompt``.
+# The ledger never sees them.
+# One probe per string, its first _PROBE_LEN chars: long enough to be
+# specific, short enough to survive a prompt that truncates the text (any
+# longer prefix that matched would imply this one does).
+_PROBE_LEN = 64
+_PROBE_MIN = 12   # shorter texts ("yes", an ID) would match by accident
+_PROBES_MAX = 8   # per item
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.split())
+
+
+def probes(value) -> Tuple[str, ...]:
+    """Snippets of ``value`` to look for in a prompt: the start of each
+    string in it (its first 64 characters) (a str, or the string leaves of a dict/list, as a store
+    value), whitespace-normalized, at least ``_PROBE_MIN`` chars."""
+    out: List[str] = []
+
+    def walk(v) -> None:
+        if len(out) >= _PROBES_MAX:
+            return
+        if isinstance(v, bytes):
+            v = v.decode("utf-8", "replace")
+        if isinstance(v, str):
+            # Only the start matters; normalize just enough of it.
+            t = _normalize(v[:4 * _PROBE_LEN])
+            if len(t) >= _PROBE_MIN:
+                out.append(t[:_PROBE_LEN])
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x)
+
+    walk(value)
+    return tuple(dict.fromkeys(out))
+
+
 def _edges(direct, context) -> Tuple[Edge, ...]:
     """A write's parent edges as the ledger's ``parents`` view has them.
 
@@ -122,23 +165,67 @@ class Capture:
         self._lock = threading.Lock()
         # key -> {(store, record_id): tag}; in_prompt wins over retrieved_in_scope.
         self._context: Dict[Hashable, Dict[Item, str]] = {}
+        # key -> {item: probes} for retrieved_in_scope items whose text the
+        # integration passed: what confirm() looks for. Memory only.
+        self._probes: Dict[Hashable, Dict[Item, Tuple[str, ...]]] = {}
         # write_id -> store, oldest first, until bind() succeeds.
         self._pending: "OrderedDict[str, str]" = OrderedDict()
         # write_ids with a bind() call in flight; a second concurrent bind raises.
         self._binding: Set[str] = set()
 
     def on_retrieve(
-        self, key: Hashable, items: Iterable[Item], tag: str = "retrieved_in_scope"
+        self, key: Hashable, items: Iterable[Item], tag: str = "retrieved_in_scope",
+        texts: Optional[Sequence] = None,
     ) -> None:
-        """Add retrieved ``(store, record_id)`` items to ``key``'s context."""
+        """Add retrieved ``(store, record_id)`` items to ``key``'s context.
+
+        ``texts``, parallel to ``items``, is each item's content as the
+        integration read it (a str, or a store value whose string leaves
+        count). It is kept in memory only, so ``confirm`` can later upgrade
+        an item to ``in_prompt`` when a prompt contains it.
+        """
         if tag not in TAGS:
             raise ValueError(f"unknown tag {tag!r}; expected one of {TAGS}")
         items = [(store, record_id) for store, record_id in items]
+        found = None
+        if texts is not None and tag != "in_prompt":
+            found = [probes(t) for t in texts]
         with self._lock:
             ctx = self._context.setdefault(key, {})
             for item in items:
                 if ctx.get(item) != "in_prompt":
                     ctx[item] = tag
+            if found:
+                pr = self._probes.setdefault(key, {})
+                for item, ps in zip(items, found):
+                    if ps and ctx.get(item) != "in_prompt":
+                        pr[item] = ps
+
+    def confirm(self, key: Hashable, prompt: str) -> List[Item]:
+        """Upgrade ``key``'s retrieved items whose text appears in ``prompt``
+        to ``in_prompt``; return them.
+
+        Call it with the text actually sent to the model (the wrappers in
+        ``dod.integrations.llm`` do). Writes after the call carry the
+        upgraded tags; earlier writes keep theirs. Items never seen in a
+        prompt stay ``retrieved_in_scope``: still parents, never dropped.
+        """
+        with self._lock:
+            pr = self._probes.get(key)
+            if not pr:
+                return []
+            candidates = list(pr.items())
+        text = _normalize(prompt)
+        hit = [item for item, ps in candidates if any(p in text for p in ps)]
+        if hit:
+            with self._lock:
+                ctx = self._context.get(key)
+                pr = self._probes.get(key, {})
+                for item in hit:
+                    pr.pop(item, None)
+                    if ctx is not None and item in ctx:
+                        ctx[item] = "in_prompt"
+        return hit
 
     def on_write(
         self,
@@ -284,6 +371,9 @@ class Capture:
             ctx = self._context.get(key)
             if ctx:
                 self._context[snap] = dict(ctx)
+            pr = self._probes.get(key)
+            if pr:
+                self._probes[snap] = dict(pr)
         return snap
 
     def bind(self, write_id: str, record_id: str, content_hash: Optional[str] = None) -> None:
@@ -316,6 +406,7 @@ class Capture:
         """Clear ``key``'s context, for example when a new task starts."""
         with self._lock:
             self._context.pop(key, None)
+            self._probes.pop(key, None)
 
     def _append(self, key, extra, content, store, source, agent_id, session_id):
         with self._lock:
