@@ -175,6 +175,19 @@ with PostgresStore.from_conn_string(uri, index={"dims": 1536, "embed": embed}) a
 
 Vector search results become parents like any other read, quarantined rows drop out of `get` and `search`, `excise(mode="delete")` deletes rows through the store, and `reconcile` reports rows written with raw SQL.
 
+## LangChain vector stores
+
+Any LangChain `VectorStore` (Chroma, PGVector, Pinecone, FAISS, `InMemoryVectorStore`, ...) is captured by wrapping the instance:
+
+```python
+from dod.integrations import langchain as lc
+
+vs = lc.instrument(Chroma(...), cap, store="kb")
+retriever = vs.as_retriever()           # searches through it are tracked too
+```
+
+Searches, `get_by_ids` and retrievers add the returned documents (by `Document.id`) to the scope's context; `add_documents`/`add_texts` record writes bound to the returned IDs; `delete(ids)` records tombstones. Quarantined documents drop out of results. `lc.DeleteAdapter(vs)` and `lc.ReconcileAdapter(vs, list_ids=...)` plug into `excise` and `reconcile`.
+
 ## LangGraph agents
 
 `langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
