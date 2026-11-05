@@ -240,7 +240,8 @@ def test_openai_style_clients(ledger):
 # --- integrations pass their texts -------------------------------------------------------
 
 
-def test_crewai_langgraph_and_mcp_reads_are_confirmable(ledger):
+def test_crewai_and_langgraph_store_reads_are_confirmable(ledger):
+    # MCP resource reads and graph state: test_mcp.py, test_langgraph_graph.py.
     from test_crewai import StubMemory
 
     from dod.integrations import crewai
