@@ -762,8 +762,17 @@ def test_future_version_raises(path):
     assert user_version(path) == SCHEMA_VERSION + 1
 
 
+def _as_version_5(path):
+    """Turn a current ledger into a version-5 file: no audit chain."""
+    conn = raw(path)
+    conn.execute("DROP TABLE audit_chain")
+    conn.execute("PRAGMA user_version=5")
+    conn.close()
+
+
 def _as_version_4(path):
-    """Turn a current ledger into a version-4 file: no bindings.content_hash."""
+    """Turn a current ledger into a version-4 file: also no bindings.content_hash."""
+    _as_version_5(path)
     conn = raw(path)
     conn.execute("ALTER TABLE bindings DROP COLUMN content_hash")
     conn.execute("PRAGMA user_version=4")
@@ -778,7 +787,7 @@ def test_version_4_migrates_in_place(path):
     with Ledger(path) as led:
         second = write(led)
         led.bind(second, "mem", "r2", content_hash="h2")
-    assert user_version(path) == SCHEMA_VERSION == 5
+    assert user_version(path) == SCHEMA_VERSION == 6
     assert raw(path).execute(
         "SELECT write_id, record_id, content_hash FROM bindings ORDER BY rowid").fetchall() == [
         (first, "r1", None), (second, "r2", "h2")]
