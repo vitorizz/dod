@@ -33,7 +33,7 @@ flowchart LR
 
 ## Install
 
-Not on PyPI yet. From a clone:
+Not on PyPI yet (it will publish as `dod-lineage`; the import name is `dod`). From a clone:
 
 ```bash
 pip install -e ".[crewai]"      # CrewAI memory (crewai==1.15.22)
@@ -188,6 +188,23 @@ app.invoke({"messages": [user_msg]}, {"configurable": {"thread_id": "ana"}})
 ```
 
 Every run is scoped to `(graph name, thread_id)`, so no `agent_task_scope` is needed around it. Each state channel of a thread is an item (`langgraph_state`): the run's input is recorded with source `user`, each node's update as a write, and the thread's saved state is context for the run. A memory a node writes to the store then traces back to the user message it came from.
+
+## Command line
+
+Installing the package adds a `dod` command (or `python -m dod`) for the ledger:
+
+```bash
+export DOD_LEDGER=ledger.db
+dod trace mcp:crm R5                    # where did this reply come from?
+dod blast-radius langgraph_state '["ben", "", "messages"]' --in-prompt-only
+dod excise notes /memories/policies/refunds.md --dry-run
+dod excise notes /memories/policies/refunds.md   # quarantine (reversible)
+dod release notes /memories/policies/refunds.md
+dod quarantined
+dod stats
+```
+
+Every command takes `--json`. The CLI only quarantines; deleting through stores needs their adapters, so use `dod.excise(mode="delete", stores=...)` in code.
 
 ## Confirming what reached the prompt
 
