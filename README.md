@@ -175,6 +175,17 @@ with PostgresStore.from_conn_string(uri, index={"dims": 1536, "embed": embed}) a
 
 Vector search results become parents like any other read, quarantined rows drop out of `get` and `search`, `excise(mode="delete")` deletes rows through the store, and `reconcile` reports rows written with raw SQL.
 
+## OpenAI Agents SDK
+
+```python
+from dod.integrations.openai_agents import instrument_tools
+
+agent = Agent(name="support", tools=instrument_tools([lookup, save_note], cap,
+                                                     read_only=["lookup"]))
+```
+
+`instrument_tools` wraps `FunctionTool`s in place, with the same read/write/passthrough rules as the Pydantic AI integration: read results become `call:<call_id>` items in the prompt, write tools are recorded before the call and bound after it (`record_id=`, `deleted=` callbacks). Outside `agent_task_scope`, each run is its own unit of work. Read results carried in a later run's input (`result.to_input_list()`, sessions) are parents there too. Create tools with `failure_error_function=None` so a failed write raises instead of returning an error message the wrapper can't tell from success.
+
 ## LangGraph agents
 
 `langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
