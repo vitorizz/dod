@@ -131,7 +131,8 @@ def test_append_only_and_validation(tmp_path, prefix):
 def test_background_thread_ships(tmp_path, prefix):
     import time
     led = Ledger(tmp_path / "l.db")
-    with Shipper(led, DSN, "bg", prefix=prefix, interval=0.05):
+    with pytest.warns(RuntimeWarning, match="dod ship"), \
+            Shipper(led, DSN, "bg", prefix=prefix, interval=0.05):
         write(led, "mem", "x")
         write(led, "mem", "y", context=[("mem", "x", "in_prompt")])
         deadline = time.time() + 5
