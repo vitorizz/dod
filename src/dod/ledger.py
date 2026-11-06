@@ -924,10 +924,6 @@ class Ledger:
         # fills take at most _FILL_BUSY_SHARE of the time.
         rest_until = 0.0
         while not self._stop.wait(pause):
-            if self._wal and _wal_bytes(self._wal) > _WAL_RESTART_BYTES // 2:
-                # A burst of writes: copy now, so the writer's restart at
-                # _WAL_RESTART_BYTES finds little left to copy.
-                next_ckpt = 0.0
             if time.monotonic() >= next_ckpt:
                 next_ckpt = time.monotonic() + interval
                 try:
@@ -979,9 +975,11 @@ class Ledger:
         begins at a moment the log is fully copied and no reader is on it;
         under continuous writes, with the index fill reading, that rarely
         happens, so the file grows without bound and commits slow down with
-        it. The background PASSIVE checkpoint has copied most frames, so a
-        TRUNCATE here copies the rest and resets: once per
-        _WAL_RESTART_BYTES of writes. It gives up at once if a reader is in
+        it. The background PASSIVE checkpoint (every interval) has copied
+        most frames, so a TRUNCATE here copies the rest and resets: once per
+        _WAL_RESTART_BYTES of writes. (Checkpointing early in the background
+        as the WAL fills was tried: it ran a disk sync every pass and raised
+        capture p99.) It gives up at once if a reader is in
         the way (the next commit tries again).
         """
         conn = self._conn
