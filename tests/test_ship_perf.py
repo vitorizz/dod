@@ -37,7 +37,7 @@ while True:
 """
 
 
-def test_shipping_adds_under_1ms_to_capture_p99(tmp_path, prefix):  # noqa: F811
+def test_shipping_adds_under_half_ms_to_capture_p99(tmp_path, prefix):  # noqa: F811
     path = tmp_path / "ledger.db"
     edges = [("mem", f"rec-{i}", "retrieved_in_scope") for i in range(10)]
     with Ledger(path) as ledger:
@@ -91,4 +91,4 @@ def test_shipping_adds_under_1ms_to_capture_p99(tmp_path, prefix):  # noqa: F811
     # What the shipper adds to capture, on the same machine: on a 2-core CI
     # runner with Postgres also running, the absolute p99 swings with load.
     print(f"shipping adds p99 ~ {p99 - base:.4f} ms")
-    assert p99 - base < 1.0
+    assert p99 - base < 0.5
