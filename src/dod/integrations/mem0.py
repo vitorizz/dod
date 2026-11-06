@@ -1,4 +1,5 @@
-"""Mem0 integration: capture lineage from a ``mem0.Memory`` (mem0ai 2.0.5).
+"""Mem0 integration: capture lineage from a ``mem0.Memory`` or
+``mem0.AsyncMemory`` (mem0ai 2.0.5).
 
 ``instrument(memory, capture)`` wraps the instance's methods in place. The
 record ID of a memory is its Mem0 ID.
@@ -30,16 +31,21 @@ Deletes
     through Mem0's ``_delete_memory``, which is wrapped. ``reset()`` is not
     recorded.
 
-Only the synchronous ``Memory`` is supported.
+``AsyncMemory`` is supported the same way (its methods stay coroutines);
+excising from it with ``DeleteAdapter`` needs ``dod.excise`` to run off the
+event loop (``asyncio.to_thread``).
 """
 
+import asyncio
+import contextlib
 import contextvars
 import functools
+import inspect
 import logging
 import uuid
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Tuple
 
-from mem0 import Memory
+from mem0 import AsyncMemory, Memory
 
 from dod import scope as _scope
 from dod.capture import Capture
@@ -62,13 +68,37 @@ def _results(value: Any) -> List[dict]:
     return [r for r in (value or []) if isinstance(r, dict)]
 
 
+def _wrap(fn: Callable, after: Callable, around: Optional[Callable] = None) -> Callable:
+    """Wrap ``fn``, sync or async: ``around(args, kwargs)`` is a context
+    manager entered for the call (its value is passed on), then
+    ``after(out, state, args, kwargs)`` returns the result."""
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def awrapper(*args, **kwargs):
+            with around(args, kwargs) if around else contextlib.nullcontext() as state:
+                out = await fn(*args, **kwargs)
+            return after(out, state, args, kwargs)
+        return awrapper
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with around(args, kwargs) if around else contextlib.nullcontext() as state:
+            out = fn(*args, **kwargs)
+        return after(out, state, args, kwargs)
+    return wrapper
+
+
+def _arg(args: tuple, kwargs: dict, i: int, name: str) -> Any:
+    return args[i] if len(args) > i else kwargs.get(name)
+
+
 def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
     """Wrap ``memory``'s methods in place; return it. Return values and
     exceptions are unchanged. Instrumenting twice is a no-op."""
     if getattr(memory, _MARK, False):
         return memory
-    if not isinstance(memory, Memory):
-        raise TypeError(f"{type(memory).__name__} is not a mem0 Memory")
+    if not isinstance(memory, (Memory, AsyncMemory)):
+        raise TypeError(f"{type(memory).__name__} is not a mem0 Memory or AsyncMemory")
     _scope.register(capture)
     quarantine = QuarantineCache(capture._ledger)
     base = {n: getattr(memory, n) for n in ("add", "search", "get", "get_all",
@@ -92,32 +122,25 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
 
     # --- reads ---------------------------------------------------------------
 
-    def listing(name: str):
-        fn = base[name]
+    def after_listing(out, _state, args, kwargs):
+        if isinstance(out, dict) and isinstance(out.get("results"), list):
+            out = dict(out, results=drop_blocked(_results(out)))
+            retrieved(_scope.current_key(),
+                      [(r.get("id"), r.get("memory")) for r in out["results"]])
+        return out
 
-        @functools.wraps(fn)
-        def read(*args, **kwargs):
-            out = fn(*args, **kwargs)
-            if isinstance(out, dict) and isinstance(out.get("results"), list):
-                out = dict(out, results=drop_blocked(_results(out)))
-                retrieved(_scope.current_key(),
-                          [(r.get("id"), r.get("memory")) for r in out["results"]])
-            return out
-
-        return read
-
-    @functools.wraps(base["get"])
-    def get(memory_id, *args, **kwargs):
-        out = base["get"](memory_id, *args, **kwargs)
+    def after_get(out, _state, args, kwargs):
         if out is None:
             return None
-        if (store, out.get("id", memory_id)) in quarantine.current():
-            count_blocked([(store, out.get("id", memory_id))])
+        rid = out.get("id", _arg(args, kwargs, 0, "memory_id"))
+        if (store, rid) in quarantine.current():
+            count_blocked([(store, rid)])
             return None
-        retrieved(_scope.current_key(), [(out.get("id", memory_id), out.get("memory"))])
+        retrieved(_scope.current_key(), [(rid, out.get("memory"))])
         return out
 
     # Mem0's own retrieval inside add(): collected, not a read by the caller.
+    # (AsyncMemory calls it through asyncio.to_thread, which copies the context.)
     @functools.wraps(vs_search)
     def vector_search(*args, **kwargs):
         out = vs_search(*args, **kwargs)
@@ -130,8 +153,8 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
 
     # --- writes --------------------------------------------------------------
 
-    @functools.wraps(base["add"])
-    def add(messages, *args, **kwargs):
+    @contextlib.contextmanager
+    def around_add(args, kwargs):
         key = _scope.current_key()
         own = key is None
         if own:
@@ -139,10 +162,17 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
         found: list = []
         token, ktoken = _internal.set(found), _add_key.set((key, own, found))
         try:
-            out = base["add"](messages, *args, **kwargs)
+            yield key, own, found
+        except BaseException:
+            if own:
+                capture.reset(key)
+            raise
         finally:
             _internal.reset(token)
             _add_key.reset(ktoken)
+
+    def after_add(out, state, args, kwargs):
+        key, own, found = state
         try:
             added = [r for r in _results(out) if r.get("event", "ADD") == "ADD" and r.get("id")]
             if found:
@@ -166,9 +196,9 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
 
     # Every rewrite of an existing memory goes through _update_memory: the
     # public update(), and any UPDATE Mem0 decides on inside add().
-    @functools.wraps(base["_update_memory"])
-    def update_memory(memory_id, data, *args, **kwargs):
-        out = base["_update_memory"](memory_id, data, *args, **kwargs)
+    def after_update(out, _state, args, kwargs):
+        memory_id = _arg(args, kwargs, 0, "memory_id")
+        data = _arg(args, kwargs, 1, "data")
         in_add = _add_key.get()
         if in_add is not None:
             key, own, found = in_add
@@ -191,9 +221,8 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
             logger.exception("dod: recording mem0 update of %r failed", memory_id)
         return out
 
-    @functools.wraps(base["_delete_memory"])
-    def delete_memory(memory_id, *args, **kwargs):
-        out = base["_delete_memory"](memory_id, *args, **kwargs)
+    def after_delete(out, _state, args, kwargs):
+        memory_id = _arg(args, kwargs, 0, "memory_id")
         key = _scope.current_key()
         agent_id, session_id = key if key is not None else (None, None)
         try:
@@ -203,9 +232,12 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
             logger.exception("dod: recording the deletion of mem0 memory %r failed", memory_id)
         return out
 
-    memory.add, memory.get, memory._update_memory = add, get, update_memory
-    memory.search, memory.get_all = listing("search"), listing("get_all")
-    memory._delete_memory = delete_memory
+    memory.add = _wrap(base["add"], after_add, around_add)
+    memory.get = _wrap(base["get"], after_get)
+    memory.search = _wrap(base["search"], after_listing)
+    memory.get_all = _wrap(base["get_all"], after_listing)
+    memory._update_memory = _wrap(base["_update_memory"], after_update)
+    memory._delete_memory = _wrap(base["_delete_memory"], after_delete)
     memory.vector_store.search = vector_search
     memory._dod_base = base
     setattr(memory, _MARK, True)
@@ -229,7 +261,18 @@ class DeleteAdapter:
     def delete(self, record_id: str) -> bool:
         if _text(self.memory, record_id) is None:
             return False
-        self.memory.delete(record_id)
+        out = self.memory.delete(record_id)
+        if inspect.isawaitable(out):
+            # AsyncMemory: excise is synchronous, so it must run off the event
+            # loop (e.g. asyncio.to_thread(dod.excise, ...)).
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(out)
+            else:
+                out.close()
+                raise RuntimeError("deleting from an AsyncMemory needs dod.excise to run"
+                                   " outside the event loop: asyncio.to_thread(dod.excise, ...)")
         return True
 
 
@@ -239,8 +282,8 @@ class ReconcileAdapter:
     narrows the scan (e.g. ``{"user_id": "u1"}``); ``limit`` caps it."""
 
     def __init__(self, memory: Any, filters: Optional[dict] = None, limit: int = 100_000) -> None:
-        if not isinstance(memory, Memory):
-            raise TypeError("memory must be a mem0 Memory")
+        if not isinstance(memory, (Memory, AsyncMemory)):
+            raise TypeError("memory must be a mem0 Memory or AsyncMemory")
         self.memory, self.filters, self.limit = memory, filters, limit
 
     def scan(self) -> List[Tuple[str, str]]:

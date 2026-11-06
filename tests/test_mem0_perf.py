@@ -56,3 +56,33 @@ def test_search_overhead_p99_under_1ms(tmp_path):
             p99 = p99_ms(lambda: m.search("q", filters={"user_id": "u1"}), rounds=3,
                          label="instrumented mem0 search (10 results)")
     assert p99 < 1.0
+
+
+def test_async_add_overhead_p99_under_1ms(tmp_path):
+    import asyncio
+
+    from mem0 import AsyncMemory
+
+    m = AsyncMemory.__new__(AsyncMemory)
+    m.vector_store = types.SimpleNamespace(search=lambda *a, **k: HITS)
+
+    async def add(messages, **kwargs):
+        await asyncio.to_thread(m.vector_store.search, query=messages)
+        return {"results": [{"id": str(uuid.uuid4()), "memory": "a new fact", "event": "ADD"}]}
+
+    async def noop(*a, **k):
+        return None
+
+    m.add = add
+    for name in ("search", "get", "get_all", "_update_memory", "_delete_memory"):
+        setattr(m, name, noop)
+    loop = asyncio.new_event_loop()
+    base = p99_ms(lambda: loop.run_until_complete(add("hello")), n=3_000, rounds=3,
+                  label="raw async add stub (to_thread hop)")
+    with Ledger(tmp_path / "ledger.db") as ledger:
+        m0.instrument(m, Capture(ledger))
+        with agent_task_scope("agent", "task"):
+            p99 = p99_ms(lambda: loop.run_until_complete(m.add("hello", user_id="u1")),
+                         n=3_000, rounds=3, label="instrumented async mem0 add")
+    loop.close()
+    assert p99 - base < 1.0

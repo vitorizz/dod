@@ -208,7 +208,7 @@ memory = m0.instrument(Memory.from_config(cfg), cap)
 memory.add("I'm allergic to peanuts", user_id="u1")
 ```
 
-When Mem0 extracts memories in `add`, it first searches the existing ones and puts the matches in its extraction prompt. Those matches are recorded as `in_prompt` parents of every memory the call adds, so lineage between Mem0 memories is captured even when the agent never searches explicitly. `search`, `get` and `get_all` results join the scope's context; `update` is a compaction; `delete`/`delete_all` record tombstones. `m0.DeleteAdapter` and `m0.ReconcileAdapter` plug into `excise` and `reconcile`. Synchronous `Memory` only. Set `MEM0_TELEMETRY=False` if you don't want Mem0's own telemetry.
+When Mem0 extracts memories in `add`, it first searches the existing ones and puts the matches in its extraction prompt. Those matches are recorded as `in_prompt` parents of every memory the call adds, so lineage between Mem0 memories is captured even when the agent never searches explicitly. `search`, `get` and `get_all` results join the scope's context; `update` is a compaction; `delete`/`delete_all` record tombstones. `m0.DeleteAdapter` and `m0.ReconcileAdapter` plug into `excise` and `reconcile`. `AsyncMemory` works the same way (excising from it with `DeleteAdapter` needs `dod.excise` off the event loop: `asyncio.to_thread`). Set `MEM0_TELEMETRY=False` if you don't want Mem0's own telemetry.
 
 ## LangGraph agents
 
