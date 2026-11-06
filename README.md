@@ -266,6 +266,7 @@ dod release notes /memories/policies/refunds.md
 dod quarantined
 dod stats
 dod verify                              # audited ledgers: exit 1 if tampered
+dod doctor                              # health: schema, WAL, index lag, unbound writes, audit
 dod ship --dsn postgresql://... --node host-a   # copy to Postgres (see "Across hosts")
 dod report notes /memories/policies/refunds.md > excision.md
 ```
