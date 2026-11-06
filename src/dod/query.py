@@ -589,7 +589,7 @@ def _walk_connection(ledger: Ledger) -> Tuple[sqlite3.Connection, Callable[[], N
 
 def blast_radius(
     ledger: Ledger, store: str, record_id: str, max_depth: Optional[int] = None,
-    in_prompt_only: bool = False,
+    in_prompt_only: bool = False, precise: bool = False,
 ) -> BlastResult:
     """Walk forward from ``(store, record_id)`` to every descendant write.
 
@@ -613,6 +613,12 @@ def blast_radius(
     derived from the item through the model's prompt, leaving out items that
     were only retrieved in the same scope (see ``dod.prompt``). It is the
     precise view; the default over-includes so no parent is missed.
+
+    ``precise`` also resolves versions going forward, as ``trace`` does going
+    back: a write is derived only if it came after (by ``seq``) a reached
+    version of one of its parent items. The default walk is item-level, so
+    a write that read an item before the contaminated version of it was
+    written is included too. It costs a pass over the walk's edges.
 
     Raises ``KeyError`` if the item has no binding in the ledger.
     """
@@ -700,7 +706,37 @@ def blast_radius(
     if in_prompt_only:
         load = result._load_edges
         result._load_edges = lambda: [e for e in load() if e.tag == "in_prompt"]
+    if precise:
+        result = _precise(result)
     return result
+
+
+def _precise(result: BlastResult) -> BlastResult:
+    """Keep only descendants that came after a kept version of a parent
+    item. Writes are visited in ``seq`` order (parents' versions always
+    precede their children), so one pass decides each write."""
+    seq = {w.write_id: w.seq for w in result.items + result.descendants}
+    by_child: Dict[str, List[Edge]] = {}
+    for e in result.edges:
+        by_child.setdefault(e.child_write_id, []).append(e)
+    kept = {w.write_id for w in result.items}
+    descendants = []
+    for w in sorted(result.descendants, key=lambda d: d.seq):
+        if any(e.parent_write_id in kept and seq[e.parent_write_id] < w.seq
+               for e in by_child.get(w.write_id, ())):
+            kept.add(w.write_id)
+            descendants.append(w)
+    descendants.sort(key=lambda d: (d.depth, d.seq))
+    bindings = {w: its for w, its in result.bindings.items() if w in kept}
+    items = {i for its in bindings.values() for i in its} | {(result.store, result.record_id)}
+    return BlastResult(
+        store=result.store, record_id=result.record_id, items=result.items,
+        descendants=descendants, bindings=bindings,
+        store_counts=dict(sorted(Counter(w.store for w in descendants).items())),
+        truncated=result.truncated,
+        deleted={i: t for i, t in result.deleted.items() if i in items},
+        edges=[e for e in result.edges if e.child_write_id in kept and e.parent_write_id in kept],
+    )
 
 
 # Walks building their results right now, and whether the collector was
