@@ -199,6 +199,17 @@ agent = Agent(name="support", tools=instrument_tools([lookup, save_note], cap,
 
 `instrument_tools` wraps `FunctionTool`s in place, with the same read/write/passthrough rules as the Pydantic AI integration: read results become `call:<call_id>` items in the prompt, write tools are recorded before the call and bound after it (`record_id=`, `deleted=` callbacks). Outside `agent_task_scope`, each run is its own unit of work. Read results carried in a later run's input (`result.to_input_list()`, sessions) are parents there too. Create tools with `failure_error_function=None` so a failed write raises instead of returning an error message the wrapper can't tell from success.
 
+## Mem0
+
+```python
+from dod.integrations import mem0 as m0
+
+memory = m0.instrument(Memory.from_config(cfg), cap)
+memory.add("I'm allergic to peanuts", user_id="u1")
+```
+
+When Mem0 extracts memories in `add`, it first searches the existing ones and puts the matches in its extraction prompt. Those matches are recorded as `in_prompt` parents of every memory the call adds, so lineage between Mem0 memories is captured even when the agent never searches explicitly. `search`, `get` and `get_all` results join the scope's context; `update` is a compaction; `delete`/`delete_all` record tombstones. `m0.DeleteAdapter` and `m0.ReconcileAdapter` plug into `excise` and `reconcile`. Synchronous `Memory` only. Set `MEM0_TELEMETRY=False` if you don't want Mem0's own telemetry.
+
 ## LangGraph agents
 
 `langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
