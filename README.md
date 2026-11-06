@@ -401,3 +401,7 @@ Summary: excised 5 items, preserved 12, stores touched: crewai, langgraph.
 ```
 
 `tests/test_demo.py` runs the demo and checks these numbers.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
