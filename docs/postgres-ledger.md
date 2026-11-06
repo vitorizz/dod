@@ -1,6 +1,6 @@
 # Postgres ledger: design options
 
-Status: proposal, not built. Needs a decision before code.
+Status: option A built (`dod.ship`, `dod ship`); see decisions.md (2026-11-06).
 
 ## Why
 
