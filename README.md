@@ -175,6 +175,17 @@ with PostgresStore.from_conn_string(uri, index={"dims": 1536, "embed": embed}) a
 
 Vector search results become parents like any other read, quarantined rows drop out of `get` and `search`, `excise(mode="delete")` deletes rows through the store, and `reconcile` reports rows written with raw SQL.
 
+## Mem0
+
+```python
+from dod.integrations import mem0 as m0
+
+memory = m0.instrument(Memory.from_config(cfg), cap)
+memory.add("I'm allergic to peanuts", user_id="u1")
+```
+
+When Mem0 extracts memories in `add`, it first searches the existing ones and puts the matches in its extraction prompt. Those matches are recorded as `in_prompt` parents of every memory the call adds, so lineage between Mem0 memories is captured even when the agent never searches explicitly. `search`, `get` and `get_all` results join the scope's context; `update` is a compaction; `delete`/`delete_all` record tombstones. `m0.DeleteAdapter` and `m0.ReconcileAdapter` plug into `excise` and `reconcile`. Synchronous `Memory` only. Set `MEM0_TELEMETRY=False` if you don't want Mem0's own telemetry.
+
 ## LangGraph agents
 
 `langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
