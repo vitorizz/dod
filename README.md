@@ -188,6 +188,17 @@ retriever = vs.as_retriever()           # searches through it are tracked too
 
 Searches, `get_by_ids` and retrievers add the returned documents (by `Document.id`) to the scope's context; `add_documents`/`add_texts` record writes bound to the returned IDs; `delete(ids)` records tombstones. Quarantined documents drop out of results. `lc.DeleteAdapter(vs)` and `lc.ReconcileAdapter(vs, list_ids=...)` plug into `excise` and `reconcile`.
 
+## OpenAI Agents SDK
+
+```python
+from dod.integrations.openai_agents import instrument_tools
+
+agent = Agent(name="support", tools=instrument_tools([lookup, save_note], cap,
+                                                     read_only=["lookup"]))
+```
+
+`instrument_tools` wraps `FunctionTool`s in place, with the same read/write/passthrough rules as the Pydantic AI integration: read results become `call:<call_id>` items in the prompt, write tools are recorded before the call and bound after it (`record_id=`, `deleted=` callbacks). Outside `agent_task_scope`, each run is its own unit of work. Read results carried in a later run's input (`result.to_input_list()`, sessions) are parents there too. Create tools with `failure_error_function=None` so a failed write raises instead of returning an error message the wrapper can't tell from success.
+
 ## LangGraph agents
 
 `langgraph.instrument` captures a LangGraph `Store`. `langgraph_graph.instrument_graph` also captures the graph itself:
