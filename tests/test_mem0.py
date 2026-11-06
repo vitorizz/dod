@@ -95,6 +95,32 @@ def test_scope_reads_are_parents_too(ledger, mem):
     assert note[0] == "mem0"
 
 
+def test_infer_false_source_follows_role(ledger, mem):
+    # Mem0 2.0.5 returns each infer=False message's role; system messages are skipped.
+    out = mem.add([{"role": "system", "content": "be terse"},
+                   {"role": "user", "content": "I'm vegetarian"},
+                   {"role": "assistant", "content": "Noted: no meat"}],
+                  user_id="u1", infer=False)
+    by_text = {r["memory"]: r["id"] for r in out["results"]}
+    assert set(by_text) == {"I'm vegetarian", "Noted: no meat"}
+    source = dict(ledger._read_conn.execute(
+        "SELECT b.record_id, w.source FROM bindings b JOIN writes w ON w.write_id = b.write_id"
+        " WHERE b.store = 'mem0'").fetchall())
+    assert source == {by_text["I'm vegetarian"]: "user",
+                      by_text["Noted: no meat"]: "agent_inference"}
+    # A plain string is a user message.
+    (s,) = ids(mem.add("I live in Brooklyn", user_id="u1", infer=False))
+    assert ledger._read_conn.execute(
+        "SELECT w.source FROM bindings b JOIN writes w ON w.write_id = b.write_id"
+        " WHERE b.record_id = ?", (s,)).fetchone() == ("user",)
+    # With infer=True, every extracted memory is agent_inference.
+    mem.llm.script = [["User is vegetarian"]]
+    (x,) = ids(mem.add("I'm vegetarian", user_id="u2"))
+    assert ledger._read_conn.execute(
+        "SELECT w.source FROM bindings b JOIN writes w ON w.write_id = b.write_id"
+        " WHERE b.record_id = ?", (x,)).fetchone() == ("agent_inference",)
+
+
 def test_get_get_all_and_quarantine(ledger, mem):
     mem.llm.script = [["fact one is here"], ["fact two is here"]]
     (a,) = ids(mem.add("one", user_id="u1", infer=True))
