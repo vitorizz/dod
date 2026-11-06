@@ -31,6 +31,16 @@ function canonical(value: unknown): string {
 
 let calls = 0;
 
+/** Run a capture step; a ledger error is logged, never thrown into the agent. */
+function safely<T>(what: string, fn: () => T): T | undefined {
+  try {
+    return fn();
+  } catch (e) {
+    console.warn(`dod: ${what} failed; lineage for this call is incomplete:`, e);
+    return undefined;
+  }
+}
+
 /**
  * Wrap each tool's `execute` (a new object; tools are not mutated). A read
  * tool's result is recorded as item `call:<toolCallId>` (source `tool`) and
@@ -55,17 +65,24 @@ export function instrumentTools<T extends Record<string, ToolLike>>(tools: T, ca
           if (passthrough.has(name)) return execute(args, options);
           if (readOnly.has(name)) {
             const result = await execute(args, options);
-            capture.onWrite({ store, content: canonical({ tool: name, result }), source: "tool", recordId: item });
-            capture.onRetrieve([[store, item]], "in_prompt");
+            safely(`recording read tool ${name}`, () => {
+              capture.onWrite({ store, content: canonical({ tool: name, result }), source: "tool", recordId: item });
+              capture.onRetrieve([[store, item]], "in_prompt");
+            });
             return result;
           }
-          const wid = capture.onWrite({ store, content: canonical({ tool: name, arguments: args }), source: "agent_inference" });
+          // Recorded before the call; if the tool throws, the write stays
+          // unbound (it changed nothing the ledger knows of).
+          const wid = safely(`recording write tool ${name}`, () =>
+            capture.onWrite({ store, content: canonical({ tool: name, arguments: args }), source: "agent_inference" }));
           const result = await execute(args, options);
-          const rid = opts.recordId?.(name, args, result) ?? item;
-          capture.onBind(wid, store, String(rid));
-          const gone = [...(opts.deleted?.(name, args, result) ?? [])];
-          if (gone.length) capture.onDelete(store, gone.map(String), "forget");
-          capture.onRetrieve([[store, String(rid)]], "in_prompt");
+          safely(`binding write tool ${name}`, () => {
+            const rid = String(opts.recordId?.(name, args, result) ?? item);
+            if (wid) capture.onBind(wid, store, rid);
+            const gone = [...(opts.deleted?.(name, args, result) ?? [])];
+            if (gone.length) capture.onDelete(store, gone.map(String), "forget");
+            capture.onRetrieve([[store, rid]], "in_prompt");
+          });
           return result;
         };
         if (key) return run();

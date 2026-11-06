@@ -108,7 +108,6 @@ test("rejects bad input and other schema versions", () => {
 });
 
 test("the WAL is checkpointed off the write path", async () => {
-  const { statSync, existsSync } = await import("node:fs");
   const path = tmp();
   const led = new Ledger(path, { checkpointMs: 20 });
   const cap = new Capture(led);
@@ -118,5 +117,46 @@ test("the WAL is checkpointed off the write path", async () => {
   assert.equal(row.busy, 0);
   assert.equal(row.log, row.checkpointed); // everything already copied
   led.close();
-  assert.ok(!existsSync(path + "-wal") || statSync(path + "-wal").size >= 0);
+});
+
+
+test("tools: deletes, passthrough, a throwing write, and a failing ledger", async () => {
+  const led = new Ledger(tmp());
+  const cap = new Capture(led);
+  const seen = [];
+  const tools = instrumentTools({
+    forget: { execute: async ({ id }) => ({ ok: true, id }) },
+    peek: { execute: async () => "x" },
+    boom: { execute: async () => { throw new Error("down"); } },
+  }, cap, { store: "crm", passthrough: ["peek"], deleted: (n, a) => (n === "forget" ? [a.id] : []) });
+  await agentTaskScope("agent", "t", async () => {
+    await tools.forget.execute({ id: "doc-9" }, { toolCallId: "c1" });
+    assert.equal(await tools.peek.execute({}, { toolCallId: "c2" }), "x");
+    await assert.rejects(tools.boom.execute({}, { toolCallId: "c3" }), /down/);
+  });
+  const t = led.db.prepare("SELECT record_id, reason FROM tombstones").all();
+  assert.deepEqual(t.map((r) => [r.record_id, r.reason]), [["doc-9", "forget"]]);
+  const writes = Number(led.db.prepare("SELECT count(*) n FROM writes").get().n);
+  const bound = Number(led.db.prepare("SELECT count(*) n FROM bindings").get().n);
+  assert.equal(writes, 2);  // forget and boom; peek is passthrough
+  assert.equal(bound, 1);   // boom threw: its write stays unbound
+  // Capture fails open: a closed ledger doesn't break the tool call.
+  led.close();
+  const warn = console.warn;
+  console.warn = (...a) => seen.push(a.join(" "));
+  try {
+    assert.deepEqual(await tools.forget.execute({ id: "z" }, { toolCallId: "c4" }), { ok: true, id: "z" });
+  } finally {
+    console.warn = warn;
+  }
+  assert.ok(seen.some((m) => m.includes("lineage for this call is incomplete")));
+});
+
+test("appendBatch merges duplicate parents, in_prompt wins", () => {
+  const led = new Ledger(tmp());
+  led.appendWrite({ content: "x", store: "s", source: "user",
+    parents: [["s", "a", "retrieved_in_scope"], ["s", "a", "in_prompt"], ["s", "b", "retrieved_in_scope"]] });
+  const rows = led.db.prepare("SELECT parent_record_id r, tag FROM direct_parents ORDER BY r").all();
+  assert.deepEqual(rows.map((x) => [x.r, x.tag]), [["a", "in_prompt"], ["b", "retrieved_in_scope"]]);
+  led.close();
 });
