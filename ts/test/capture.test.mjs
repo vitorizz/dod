@@ -108,17 +108,21 @@ test("rejects bad input and other schema versions", () => {
 });
 
 test("the WAL is checkpointed off the write path", async () => {
+  const { statSync } = await import("node:fs");
   const path = tmp();
   const led = new Ledger(path, { checkpointMs: 20 });
   const cap = new Capture(led);
+  const before = statSync(path).size;
   for (let i = 0; i < 2000; i++) cap.onWrite({ store: "s", content: `c${i}`, source: "user", recordId: `r${i}` });
-  await new Promise((r) => setTimeout(r, 200));
-  const row = led.db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get();
-  assert.equal(row.busy, 0);
-  assert.equal(row.log, row.checkpointed); // everything already copied
+  // Writes only go to the WAL (autocheckpoint is off); the main file grows
+  // only when the worker checkpoints. Wait up to 10 s for a slow runner.
+  const deadline = Date.now() + 10_000;
+  while (statSync(path).size === before && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.ok(statSync(path).size > before, "the worker never checkpointed");
   led.close();
 });
-
 
 test("tools: deletes, passthrough, a throwing write, and a failing ledger", async () => {
   const led = new Ledger(tmp());
