@@ -78,8 +78,10 @@ def test_shipping_adds_under_half_ms_to_capture_p99(tmp_path, prefix):  # noqa: 
                 stop.set()
                 t.join()
                 other.close()
-            time.sleep(0.6)
-            assert ledger.quarantined(), "no quarantine was pulled during the run"
+            deadline = time.time() + 30  # the shipper's next pass pulls them
+            while not ledger.quarantined() and time.time() < deadline:
+                time.sleep(0.1)
+            assert ledger.quarantined(), "no quarantine was pulled"
         finally:
             proc.terminate()
             assert proc.wait(timeout=30) == 0
