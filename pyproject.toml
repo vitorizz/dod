@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -9,6 +9,8 @@ version = "0.1.0"
 description = "A capture library for AI agents with long-lived memory: records which retrieved items were in context at every memory write, turning agent memory into a traceable lineage graph."
 readme = "README.md"
 requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 keywords = ["ai-agents", "llm", "memory", "lineage", "provenance", "observability"]
 classifiers = [
     "Development Status :: 3 - Alpha",
