@@ -21,17 +21,19 @@ from dod.ship import PgLineage  # noqa: E402
 
 DSN = os.environ.get("DOD_TEST_POSTGRES_URI", "")
 
-# Another node: quarantine an item and ship it, every 200 ms, until killed.
+# Another node: quarantine one item, then keep writing and shipping every
+# 200 ms (Postgres load) until killed. Quarantines are rare in practice (an
+# excision), so one is pulled during the run, not a stream of them.
 OTHER_NODE = """
-import sys, time
+import sys, time, uuid
 from dod.ledger import Ledger
 from dod.ship import Shipper
 led = Ledger(sys.argv[1])
 s = Shipper(led, sys.argv[2], "other", prefix=sys.argv[3], pull=False)
-n = 0
+led.quarantine([("mem", "rec-0")])
 while True:
-    n += 1
-    led.quarantine([("mem", f"rec-{n}")])
+    for _ in range(50):
+        led.append_write(content=str(uuid.uuid4()), store="mem", source="user")
     s.ship_once()
     time.sleep(0.2)
 """
