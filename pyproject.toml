@@ -29,6 +29,7 @@ dev = ["pytest"]
 crewai = ["crewai==1.15.22"]
 langgraph = ["langgraph==1.2.14", "langgraph-checkpoint==4.2.0"]
 anthropic = ["anthropic==1.12.1"]
+langchain = ["langchain-core==1.7.5"]
 otel = ["opentelemetry-api==1.45.1", "opentelemetry-sdk==1.45.1"]
 mcp = ["mcp==1.28.1"]
 pydantic_ai = ["pydantic-ai-slim==2.66.0"]
@@ -39,6 +40,7 @@ postgres = ["langgraph==1.2.14", "langgraph-checkpoint==4.2.0", "langgraph-check
 markers = [
     "crewai: needs the real crewai package (pip install -e \".[crewai]\")",
     "langgraph: needs the langgraph package (pip install -e \".[langgraph]\")",
+    "langchain: needs langchain-core (pip install -e \".[langchain]\")",
     "anthropic: needs the anthropic package (pip install -e \".[anthropic]\")",
     "otel: needs the OpenTelemetry API and SDK (pip install -e \".[otel]\")",
     "mcp: needs the MCP SDK (pip install -e \".[mcp]\")",
