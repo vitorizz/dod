@@ -211,6 +211,7 @@ _FILL_IDLE_POLL = 0.02
 # The writer restarts the WAL once its file is this large (see
 # Ledger._restart_wal).
 _WAL_RESTART_BYTES = 64 * 1024 * 1024
+_WAL_RETRY_SECONDS = 0.05
 
 
 def _wal_bytes(path: str) -> int:
@@ -887,6 +888,7 @@ class Ledger:
         self._walk_pool_lock = threading.Lock()
 
         self._wal = self._file + "-wal" if self._file else None
+        self._wal_retry_at = 0.0
         self._ckpt_conn = sqlite3.connect(
             str(path), isolation_level=None, check_same_thread=False
         )
@@ -972,24 +974,32 @@ class Ledger:
         commit, holding the write lock.
 
         With autocheckpoint off, SQLite restarts the WAL only when a writer
-        begins at a moment the log is fully copied and no reader is on it;
-        under continuous writes, with the index fill reading, that rarely
+        begins at a moment the log is fully copied and no reader is on it.
+        Under continuous writes, with the index fill reading, that never
         happens, so the file grows without bound and commits slow down with
-        it. The background PASSIVE checkpoint (every interval) has copied
-        most frames, so a TRUNCATE here copies the rest and resets: once per
-        _WAL_RESTART_BYTES of writes. (Checkpointing early in the background
-        as the WAL fills was tried: it ran a disk sync every pass and raised
-        capture p99.) It gives up at once if a reader is in
-        the way (the next commit tries again).
+        it. Here the writer takes the checkpoint lock if it is free (so the
+        fill, which reads under it, isn't reading) and runs TRUNCATE without
+        waiting: it copies what the background PASSIVE pass left, resets and
+        truncates, once per _WAL_RESTART_BYTES of writes. If the lock is
+        taken or another reader is in the way, it tries again after
+        _WAL_RETRY_SECONDS.
         """
-        conn = self._conn
-        conn.execute("PRAGMA busy_timeout=0")
-        try:
-            conn.execute("PRAGMA main.wal_checkpoint(TRUNCATE)")
-        except sqlite3.Error:
-            pass
-        finally:
-            conn.execute("PRAGMA busy_timeout=5000")
+        now = time.monotonic()
+        if now < self._wal_retry_at:
+            return
+        busy = 1
+        if self._ckpt_lock.acquire(blocking=False):
+            conn = self._conn
+            try:
+                conn.execute("PRAGMA busy_timeout=0")
+                busy = conn.execute("PRAGMA main.wal_checkpoint(TRUNCATE)").fetchone()[0]
+            except sqlite3.Error:
+                busy = 1
+            finally:
+                conn.execute("PRAGMA busy_timeout=5000")
+                self._ckpt_lock.release()
+        if busy:
+            self._wal_retry_at = now + _WAL_RETRY_SECONDS
 
     def _index_watermarks(self, conn: sqlite3.Connection) -> Tuple[int, int, int]:
         """``(writes_upto, sets_upto, bindings_upto)``: the last write
