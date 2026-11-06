@@ -280,8 +280,12 @@ def cmd_pg(args) -> int:
             q = sorted(lin.quarantined())
             data = {"quarantined": [list(i) for i in q]}
             lines = [f"{len(q)} quarantined item(s), across nodes"] + [f"  {s} {r}" for s, r in q]
-    except KeyError:
+    except KeyError as exc:
+        if exc.args != ((args.store, args.record_id),):
+            raise
         raise SystemExit(f"dod: no node recorded a write for {args.store} {args.record_id}")
+    except ValueError as exc:
+        raise SystemExit(f"dod: {exc}")
     _out(args, data, lines)
     return 0
 

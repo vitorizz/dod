@@ -221,3 +221,21 @@ def test_cli_pg_commands(tmp_path, prefix, capsys):
     with pytest.raises(SystemExit, match="no node recorded"):
         main(["pg", "trace", "mem", "nope", *common])
     led.close()
+
+
+def test_pg_excise_options_and_errors(tmp_path, prefix):
+    led = Ledger(tmp_path / "a.db")
+    write(led, "mem", "bad")
+    write(led, "crm", "prompted", context=[("mem", "bad", "in_prompt")])
+    write(led, "crm", "retrieved", context=[("mem", "bad", "retrieved_in_scope")])
+    Shipper(led, DSN, "a", prefix=prefix).sync()
+    lin = PgLineage(DSN, prefix)
+    assert lin.excise("mem", "bad", in_prompt_only=True, dry_run=True) == [
+        ("mem", "bad"), ("crm", "prompted")]
+    assert set(lin.excise("mem", "bad", dry_run=True)) == {
+        ("mem", "bad"), ("crm", "prompted"), ("crm", "retrieved")}
+    with pytest.raises(KeyError):
+        lin.excise("mem", "nope")
+    with pytest.raises(ValueError, match="not quarantined"):
+        lin.release([("mem", "bad")])
+    led.close()

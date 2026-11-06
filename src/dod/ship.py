@@ -419,7 +419,12 @@ class PgLineage:
 
     def release(self, items: List[Item], reason: Optional[str] = None,
                 actor: Optional[str] = None, node: str = CONSOLE) -> None:
-        """Release ``items`` on every node (pulled like ``quarantine``)."""
+        """Release ``items`` on every node (pulled like ``quarantine``).
+        Raises ``ValueError``, releasing nothing, if any isn't quarantined."""
+        items = list(items)
+        missing = [i for i in items if i not in self.quarantined()]
+        if missing:
+            raise ValueError(f"not quarantined: {missing}; nothing was released")
         self._append(items, "release", reason, actor, node)
 
     def excise(self, store: str, record_id: str, *, in_prompt_only: bool = False,
