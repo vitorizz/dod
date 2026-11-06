@@ -242,6 +242,10 @@ lin.trace("mcp:crm", "R5")["roots"]
 
 A quarantine taken on any node reaches every other node: each `dod ship` pulls the other nodes' quarantine actions into its local ledger. Run `dod ship` as its own process, at low priority (`nice -n 19 dod ship ...`), so it never takes CPU the agent's writes need. Capture then stays as fast as without it (p99 ~0.1–0.3 ms while it ships and pulls). Postgres only receives what the ledger holds: IDs, hashes and edges.
 
+## Versions
+
+An item can be rewritten: a profile updated, a file edited. `trace` only follows a parent to versions written before the child. `blast_radius(..., precise=True)` (and `excise(..., precise=True)`, `dod blast-radius --precise`) does the same going forward: it leaves out writes that read an item only before its contaminated version was written. The default stays item-level, so it can over-include but never misses a version.
+
 ## Command line
 
 Installing the package adds a `dod` command (or `python -m dod`) for the ledger:

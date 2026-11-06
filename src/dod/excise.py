@@ -74,6 +74,7 @@ def excise(
     stores: Optional[Mapping[str, DeleteAdapter]] = None,
     dry_run: bool = False,
     in_prompt_only: bool = False,
+    precise: bool = False,
 ) -> ExciseResult:
     """Quarantine (default) or delete ``(store, record_id)`` and every item
     derived from it.
@@ -85,6 +86,8 @@ def excise(
     was derived through the model's prompt (``blast_radius``'s option of the
     same name): smaller, and precise when prompts are confirmed
     (``dod.prompt``), but it misses what an unconfirmed retrieval influenced.
+    ``precise`` leaves out writes that only read an earlier, clean version of
+    a contaminated item (``blast_radius``'s option of the same name).
 
     Raises ``KeyError`` if the item has no binding in the ledger.
     """
@@ -93,7 +96,8 @@ def excise(
     if mode == "delete" and stores is None:
         raise ValueError('mode="delete" requires stores: {store name: delete adapter}')
 
-    blast = blast_radius(ledger, store, record_id, in_prompt_only=in_prompt_only)
+    blast = blast_radius(ledger, store, record_id, in_prompt_only=in_prompt_only,
+                         precise=precise)
     targets = _targets(blast, (store, record_id))
     if mode == "delete":
         missing = sorted(s for s in targets if s not in stores)

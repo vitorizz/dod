@@ -95,7 +95,7 @@ def cmd_blast(args) -> int:
     with _ledger(args) as led:
         try:
             b = blast_radius(led, args.store, args.record_id, max_depth=args.max_depth,
-                             in_prompt_only=args.in_prompt_only)
+                             in_prompt_only=args.in_prompt_only, precise=args.precise)
         except KeyError:
             raise SystemExit(f"dod: no recorded write for {args.store} {args.record_id}")
         items = sorted({i for its in b.bindings.values() for i in its} - {(args.store, args.record_id)})
@@ -115,7 +115,7 @@ def cmd_excise(args) -> int:
     with _ledger(args) as led:
         try:
             r = dod.excise(led, args.store, args.record_id, dry_run=args.dry_run,
-                           in_prompt_only=args.in_prompt_only)
+                           in_prompt_only=args.in_prompt_only, precise=args.precise)
         except KeyError:
             raise SystemExit(f"dod: no recorded write for {args.store} {args.record_id}")
         n = sum(len(v) for v in r.targets.values())
@@ -265,6 +265,8 @@ def parser() -> argparse.ArgumentParser:
     b = sub.add_parser("blast-radius", parents=[common], help="everything derived from an item")
     item(b)
     b.add_argument("--max-depth", type=int)
+    b.add_argument("--precise", action="store_true",
+                   help="leave out writes that only read an earlier, clean version of an item")
     b.add_argument("--in-prompt-only", action="store_true",
                    help="follow only edges confirmed in a prompt")
     b.set_defaults(fn=cmd_blast)
@@ -273,6 +275,7 @@ def parser() -> argparse.ArgumentParser:
     item(e)
     e.add_argument("--dry-run", action="store_true", help="show the targets, change nothing")
     e.add_argument("--in-prompt-only", action="store_true")
+    e.add_argument("--precise", action="store_true")
     e.set_defaults(fn=cmd_excise)
     r = sub.add_parser("release", parents=[common], help="undo a quarantine")
     r.add_argument("store")

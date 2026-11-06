@@ -174,3 +174,8 @@ def test_ship_final_sync_failure_exits_1_without_traceback(path, capsys, monkeyp
     assert len(calls) == 2
     assert "dod: final ship failed: connection refused; the next run ships it" in err
     assert "Traceback" not in err
+def test_precise_flag(path, capsys):
+    code, out = run(capsys, "blast-radius", "mem", "bad", "--ledger", path, "--precise", "--json")
+    assert code == 0 and "items" in json.loads(out)
+    code, _ = run(capsys, "excise", "mem", "bad", "--ledger", path, "--precise", "--dry-run")
+    assert code == 0
