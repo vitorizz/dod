@@ -237,7 +237,12 @@ def cmd_ship(args) -> int:
                     print(f"dod: ship failed: {exc}", file=sys.stderr, flush=True)
         except KeyboardInterrupt:
             pass
-        shipper.sync()
+        try:
+            shipper.sync()
+        except Exception as exc:
+            print(f"dod: final ship failed: {exc}; the next run ships it", file=sys.stderr,
+                  flush=True)
+            return 1
     return 0
 
 

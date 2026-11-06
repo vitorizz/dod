@@ -240,7 +240,7 @@ lin.blast_radius("mem0", bad_id)["items"]      # everything derived from it, on 
 lin.trace("mcp:crm", "R5")["roots"]
 ```
 
-A quarantine taken on any node reaches every other node: each `dod ship` pulls the other nodes' quarantine actions into its local ledger. Run `dod ship` as its own process. Capture in the agent's process then stays as fast as without it (p99 ~0.1 ms while shipping every 100 ms). Postgres only receives what the ledger holds: IDs, hashes and edges.
+A quarantine taken on any node reaches every other node: each `dod ship` pulls the other nodes' quarantine actions into its local ledger. Run `dod ship` as its own process, at low priority (`nice -n 19 dod ship ...`), so it never takes CPU the agent's writes need. Capture then stays as fast as without it (p99 ~0.1–0.3 ms while it ships and pulls). Postgres only receives what the ledger holds: IDs, hashes and edges.
 
 ## TypeScript
 
