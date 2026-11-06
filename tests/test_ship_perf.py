@@ -4,6 +4,7 @@ process (the recommended deployment: no contention for the interpreter)."""
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -42,26 +43,10 @@ def test_shipping_adds_under_half_ms_to_capture_p99(tmp_path, prefix):  # noqa: 
             # normal priority takes the CPU the agent's writes need.
             preexec_fn=lambda: os.nice(19))
         try:
-            # Another node quarantines items while capture runs, so this node's
-            # shipper is also appending pulled quarantine rows to the ledger.
-            other = Ledger(tmp_path / "other.db")
-            from dod.ship import Shipper
-            remote = Shipper(other, DSN, "other", prefix=prefix, pull=False)
-            n = [0]
-
-            def append_and_quarantine_elsewhere():
-                append()
-                n[0] += 1
-                if n[0] % 500 == 0:
-                    other.quarantine([("mem", f"rec-{n[0]}")])
-                    remote.ship_once()
-
-            p99 = p99_ms(append_and_quarantine_elsewhere, n=5_000, rounds=3,
-                         label="append_write (10 context) while `dod ship` (nice 19) runs every 250 ms"
-                               " and pulls quarantines")
-            other.close()
-            deadline = time.time() + 10
-            while time.time() < deadline:  # it really shipped
+            # Steady state: the shipper has started and shipped (its start-up,
+            # imports and schema DDL, isn't what this measures).
+            deadline = time.time() + 30
+            while time.time() < deadline:
                 try:
                     PgLineage(DSN, prefix).trace("mem", "seed")
                     break
@@ -69,6 +54,32 @@ def test_shipping_adds_under_half_ms_to_capture_p99(tmp_path, prefix):  # noqa: 
                     time.sleep(0.1)
             else:
                 pytest.fail("dod ship shipped nothing")
+            # Meanwhile another node quarantines items, so this node's shipper
+            # also appends pulled quarantine rows to the ledger during capture.
+            from dod.ship import Shipper
+            other = Ledger(tmp_path / "other.db")
+            remote = Shipper(other, DSN, "other", prefix=prefix, pull=False)
+            stop = threading.Event()
+
+            def quarantine_elsewhere():
+                n = 0
+                while not stop.wait(0.2):
+                    n += 1
+                    other.quarantine([("mem", f"rec-{n}")])
+                    remote.ship_once()
+
+            t = threading.Thread(target=quarantine_elsewhere, daemon=True)
+            t.start()
+            try:
+                p99 = p99_ms(append, n=5_000, rounds=3,
+                             label="append_write (10 context) while `dod ship` (nice 19) runs"
+                                   " every 250 ms and pulls quarantines")
+            finally:
+                stop.set()
+                t.join()
+                other.close()
+            time.sleep(0.6)
+            assert ledger.quarantined(), "no quarantine was pulled during the run"
         finally:
             proc.terminate()
             assert proc.wait(timeout=30) == 0
