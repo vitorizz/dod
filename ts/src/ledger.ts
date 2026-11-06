@@ -133,17 +133,24 @@ export class Ledger {
    * restarts it only when a writer begins while the log is fully copied and
    * unread, which continuous writes rarely allow, so it would grow without
    * bound (as in dod.ledger, which does the same). No busy wait: if a reader
-   * is in the way, the next commit tries again.
+   * is in the way, a commit 50 ms later tries again.
    */
+  private walRetryAt = 0;
+
   private restartWal(): void {
+    const now = Date.now();
+    if (now < this.walRetryAt) return;
+    let busy = 1;
     this.db.exec("PRAGMA busy_timeout=0");
     try {
-      this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      busy = Number((this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as any).busy);
     } catch {
-      /* busy: retried at the next commit */
+      busy = 1;
     } finally {
       this.db.exec("PRAGMA busy_timeout=5000");
     }
+    // Each try still copies frames and syncs: after a busy one, wait a while.
+    if (busy) this.walRetryAt = now + 50;
   }
 
   /** Record a write (and its parent edges) in one transaction; return its ID. */
