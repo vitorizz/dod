@@ -142,3 +142,10 @@ def test_verify_fails_on_tampering(audited, capsys):
     conn.close()
     code, out = run(capsys, "verify", "--ledger", audited)
     assert code == 1 and out.startswith("NOT VERIFIED") and "digest mismatch" in out
+
+
+def test_precise_flag(path, capsys):
+    code, out = run(capsys, "blast-radius", "mem", "bad", "--ledger", path, "--precise", "--json")
+    assert code == 0 and "items" in json.loads(out)
+    code, _ = run(capsys, "excise", "mem", "bad", "--ledger", path, "--precise", "--dry-run")
+    assert code == 0

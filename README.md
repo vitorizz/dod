@@ -224,6 +224,10 @@ app.invoke({"messages": [user_msg]}, {"configurable": {"thread_id": "ana"}})
 
 Every run is scoped to `(graph name, thread_id)`, so no `agent_task_scope` is needed around it. Each state channel of a thread is an item (`langgraph_state`): the run's input is recorded with source `user`, each node's update as a write, and the thread's saved state is context for the run. A memory a node writes to the store then traces back to the user message it came from.
 
+## Versions
+
+An item can be rewritten: a profile updated, a file edited. `trace` only follows a parent to versions written before the child. `blast_radius(..., precise=True)` (and `excise(..., precise=True)`, `dod blast-radius --precise`) does the same going forward: it leaves out writes that read an item only before its contaminated version was written. The default stays item-level, so it can over-include but never misses a version.
+
 ## Command line
 
 Installing the package adds a `dod` command (or `python -m dod`) for the ledger:
