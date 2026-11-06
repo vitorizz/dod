@@ -147,6 +147,7 @@
   <span class="spacer"></span>
   <span class="badge" id="model"></span>
   <span class="badge" id="backend"></span>
+  <span class="badge" id="auditbadge" title="The ledger is hash-chained: every record dod writes is covered by a chain of sha256 digests, so editing or removing one is detectable"></span>
   <button id="story" class="primary" title="Start over and play the story one turn at a time">▶ Play the story</button>
   <button id="reset" title="Start over with empty memory">Reset</button>
   <button class="help" id="helpbtn" title="What is going on here?">?</button>
@@ -221,6 +222,14 @@
   <div class="foot"><button onclick="closeModal('confirm')">Cancel</button><button id="cgo" class="danger"></button></div>
 </div></div>
 
+<div class="modal" id="proof"><div class="card">
+  <h2>Proof of removal</h2>
+  <p id="psum"></p>
+  <table class="ba" id="ptable"></table>
+  <p class="empty" id="pchain"></p>
+  <div class="foot"><button onclick="downloadProof()">Download report (.md)</button><button class="primary" onclick="closeModal('proof')">Close</button></div>
+</div></div>
+
 <script>
 const COLS = ["langgraph_state", "memory", "notes", "mcp:crm"];
 const COLOR = {"langgraph_state": "var(--state)", "memory": "var(--memory)", "notes": "var(--notes)", "mcp:crm": "var(--crm)"};
@@ -266,6 +275,7 @@ function load(data) {
   for (const b of S.boxes) if (b.kind === "reply") S.replyBox[b.item[1]] = b.id;
   $("model").textContent = "model: " + S.model;
   $("backend").textContent = "memory: " + S.backend;
+  $("auditbadge").textContent = S.audit.ok ? `ledger verified ✓ · ${S.audit.entries} audit entries` : "ledger NOT verified";
   HEAD.memory[1] = S.backend.startsWith("Postgres") ? "Postgres + pgvector" : "in-memory store";
   if (sel && !S.box[sel]) { sel = null; focus = null; }
   renderTabs(); renderChat(); renderGraph(); renderInspector();
@@ -504,13 +514,35 @@ async function run(action) {
   const r = data.result;
   focus = null;
   if (action === "excise") {
-    lastResult = `<div class="explain"><b>Quarantined ${r.compare.excise} record(s).</b> The agent can't read them anymore; the ${r.compare.kept} unrelated records are untouched. The affected replies are struck through in the chat. <button class="good" onclick="ask('regenerate')">Regenerate the affected replies…</button></div>`;
+    lastResult = `<div class="explain"><b>Quarantined ${r.compare.excise} record(s).</b> The agent can't read them anymore; the ${r.compare.kept} unrelated records are untouched. The affected replies are struck through in the chat. <button class="good" onclick="ask('regenerate')">Regenerate the affected replies…</button> <button onclick="proof()">Proof of removal</button></div>`;
   } else {
-    lastResult = `<div class="explain"><b>Quarantined ${r.compare.excise} record(s), then re-answered ${r.pairs.length} customer(s) from clean memory</b> (green in the graph and chat):</div>
+    lastResult = `<div class="explain"><b>Quarantined ${r.compare.excise} record(s), then re-answered ${r.pairs.length} customer(s) from clean memory</b> (green in the graph and chat). <button onclick="proof()">Proof of removal</button></div>
       <table class="ba"><tr><th>Customer asked</th><th>Before</th><th>After</th></tr>
       ${r.pairs.map(p => `<tr><td><b>${esc(cap(p.customer))}</b>: ${esc(p.question)}</td><td class="before">${esc(p.before)}</td><td class="after">${esc(p.after)}</td></tr>`).join("")}</table>`;
   }
   load(data);
+}
+
+let proofMd = "";
+async function proof() {
+  const r = await busy(async () => (await api("/api/box/report", {box: sel})).result);
+  if (!r) return;
+  proofMd = r.markdown;
+  const n = s => r.items.filter(i => i.status === s).length;
+  $("psum").innerHTML = `<b>${r.items.length} record(s)</b> traced from “${esc(S.box[sel].label)}”: ${n("quarantined")} quarantined, ${n("deleted")} deleted, ${n("live")} still live. Each action is a row in dod's append-only ledger, with the audit entry that sealed it.`;
+  const when = ts => new Date(ts / 1e6).toLocaleTimeString();
+  $("ptable").innerHTML = `<tr><th>System</th><th>Record</th><th>Status</th><th>Recorded</th></tr>` + r.items.map(i =>
+    `<tr><td>${esc((HEAD[i.store] || [i.store])[0])}</td><td>${esc(i.label)}</td><td>${esc(i.status)}</td><td>${i.actions.map(a => `${esc(a.what)} at ${when(a.ts)} · entry #${a.entry ?? "?"}`).join("<br>") || "-"}</td></tr>`).join("");
+  $("pchain").textContent = r.chain.ok
+    ? `Audit chain verified: ${r.chain.entries} entries, head ${r.chain.head.slice(0, 16)}…. Anyone holding this head can later prove no record was edited or removed.`
+    : "Audit chain NOT verified: " + r.chain.problems.join("; ");
+  $("proof").classList.add("on");
+}
+function downloadProof() {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([proofMd], {type: "text/markdown"}));
+  a.download = "dod-proof-of-removal.md";
+  a.click();
 }
 
 // Play the story: start over, then one turn every few seconds (pausable).

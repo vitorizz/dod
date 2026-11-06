@@ -113,7 +113,7 @@ class World:
     # --- lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
-        self.ledger = Ledger(self.dir / "ledger.db")
+        self.ledger = Ledger(self.dir / "ledger.db", audit=True)
         self.cap = Capture(self.ledger)
         if self.pg_uri:
             from langgraph.store.postgres import PostgresStore

@@ -24,6 +24,7 @@ from starlette.routing import Route
 import sqlite3
 
 import dod
+from dod import audit
 
 from .lineage import Lineage
 from .world import STORE_LABELS, STORY, World
@@ -51,7 +52,9 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
 
     def snapshot() -> dict:
         w = state["world"]
+        v = audit.verify(w.ledger)
         return {**Lineage(w).view(), "log": w.log, "model": w.llm.name, "backend": w.backend,
+                "audit": {"ok": v.ok, "entries": v.entries, "head": v.head},
                 "stores": STORE_LABELS, "customers": ["ana", "ben", "chloe", "dev", "eli"],
                 "story": [{"customer": c, "message": m} for c, m in STORY]}
 
@@ -105,6 +108,8 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
                     for old, new in r["replaced"]:
                         pairs.append(_pair(w, old[1], new[1]))
                 result = {"compare": before, "pairs": pairs}
+            elif action == "report":
+                result = _report(w, lin, box)
             else:
                 return JSONResponse({"error": f"unknown action {action}"}, status_code=404)
         return JSONResponse({"result": result, **snapshot()})
@@ -120,6 +125,31 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
         ],
         lifespan=lifespan,
     )
+
+
+def _report(w: World, lin: Lineage, box: str) -> dict:
+    """Proof of removal for a box: every item it reached, with what happened
+    to it and the audit entry that recorded it, plus the chain's check."""
+    lin.view()  # fills each box's label
+    labels = {tuple(b["item"]): b["label"] for b in lin.boxes.values() if b["item"]}
+    items, docs = {}, []
+    for item in lin._items_of(box):
+        rep = audit.report(w.ledger, *item)
+        docs.append(audit.to_markdown(rep))
+        for i in rep["items"]:
+            key = (i["store"], i["record_id"])
+            acts = [{"what": a["action"], "ts": a["ts"], "entry": (a["chain"] or {}).get("seq")}
+                    for a in i["quarantine"]]
+            acts += [{"what": "deleted", "ts": d["ts"], "entry": (d["chain"] or {}).get("seq")}
+                     for d in i["deletions"]]
+            items[key] = {"store": i["store"], "record_id": i["record_id"],
+                          "label": labels.get(key) or ("Lookup result the agent read"
+                                                       if i["record_id"].startswith("call:")
+                                                       else i["record_id"]),
+                          "status": i["status"],
+                          "actions": acts}
+    return {"items": sorted(items.values(), key=lambda i: (i["store"], i["label"])),
+            "chain": rep["chain"], "markdown": "\n".join(docs)}
 
 
 def _pair(w: World, old: str, new: str) -> dict:
