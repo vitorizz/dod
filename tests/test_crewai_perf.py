@@ -101,7 +101,6 @@ def test_filter_delete_1000_records(tmp_path):
     # it sets this op's p99 on a slow disk. The guard is on the median (~15 ms
     # on a dev machine), which a regression in the call itself moves.
     import statistics
-    import time
 
     mem = StubMemory(pool=False)
     with Ledger(tmp_path / "ledger.db") as ledger:
@@ -121,6 +120,8 @@ def test_filter_delete_1000_records(tmp_path):
           f" max={max(times):.1f} ms (n={len(times)})")
     assert count == 1_000 * 220
     assert median < 60.0
+    # Tail ceiling: a WAL restart (copy, sync, truncate) on a slow CI disk.
+    assert sorted(times)[int(len(times) * 0.99)] / perf.SCALE < 1_000.0
 
 
 def test_update_p99_under_1ms(tmp_path):

@@ -1,5 +1,5 @@
-import os
 import hashlib
+import os
 import shutil
 import sqlite3
 import threading
@@ -945,12 +945,29 @@ def test_wal_stays_bounded_under_continuous_writes(tmp_path, monkeypatch):
     import dod.ledger as ledger_mod
     monkeypatch.setattr(ledger_mod, "_WAL_RESTART_BYTES", 1 << 20)
     path = tmp_path / "ledger.db"
-    with Ledger(path) as led:
+    with Ledger(path, checkpoint_interval=0.02) as led:
         peak = 0
         for i in range(300):
+            time.sleep(0.002)  # leave the checkpoint thread a pass now and then
             led.append_tombstones([{"store": "s", "record_id": f"r{i}-{j}", "reason": "forget"}
                                    for j in range(200)])
             peak = max(peak, os.path.getsize(str(path) + "-wal"))
         (n,) = led._conn.execute("SELECT count(*) FROM tombstones").fetchone()
     assert n == 300 * 200
     assert peak < 4 << 20, f"WAL grew to {peak} bytes"  # 1 MiB limit + a few commits
+
+
+def test_wal_restart_backs_off_while_the_index_fill_holds_the_lock(tmp_path, monkeypatch):
+    import dod.ledger as ledger_mod
+    monkeypatch.setattr(ledger_mod, "_WAL_RESTART_BYTES", 1 << 16)
+    path = tmp_path / "ledger.db"
+    with Ledger(path, checkpoint_interval=3600) as led:
+        led._wal_log = 10_000  # as if the last pass found a large WAL
+        with led._ckpt_lock:  # as if the fill were reading
+            led.append_write(content="x", store="s", source="user")
+            assert led._wal_retry_at > 0 and led._wal_log == 10_000  # backed off
+        led.append_write(content="y", store="s", source="user")
+        assert led._wal_log == 10_000  # still backing off
+        led._wal_retry_at = 0.0
+        led.append_write(content="z", store="s", source="user")
+        assert led._wal_log == 0  # restarted once the lock was free

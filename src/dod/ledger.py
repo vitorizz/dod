@@ -889,6 +889,10 @@ class Ledger:
 
         self._wal = self._file + "-wal" if self._file else None
         self._wal_retry_at = 0.0
+        self._wal_log = 0  # frames in the WAL at the last checkpoint pass
+        self._page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        if self._file:
+            conn.execute(f"PRAGMA journal_size_limit={_WAL_RESTART_BYTES}")
         self._ckpt_conn = sqlite3.connect(
             str(path), isolation_level=None, check_same_thread=False
         )
@@ -931,7 +935,12 @@ class Ledger:
                 try:
                     with self._ckpt_lock:
                         # Every attached file: the ledger and its lineage file.
-                        self._ckpt_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        if self._file:
+                            self._ckpt_conn.execute("PRAGMA lineage.wal_checkpoint(PASSIVE)")
+                        # The ledger's own row: how many frames its WAL holds
+                        # (since its last restart), for the writer's restart.
+                        self._wal_log = self._ckpt_conn.execute(
+                            "PRAGMA main.wal_checkpoint(PASSIVE)").fetchone()[1]
                 except sqlite3.Error:
                     pass  # retried next interval
             until_ckpt = max(0.0, next_ckpt - time.monotonic())
@@ -971,18 +980,20 @@ class Ledger:
 
     def _restart_wal(self) -> None:
         """Start the WAL over once it is large. Called by the writer after a
-        commit, holding the write lock.
+        commit, holding the write lock, when the checkpoint thread's last
+        pass found more than _WAL_RESTART_BYTES of frames in it.
 
         With autocheckpoint off, SQLite restarts the WAL only when a writer
         begins at a moment the log is fully copied and no reader is on it.
         Under continuous writes, with the index fill reading, that never
         happens, so the file grows without bound and commits slow down with
         it. Here the writer takes the checkpoint lock if it is free (so the
-        fill, which reads under it, isn't reading) and runs TRUNCATE without
-        waiting: it copies what the background PASSIVE pass left, resets and
-        truncates, once per _WAL_RESTART_BYTES of writes. If the lock is
-        taken or another reader is in the way, it tries again after
-        _WAL_RETRY_SECONDS.
+        fill, which reads under it, isn't reading) and runs RESTART without
+        waiting: it copies what the background PASSIVE pass left and starts
+        the log over, reusing the file (``journal_size_limit`` caps its
+        size). Truncating instead made the next writes pay to grow the file
+        again. If the lock is taken or a reader is in the way, it tries again
+        after _WAL_RETRY_SECONDS.
         """
         now = time.monotonic()
         if now < self._wal_retry_at:
@@ -992,14 +1003,18 @@ class Ledger:
             conn = self._conn
             try:
                 conn.execute("PRAGMA busy_timeout=0")
-                busy = conn.execute("PRAGMA main.wal_checkpoint(TRUNCATE)").fetchone()[0]
+                try:
+                    busy = conn.execute("PRAGMA main.wal_checkpoint(RESTART)").fetchone()[0]
+                finally:
+                    conn.execute("PRAGMA busy_timeout=5000")
             except sqlite3.Error:
                 busy = 1
             finally:
-                conn.execute("PRAGMA busy_timeout=5000")
                 self._ckpt_lock.release()
         if busy:
             self._wal_retry_at = now + _WAL_RETRY_SECONDS
+        else:
+            self._wal_log = 0
 
     def _index_watermarks(self, conn: sqlite3.Connection) -> Tuple[int, int, int]:
         """``(writes_upto, sets_upto, bindings_upto)``: the last write
@@ -1239,7 +1254,7 @@ class Ledger:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
-            if self._wal and _wal_bytes(self._wal) > _WAL_RESTART_BYTES:
+            if self._wal_log * self._page_size > _WAL_RESTART_BYTES:
                 self._restart_wal()
             for key, hint in hints.items():
                 self._chains[key] = hint
