@@ -171,3 +171,95 @@ def test_mem0_async(cap):
 def test_the_scan_finds_content(tmp_path):
     (tmp_path / "leak").write_bytes(b"prefix " + CANARY.encode("utf-16-le"))
     assert scan(tmp_path)
+
+
+def test_pydantic_ai_tools(cap):
+    pytest.importorskip("pydantic_ai")
+    from pydantic_ai import Agent
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.toolsets import FunctionToolset
+
+    from dod.integrations.pydantic_ai import CaptureToolset, call_record_id
+    capture, led, tmp = cap
+    ts = FunctionToolset()
+
+    @ts.tool_plain
+    def lookup(name: str) -> str:
+        return CANARY
+
+    @ts.tool_plain
+    def save(text: str) -> dict:
+        return {"id": "T1"}
+
+    calls = [("lookup", {"name": "ana"}), ("save", {"text": CANARY})]
+
+    def fn(messages, info):
+        if calls:
+            name, args = calls.pop(0)
+            return ModelResponse(parts=[ToolCallPart(name, args, tool_call_id=f"c{len(calls)}")])
+        return ModelResponse(parts=[TextPart(CANARY)])
+
+    agent = Agent(FunctionModel(fn), name="support", toolsets=[CaptureToolset(
+        ts, capture, read_only=["lookup"], record_id=lambda t, a, r: r["id"] if t == "save" else None)])
+    agent.run_sync(CANARY)
+    rid = led._conn.execute("SELECT record_id FROM bindings ORDER BY rowid LIMIT 1").fetchone()[0]
+    assert rid.startswith("call:") and call_record_id
+    finish(led, tmp, "pydantic_ai", rid)
+
+
+def test_openai_agents_tools(cap):
+    pytest.importorskip("agents")
+    from test_openai_agents import CONFIG, Scripted
+
+    from agents import Agent, Runner, function_tool
+    from dod.integrations.openai_agents import instrument_tools
+    capture, led, tmp = cap
+
+    @function_tool
+    def lookup(topic: str) -> str:
+        """Look up."""
+        return CANARY
+
+    @function_tool
+    def save(note: str) -> str:
+        """Save."""
+        return "ok"
+
+    tools = instrument_tools([lookup, save], capture, read_only=["lookup"],
+                             record_id=lambda n, a, r: "note-1" if n == "save" else None)
+    agent = Agent(name="support", model=Scripted([
+        ("call", "lookup", {"topic": "x"}, "c1"), ("call", "save", {"note": CANARY}, "c2"),
+        ("say", CANARY)]), tools=tools)
+    asyncio.run(Runner.run(agent, CANARY, run_config=CONFIG))
+    finish(led, tmp, "openai_agents", "call:c1")
+
+
+def test_langgraph_graph_state(cap):
+    pytest.importorskip("langgraph.graph")
+    import operator
+    from typing import Annotated, TypedDict
+
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    from dod.integrations.langgraph_graph import instrument_graph
+    capture, led, tmp = cap
+
+    class S(TypedDict):
+        messages: Annotated[list, operator.add]
+        note: str
+
+    def node(state):
+        return {"messages": [CANARY + " reply"], "note": CANARY}
+
+    g = StateGraph(S)
+    g.add_node("n", node)
+    g.add_edge(START, "n")
+    g.add_edge("n", END)
+    app = instrument_graph(g.compile(checkpointer=InMemorySaver(), name="bot"), capture)
+    cfg = {"configurable": {"thread_id": "t1"}}
+    app.invoke({"messages": [CANARY]}, cfg)
+    app.invoke({"messages": [CANARY + " 2"]}, cfg)
+    rid = led._conn.execute("SELECT record_id FROM bindings ORDER BY rowid LIMIT 1").fetchone()[0]
+    finish(led, tmp, "langgraph_state", rid)
