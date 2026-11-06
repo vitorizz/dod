@@ -34,6 +34,8 @@ export function setWalRestartBytes(n: number): void {
   WAL_RESTART_BYTES = n;
 }
 
+const WAL_CHECK_EVERY = 16;
+
 function walBytes(path: string): number {
   try {
     return statSync(path).size;
@@ -124,9 +126,13 @@ export class Ledger {
       this.db.exec("ROLLBACK");
       throw e;
     }
-    if (this.path !== ":memory:" && walBytes(this.path + "-wal") > WAL_RESTART_BYTES) this.restartWal();
+    // The WAL's size is looked at every WAL_CHECK_EVERY commits, not on each.
+    if (this.path !== ":memory:" && ++this.commits % WAL_CHECK_EVERY === 0
+      && walBytes(this.path + "-wal") > WAL_RESTART_BYTES) this.restartWal();
     return out;
   }
+
+  private commits = 0;
 
   /**
    * Start the WAL over once it is large. With autocheckpoint off, SQLite
