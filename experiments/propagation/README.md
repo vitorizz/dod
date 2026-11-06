@@ -120,7 +120,7 @@ Every variant removed every planted-value wrong item, in all 15 runs. `precise` 
 | `in_prompt_only` | 8.3 | 0 | 0 |
 | wipe | 56.0 | 47.7 | 0 |
 
-The model adopted the planted update wherever it was in the prompt. The October run with claude-haiku-5-5 produced the same per-seed numbers, so the lineage graph didn't depend on which model wrote. Every wrong output traced to the planted item. `in_prompt_only` removed exactly the 8.3 planted-value wrong items per run and nothing else.
+The model adopted the planted update wherever it was in the prompt. The October runs with claude-sonnet-5-5 and claude-haiku-5-5 produced the same per-seed numbers, so the lineage graph didn't depend on the model or the run. Every wrong output traced to the planted item. `in_prompt_only` removed exactly the 8.3 planted-value wrong items per run and nothing else.
 
 ## `results.json`
 
