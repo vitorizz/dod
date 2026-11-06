@@ -30,10 +30,18 @@ Ordering
     a parent to versions written at or before the child by timestamp, not
     by ``seq`` as the local ``trace`` does.
 
+    Write IDs are random UUIDv7-layout IDs (74 random bits), so they are
+    the global key in Postgres; a collision across nodes would be dropped by
+    ``ON CONFLICT DO NOTHING``, which at that width doesn't happen in practice.
+    Cross-node ``trace`` compares timestamps: keep node clocks synced (NTP),
+    or a skewed node's versions can be ordered wrongly.
+
 Quarantine
     A pulled row is appended locally with actor ``dod-ship:<node>`` and is
     not shipped back. Actions from different nodes are applied in the order
-    they're pulled.
+    they're pulled. Applying is at least once: a crash between the local
+    append and the watermark commit re-applies the action, which appends a
+    duplicate row (harmless: the latest action wins).
 """
 
 import logging
@@ -145,6 +153,13 @@ class Shipper:
     # --- lifecycle -------------------------------------------------------------
 
     def start(self) -> "Shipper":
+        """Ship from a thread in this process. Prefer ``dod ship`` (its own
+        process): as a thread, each pass competes with capture for the
+        interpreter, and captured writes see p99 spikes above 1 ms."""
+        import warnings
+        warnings.warn("Shipper.start() runs in the agent's process and adds capture latency;"
+                      " run `dod ship` as its own process in production", RuntimeWarning,
+                      stacklevel=2)
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="dod-shipper", daemon=True)
         self._thread.start()

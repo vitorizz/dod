@@ -144,6 +144,36 @@ def test_verify_fails_on_tampering(audited, capsys):
     assert code == 1 and out.startswith("NOT VERIFIED") and "digest mismatch" in out
 
 
+def test_ship_final_sync_failure_exits_1_without_traceback(path, capsys, monkeypatch):
+    """The loop is interrupted, then the final sync fails: message on stderr, exit 1."""
+    import signal
+
+    import dod.ship
+
+    calls = []
+
+    class FailingShipper:
+        def __init__(self, *a, **kw):
+            pass
+
+        def sync(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyboardInterrupt  # stops the loop, like Ctrl-C
+            raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(dod.ship, "Shipper", FailingShipper)
+    old = signal.getsignal(signal.SIGTERM)
+    try:
+        code = main(["ship", "--ledger", path, "--dsn", "postgresql://unused", "--node", "n",
+                     "--interval", "0.01"])
+    finally:
+        signal.signal(signal.SIGTERM, old)
+    err = capsys.readouterr().err
+    assert code == 1
+    assert len(calls) == 2
+    assert "dod: final ship failed: connection refused; the next run ships it" in err
+    assert "Traceback" not in err
 def test_precise_flag(path, capsys):
     code, out = run(capsys, "blast-radius", "mem", "bad", "--ledger", path, "--precise", "--json")
     assert code == 0 and "items" in json.loads(out)

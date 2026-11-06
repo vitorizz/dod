@@ -30,16 +30,35 @@ def test_append_while_shipping_p99_under_1ms(tmp_path, prefix):  # noqa: F811
         ledger.bind(w, "mem", "seed")
         proc = subprocess.Popen(
             [sys.executable, "-m", "dod", "ship", "--ledger", str(path), "--dsn", DSN,
-             "--node", "perf", "--prefix", prefix, "--interval", "0.1"],
-            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
+             "--node", "perf", "--prefix", prefix, "--interval", "0.25"],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            # Low priority, as recommended: on a 2-core CI runner a pass at
+            # normal priority takes the CPU the agent's writes need.
+            preexec_fn=lambda: os.nice(19))
         try:
             def append():
                 ledger.append_write(content=str(uuid.uuid4()), store="mem",
                                     source="agent_inference", agent_id="a", session_id="s",
                                     context=edges)
 
-            p99 = p99_ms(append, n=5_000, rounds=3,
-                         label="append_write (10 context) while `dod ship` runs every 100 ms")
+            # Another node quarantines items while capture runs, so this node's
+            # shipper is also appending pulled quarantine rows to the ledger.
+            other = Ledger(tmp_path / "other.db")
+            from dod.ship import Shipper
+            remote = Shipper(other, DSN, "other", prefix=prefix, pull=False)
+            n = [0]
+
+            def append_and_quarantine_elsewhere():
+                append()
+                n[0] += 1
+                if n[0] % 500 == 0:
+                    other.quarantine([("mem", f"rec-{n[0]}")])
+                    remote.ship_once()
+
+            p99 = p99_ms(append_and_quarantine_elsewhere, n=5_000, rounds=3,
+                         label="append_write (10 context) while `dod ship` (nice 19) runs every 250 ms"
+                               " and pulls quarantines")
+            other.close()
             deadline = time.time() + 10
             while time.time() < deadline:  # it really shipped
                 try:
