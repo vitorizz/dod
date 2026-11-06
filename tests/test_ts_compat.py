@@ -64,6 +64,15 @@ def test_python_reads_a_ts_ledger(golden):
 
 
 @needs_ts
+def test_ts_ledger_holds_no_content(golden):
+    path, _ = golden
+    for f in path.parent.glob(path.name + "*"):
+        data = f.read_bytes()
+        for text in ("refunds within 90 days", "told Ana 90 days", "Ana gets a refund"):
+            assert text.encode() not in data, (f, text)
+
+
+@needs_ts
 def test_content_addresses_and_hashes_match(golden):
     _, g = golden
     vectors = [
