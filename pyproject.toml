@@ -34,6 +34,7 @@ mem0 = ["mem0ai==2.0.5"]
 otel = ["opentelemetry-api==1.45.1", "opentelemetry-sdk==1.45.1"]
 mcp = ["mcp==1.28.1"]
 pydantic_ai = ["pydantic-ai-slim==2.66.0"]
+openai_agents = ["openai-agents==0.20.0"]
 postgres = ["langgraph==1.2.14", "langgraph-checkpoint==4.2.0", "langgraph-checkpoint-postgres==3.1.2", "psycopg[binary]==3.3.8"]
 
 [tool.pytest.ini_options]
@@ -45,6 +46,7 @@ markers = [
     "anthropic: needs the anthropic package (pip install -e \".[anthropic]\")",
     "otel: needs the OpenTelemetry API and SDK (pip install -e \".[otel]\")",
     "mcp: needs the MCP SDK (pip install -e \".[mcp]\")",
+    "openai_agents: needs openai-agents (pip install -e \".[openai_agents]\")",
     "pydantic_ai: needs pydantic-ai-slim (pip install -e \".[pydantic_ai]\")",
     "postgres: needs a Postgres server (DOD_TEST_POSTGRES_URI) and pip install -e \".[postgres]\"",
 ]
