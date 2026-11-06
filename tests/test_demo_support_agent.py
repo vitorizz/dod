@@ -62,6 +62,16 @@ def run(tmp_path, pg=None):
             assert not any(x["quarantined"] for x in view["boxes"]
                            if x["item"] == ["mcp:crm", dev["reply_id"]])
             assert {x["kind"] for x in view["turns"]} == {"seed", "chat", "regenerated"}
+
+            # Proof of removal: every excised record, sealed in a verified chain.
+            from demo.support_agent.app import _report
+            rep = _report(w, Lineage(w), f"msg:{ben_turn}")
+            assert rep["chain"]["ok"]
+            quarantined = [i for i in rep["items"] if i["status"] == "quarantined"]
+            assert len(quarantined) >= 13  # items: a box can hold several versions
+            assert {i["label"] for i in quarantined} >= set(c["lost_labels"])
+            assert all(a["entry"] for i in quarantined for a in i["actions"])
+            assert "# Excision report" in rep["markdown"]
         finally:
             await w.stop()
 

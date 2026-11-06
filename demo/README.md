@@ -23,6 +23,7 @@ Then in the console:
 1. Click Chloe's wrong reply (**where did this come from?**). Everything unrelated fades. Turn 5 (Chloe) read `refunds.md`, which turn 1 (Ben) wrote: the origins are what Ben and Chloe said, plus the handbook. Tracing a customer's message just says it's an origin.
 2. Click Ben's message (**what came from this?**): 13 things in 4 systems, in Ben's, Ana's and Chloe's turns. Dev's and Eli's turns stay faded.
 3. **Excise & regenerate**: the confirmation lists what's removed (13 records) and what's kept (10: the handbook, Dev's and Eli's conversations), against wiping memory (all 23). dod quarantines the subgraph, then the agent re-answers Ana and Chloe from clean memory; a before/after table shows the wrong and corrected replies, and the chat marks them.
+4. **Proof of removal**: lists every record removed, with when and the audit entry that sealed it, and checks the ledger's hash chain (the header badge shows it verified). **Download report** exports it as Markdown (`dod.audit.report`); the demo ledger is opened with `audit=True`.
 
 Nothing in dod decided that Ben's message was false: a person did, from the trace. dod recorded the edges, so finding and removing everything derived from it is a query.
 
