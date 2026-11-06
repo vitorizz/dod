@@ -109,6 +109,19 @@ ground-truth set labels items; it never adds or removes edges.
 
 Every variant removed every planted-value wrong item, in all 15 runs. `precise` cuts the correct items removed by 40–53% over the default. In this scenario, `in_prompt_only` already makes it surgical, and adding `precise` on top changes nothing there.
 
+## Real-model results (2026-11-06)
+
+`--mode llm --model anthropic/claude-sonnet-5-5 --steps 60`, 3 seeds (workflow run 42304531744), means:
+
+| Variant | Items removed | Correct items removed | Planted-value wrong items missed |
+|---|---|---|---|
+| excise | 35.0 | 26.7 | 0 |
+| `precise` | 19.0 | 10.7 | 0 |
+| `in_prompt_only` | 8.3 | 0 | 0 |
+| wipe | 56.0 | 47.7 | 0 |
+
+The model adopted the planted update wherever it was in the prompt. The October run with claude-haiku-5-5 produced the same per-seed numbers, so the lineage graph didn't depend on which model wrote. Every wrong output traced to the planted item. `in_prompt_only` removed exactly the 8.3 planted-value wrong items per run and nothing else.
+
 ## `results.json`
 
 IDs and counts only; no memory content.
