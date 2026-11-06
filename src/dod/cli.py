@@ -207,6 +207,40 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_ship(args) -> int:
+    """Ship the ledger to Postgres until interrupted (SIGINT or SIGTERM)."""
+    import signal
+    import threading
+
+    from dod.ship import Shipper
+
+    dsn = args.dsn or os.environ.get("DOD_SHIP_DSN")
+    if not dsn:
+        raise SystemExit("dod: no Postgres DSN: pass --dsn or set DOD_SHIP_DSN")
+    path = _path(args)
+    done = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: done.set())
+    with Ledger(path, audit=_audited(path), background_index=False) as led:
+        shipper = Shipper(led, dsn, args.node, prefix=args.prefix,
+                          interval=args.interval, pull=not args.no_pull)
+        if args.once:
+            n = shipper.sync()
+            _out(args, {"shipped": n}, [f"shipped {n} row(s)"])
+            return 0
+        print(f"dod: shipping {path} as node {args.node!r} every {args.interval}s",
+              file=sys.stderr, flush=True)
+        try:
+            while not done.wait(args.interval):
+                try:
+                    shipper.sync()
+                except Exception as exc:  # retried on the next pass
+                    print(f"dod: ship failed: {exc}", file=sys.stderr, flush=True)
+        except KeyboardInterrupt:
+            pass
+        shipper.sync()
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dod", description="Lineage for agent memory.")
     p.add_argument("--version", action="version", version=f"dod {dod.__version__}")
@@ -248,6 +282,16 @@ def parser() -> argparse.ArgumentParser:
     q.set_defaults(fn=cmd_quarantined)
     s = sub.add_parser("stats", parents=[common], help="what the ledger holds")
     s.set_defaults(fn=cmd_stats)
+    sh = sub.add_parser("ship", parents=[common],
+                        help="copy the ledger to Postgres (runs until stopped)")
+    sh.add_argument("--dsn", help="Postgres connection string (or $DOD_SHIP_DSN)")
+    sh.add_argument("--node", required=True, help="this ledger's node name")
+    sh.add_argument("--prefix", default="dod_", help="table name prefix (default dod_)")
+    sh.add_argument("--interval", type=float, default=1.0, help="seconds between passes")
+    sh.add_argument("--once", action="store_true", help="one pass, then exit")
+    sh.add_argument("--no-pull", action="store_true",
+                    help="don't pull other nodes' quarantine actions")
+    sh.set_defaults(fn=cmd_ship)
     v = sub.add_parser("verify", parents=[common],
                        help="check the audit chain (exit 1 if tampered)")
     v.add_argument("--expect-head", help="a digest from an earlier verify: must still be there")

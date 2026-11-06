@@ -224,6 +224,24 @@ app.invoke({"messages": [user_msg]}, {"configurable": {"thread_id": "ana"}})
 
 Every run is scoped to `(graph name, thread_id)`, so no `agent_task_scope` is needed around it. Each state channel of a thread is an item (`langgraph_state`): the run's input is recorded with source `user`, each node's update as a write, and the thread's saved state is context for the run. A memory a node writes to the store then traces back to the user message it came from.
 
+## Across hosts (Postgres)
+
+Each agent process keeps capturing into its own local ledger. `dod ship` copies its rows to shared Postgres tables, tagged with a node name. `PgLineage` then answers trace and blast-radius across every node: a memory written on one host and read on another links up.
+
+```bash
+dod ship --ledger agent.db --dsn postgresql://... --node host-a     # runs until stopped
+```
+
+```python
+from dod.ship import PgLineage
+
+lin = PgLineage("postgresql://...")
+lin.blast_radius("mem0", bad_id)["items"]      # everything derived from it, on any host
+lin.trace("mcp:crm", "R5")["roots"]
+```
+
+A quarantine taken on any node reaches every other node: each `dod ship` pulls the other nodes' quarantine actions into its local ledger. Run `dod ship` as its own process. Capture in the agent's process then stays as fast as without it (p99 ~0.1 ms while shipping every 100 ms). Postgres only receives what the ledger holds: IDs, hashes and edges.
+
 ## Versions
 
 An item can be rewritten: a profile updated, a file edited. `trace` only follows a parent to versions written before the child. `blast_radius(..., precise=True)` (and `excise(..., precise=True)`, `dod blast-radius --precise`) does the same going forward: it leaves out writes that read an item only before its contaminated version was written. The default stays item-level, so it can over-include but never misses a version.
@@ -242,6 +260,7 @@ dod release notes /memories/policies/refunds.md
 dod quarantined
 dod stats
 dod verify                              # audited ledgers: exit 1 if tampered
+dod ship --dsn postgresql://... --node host-a   # copy to Postgres (see "Across hosts")
 dod report notes /memories/policies/refunds.md > excision.md
 ```
 
