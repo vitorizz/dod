@@ -246,6 +246,46 @@ def cmd_ship(args) -> int:
     return 0
 
 
+def cmd_pg(args) -> int:
+    """Lineage across every node shipped to Postgres (see ``dod ship``)."""
+    from dod.ship import PgLineage
+
+    dsn = args.dsn or os.environ.get("DOD_SHIP_DSN")
+    if not dsn:
+        raise SystemExit("dod: no Postgres DSN: pass --dsn or set DOD_SHIP_DSN")
+    lin = PgLineage(dsn, args.prefix)
+    try:
+        if args.pg_cmd == "trace":
+            t = lin.trace(args.store, args.record_id)
+            data = {k: sorted(v) for k, v in t.items()}
+            lines = [f"{args.store} {args.record_id}: {len(t['ancestors'])} ancestor write(s),"
+                     f" {len(t['roots'])} root(s)"] + [f"  root {w}" for w in sorted(t["roots"])]
+        elif args.pg_cmd == "blast-radius":
+            b = lin.blast_radius(args.store, args.record_id, in_prompt_only=args.in_prompt_only)
+            data = {"items": [list(i) for i in sorted(b["items"])], "writes": len(b["writes"])}
+            lines = [f"{args.store} {args.record_id}: {len(b['items'])} item(s) derived from it,"
+                     " on any node"] + [f"  {s} {r}" for s, r in sorted(b["items"])]
+        elif args.pg_cmd == "excise":
+            items = lin.excise(args.store, args.record_id, in_prompt_only=args.in_prompt_only,
+                               dry_run=args.dry_run, reason=args.reason, actor=args.actor)
+            data = {"items": [list(i) for i in items], "dry_run": args.dry_run}
+            verb = "would quarantine" if args.dry_run else "quarantined, on every node at its next pass:"
+            lines = [f"{verb} {len(items)} item(s)"] + [f"  {s} {r}" for s, r in items]
+        elif args.pg_cmd == "release":
+            items = [(args.store, r) for r in args.record_ids]
+            lin.release(items, reason=args.reason, actor=args.actor)
+            data = {"released": [list(i) for i in items]}
+            lines = [f"released {len(items)} item(s) on every node"]
+        else:
+            q = sorted(lin.quarantined())
+            data = {"quarantined": [list(i) for i in q]}
+            lines = [f"{len(q)} quarantined item(s), across nodes"] + [f"  {s} {r}" for s, r in q]
+    except KeyError:
+        raise SystemExit(f"dod: no node recorded a write for {args.store} {args.record_id}")
+    _out(args, data, lines)
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dod", description="Lineage for agent memory.")
     p.add_argument("--version", action="version", version=f"dod {dod.__version__}")
@@ -297,6 +337,32 @@ def parser() -> argparse.ArgumentParser:
     sh.add_argument("--no-pull", action="store_true",
                     help="don't pull other nodes' quarantine actions")
     sh.set_defaults(fn=cmd_ship)
+    pgc = argparse.ArgumentParser(add_help=False)
+    pgc.add_argument("--dsn", help="Postgres connection string (or $DOD_SHIP_DSN)")
+    pgc.add_argument("--prefix", default="dod_", help="table name prefix (default dod_)")
+    pgc.add_argument("--json", action="store_true", help="machine-readable output")
+    pg = sub.add_parser("pg", help="lineage across every node shipped to Postgres")
+    pgs = pg.add_subparsers(dest="pg_cmd", required=True)
+    for name, help_ in (("trace", "where an item came from, on any node"),
+                        ("blast-radius", "everything derived from an item, on any node"),
+                        ("excise", "quarantine an item and what was derived from it, on every node")):
+        x = pgs.add_parser(name, parents=[pgc], help=help_)
+        item(x)
+        if name != "trace":
+            x.add_argument("--in-prompt-only", action="store_true")
+        if name == "excise":
+            x.add_argument("--dry-run", action="store_true")
+            x.add_argument("--reason")
+            x.add_argument("--actor")
+        x.set_defaults(fn=cmd_pg)
+    rel = pgs.add_parser("release", parents=[pgc], help="release items on every node")
+    rel.add_argument("store")
+    rel.add_argument("record_ids", nargs="+")
+    rel.add_argument("--reason")
+    rel.add_argument("--actor")
+    rel.set_defaults(fn=cmd_pg)
+    pgs.add_parser("quarantined", parents=[pgc], help="what is quarantined, across nodes"
+                   ).set_defaults(fn=cmd_pg)
     v = sub.add_parser("verify", parents=[common],
                        help="check the audit chain (exit 1 if tampered)")
     v.add_argument("--expect-head", help="a digest from an earlier verify: must still be there")
