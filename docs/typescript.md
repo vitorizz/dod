@@ -1,6 +1,6 @@
 # TypeScript: design options
 
-Status: proposal, not built. Needs a decision before code.
+Status: option A built (`ts/`, `@dod-lineage/capture`); see decisions.md (2026-11-06).
 
 ## Why
 
