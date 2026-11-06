@@ -947,14 +947,16 @@ def test_wal_stays_bounded_under_continuous_writes(tmp_path, monkeypatch):
     path = tmp_path / "ledger.db"
     with Ledger(path, checkpoint_interval=0.02) as led:
         peak = 0
-        for i in range(300):
+        # ~17 MiB of WAL without restarts; with them, a few times the 1 MiB
+        # limit at most (the checkpoint thread on a slow CI runner lags).
+        for i in range(600):
             time.sleep(0.002)  # leave the checkpoint thread a pass now and then
             led.append_tombstones([{"store": "s", "record_id": f"r{i}-{j}", "reason": "forget"}
                                    for j in range(200)])
             peak = max(peak, os.path.getsize(str(path) + "-wal"))
         (n,) = led._conn.execute("SELECT count(*) FROM tombstones").fetchone()
-    assert n == 300 * 200
-    assert peak < 4 << 20, f"WAL grew to {peak} bytes"  # 1 MiB limit + a few commits
+    assert n == 600 * 200
+    assert peak < 8 << 20, f"WAL grew to {peak} bytes"
 
 
 def test_wal_restart_backs_off_while_the_index_fill_holds_the_lock(tmp_path, monkeypatch):
