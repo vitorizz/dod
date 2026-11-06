@@ -953,4 +953,4 @@ def test_wal_stays_bounded_under_continuous_writes(tmp_path, monkeypatch):
             peak = max(peak, os.path.getsize(str(path) + "-wal"))
         (n,) = led._conn.execute("SELECT count(*) FROM tombstones").fetchone()
     assert n == 300 * 200
-    assert peak < 4 << 20, f"WAL grew to {peak} bytes"
+    assert peak < 4 << 20, f"WAL grew to {peak} bytes"  # 1 MiB limit + a few commits

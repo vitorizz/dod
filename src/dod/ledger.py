@@ -210,7 +210,7 @@ _FILL_QUIET = 0.1
 _FILL_IDLE_POLL = 0.02
 # The writer restarts the WAL once its file is this large (see
 # Ledger._restart_wal).
-_WAL_RESTART_BYTES = 16 * 1024 * 1024
+_WAL_RESTART_BYTES = 64 * 1024 * 1024
 
 
 def _wal_bytes(path: str) -> int:
