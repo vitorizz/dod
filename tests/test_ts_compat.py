@@ -27,6 +27,7 @@ needs_ts = pytest.mark.skipif(
     reason="node or a built ts/ package (cd ts && npm ci && npm run build) is missing")
 
 
+@pytest.mark.skipif(not TS.exists(), reason="no ts/ (an sdist ships the Python package only)")
 def test_ts_schema_is_current():
     assert OUT.read_text() == render(), "run python scripts/export_ts_schema.py"
 

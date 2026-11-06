@@ -55,3 +55,9 @@ markers = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dod"]
+
+[tool.hatch.build.targets.sdist]
+# The Python package, its tests (and the demo they run) and docs. The
+# TypeScript package, experiments and CI config live in the repository.
+include = ["/src", "/tests", "/examples", "/scripts", "/docs", "/demo", "/README.md",
+           "/LICENSE", "/CHANGELOG.md", "/pyproject.toml"]
