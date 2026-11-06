@@ -376,8 +376,16 @@ Supported:
 - `reconcile`: finds writes, edits and deletions made outside capture, in every store with a reconcile adapter (CrewAI, LangGraph Store, memory tool).
 - **Prompt confirmation**: `dod.prompt.confirm`, and wrappers for Anthropic (`messages.create`/`stream`, sync and async) and OpenAI-compatible clients (`chat.completions.create`, `responses.create`); `in_prompt_only` walks for `blast_radius` and `excise`.
 - OpenTelemetry export of every write, bind and deletion as `dod.*` span events (opentelemetry-api 1.45.1).
+- **LangChain vector stores** (langchain-core 1.7.5): any `VectorStore` (Chroma, PGVector, Pinecone, FAISS, ...): searches, `get_by_ids`, retrievers, `add_*`, `delete`.
+- **Mem0** (mem0ai 2.0.5): `Memory` and `AsyncMemory`, with Mem0's own retrieval inside `add` recorded as the new memories' parents.
+- **OpenAI Agents SDK** (openai-agents 0.20.0): function tools, scoped per run, with earlier runs' tool results as context.
+- **TypeScript** (`ts/`, Node >= 22.13): capture, scopes and a tool wrapper (Vercel AI SDK style), writing the same ledger file.
+- **Versions**: `trace` and, with `precise=True`, `blast_radius`/`excise` resolve rewritten items per version.
+- **Across hosts**: `dod ship` copies each node's ledger to Postgres. `PgLineage` and `dod pg` trace, blast-radius and excise across every node. Quarantines fan out to all nodes.
+- **Audit**: an opt-in hash-chained ledger (`audit=True`), `dod verify`, and per-excision evidence reports (`dod report`).
+- **CLI**: `dod trace`, `blast-radius`, `excise`, `release`, `quarantined`, `stats`, `verify`, `report`, `ship`, `pg`.
 
-Next: more integrations (other frameworks, more MCP-reachable stores).
+Next: design partners' frameworks and stores, and a published release.
 
 ## Demo
 
