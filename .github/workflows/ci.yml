@@ -61,6 +61,36 @@ jobs:
       - name: Run pytest without integrations
         run: pytest -q
 
+  # The TypeScript capture package, and Python reading the ledgers it writes.
+  test-ts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and test the TS package
+        working-directory: ts
+        run: |
+          npm ci
+          npm test
+
+      - name: Python reads TS ledgers
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pytest -q tests/test_ts_compat.py
+
   # Docs-only PRs (every changed file is Markdown or under docs/) skip the review.
   changes:
     if: github.event_name == 'pull_request'
