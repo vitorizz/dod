@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Capture, Ledger, agentTaskScope, instrumentTools, contextSet } from "../dist/index.js";
+import { Capture, Ledger, agentTaskScope, instrumentTools, contextSet, setWalRestartBytes } from "../dist/index.js";
 
 const tmp = () => join(mkdtempSync(join(tmpdir(), "dod-ts-")), "ledger.db");
 
@@ -163,4 +163,24 @@ test("appendBatch merges duplicate parents, in_prompt wins", () => {
   const rows = led.db.prepare("SELECT parent_record_id r, tag FROM direct_parents ORDER BY r").all();
   assert.deepEqual(rows.map((x) => [x.r, x.tag]), [["a", "in_prompt"], ["b", "retrieved_in_scope"]]);
   led.close();
+});
+
+
+test("the WAL stays bounded under continuous writes", async () => {
+  const { statSync } = await import("node:fs");
+  setWalRestartBytes(1 << 20);
+  try {
+    const path = tmp();
+    const led = new Ledger(path, { checkpointMs: 0 });  // the writer alone keeps it bounded
+    let peak = 0;
+    for (let i = 0; i < 200; i++) {
+      led.appendTombstones(Array.from({ length: 200 }, (_, j) => ["s", `r${i}-${j}`]), "forget");
+      peak = Math.max(peak, statSync(path + "-wal").size);
+    }
+    assert.ok(peak < 4 << 20, `WAL grew to ${peak} bytes`);
+    assert.equal(Number(led.db.prepare("SELECT count(*) n FROM tombstones").get().n), 40000);
+    led.close();
+  } finally {
+    setWalRestartBytes(64 * 1024 * 1024);
+  }
 });
