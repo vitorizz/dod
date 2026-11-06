@@ -64,6 +64,28 @@ test("tools: a read's result is a parent of a later write", async () => {
   led.close();
 });
 
+test("tools: a call outside a scope leaves no context behind", async () => {
+  const led = new Ledger(tmp());
+  const cap = new Capture(led);
+  const tools = instrumentTools({
+    lookup: { execute: async () => "x" },
+    save: { execute: async () => ({ id: "n" }) },
+    fail: { execute: async () => { throw new Error("boom"); } },
+  }, cap, { readOnly: ["lookup"] });
+  await tools.lookup.execute({}, { toolCallId: "c1" });
+  await tools.save.execute({}, { toolCallId: "c2" });
+  await assert.rejects(tools.fail.execute({}, { toolCallId: "c3" }), /boom/);
+  assert.equal(cap["contexts"].size, 0);
+  // A caller-supplied key may span calls, so its context is kept.
+  const keyed = instrumentTools({ lookup: { execute: async () => "x" } }, cap,
+    { readOnly: ["lookup"], key: () => ["agent", "run-1"] });
+  await keyed.lookup.execute({}, { toolCallId: "c4" });
+  assert.equal(cap["contexts"].size, 1);
+  cap.reset(["agent", "run-1"]);
+  assert.equal(cap["contexts"].size, 0);
+  led.close();
+});
+
 test("quarantine is visible through the capture cache", () => {
   const led = new Ledger(tmp());
   const cap = new Capture(led);

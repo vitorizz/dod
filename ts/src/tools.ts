@@ -15,7 +15,11 @@ export interface ToolOptions {
   recordId?: (tool: string, args: any, result: any) => string | null | undefined;
   /** Records a write tool deleted (tombstones). */
   deleted?: (tool: string, args: any, result: any) => Iterable<string> | null | undefined;
-  /** Scope key when a call runs outside agentTaskScope (default: one per call). */
+  /**
+   * Scope key when a call runs outside agentTaskScope (default: one per
+   * call, whose context is reset when the call ends). A key from here can
+   * span calls, so its context is kept: call `capture.reset(key)` when done.
+   */
   key?: (tool: string, options: any) => readonly [string, string];
 }
 
@@ -65,8 +69,15 @@ export function instrumentTools<T extends Record<string, ToolLike>>(tools: T, ca
           return result;
         };
         if (key) return run();
-        const [a, t] = opts.key?.(name, options) ?? [name, `call-${++calls}`];
-        return agentTaskScope(a, t, run);
+        if (opts.key) {
+          const [a, t] = opts.key(name, options);
+          return agentTaskScope(a, t, run);
+        }
+        // A per-call scope ends with the call: forget its context.
+        const own = [name, `call-${++calls}`] as const;
+        return agentTaskScope(own[0], own[1], async () => {
+          try { return await run(); } finally { capture.reset(own); }
+        });
       },
     };
   }
