@@ -183,14 +183,14 @@ def test_updates_inside_add_are_recorded(ledger, mem):
     # rewrites inside add goes through _update_memory, which is captured.
     mem.llm.script = [["User likes tea"], ["User likes green tea"]]
     (a,) = ids(mem.add("tea", user_id="u1"))
-    original = mem._dod_base["add"]
+    original = mem._add_to_vector_store
 
-    def add_that_updates(messages, **kwargs):
-        out = original(messages, **kwargs)
+    def pipeline_that_updates(*args, **kwargs):
+        out = original(*args, **kwargs)
         mem._update_memory(a, "User likes green tea", {"User likes green tea": [0.1] * 8})
         return out
 
-    mem._dod_base["add"] = add_that_updates
+    mem._add_to_vector_store = pipeline_that_updates
     with agent_task_scope("agent", "t"):
         mem.add("actually green tea", user_id="u1")
     rows = ledger._read_conn.execute(
@@ -235,3 +235,47 @@ def test_concurrent_adds_keep_their_own_parents(ledger, mem):
         t.join()
     assert derived(ledger, alice) == {("mem0", out["alice"])}
     assert derived(ledger, bob) == {("mem0", out["bob"])}
+
+
+@pytest.fixture
+def amem(tmp_path, ledger, monkeypatch):
+    from mem0 import AsyncMemory
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("MEM0_DIR", str(tmp_path / "mem0-async"))
+    m = AsyncMemory.from_config({
+        "vector_store": {"provider": "qdrant", "config": {
+            "path": str(tmp_path / "qdrant-async"), "embedding_model_dims": 8,
+            "collection_name": "t"}},
+        "history_db_path": str(tmp_path / "history-async.db"),
+    })
+    m.llm, m.embedding_model = ScriptedLLM(), HashEmbedder()
+    yield m0.instrument(m, Capture(ledger))
+
+
+def test_async_memory(ledger, amem):
+    import asyncio
+
+    async def go():
+        amem.llm.script = [["User is allergic to peanuts"], ["Avoid Thai restaurants"]]
+        (bad,) = ids(await amem.add("peanuts", user_id="u1"))
+        (d1,) = ids(await amem.add("dinner?", user_id="u1"))  # internal retrieval -> parent
+        with agent_task_scope("agent", "r"):
+            assert ids(await amem.search("peanuts", filters={"user_id": "u1"}, threshold=0))
+            assert (await amem.get(bad))["id"] == bad
+            await amem.update(d1, "Avoid Thai and Malaysian restaurants")
+        return bad, d1
+
+    bad, d1 = asyncio.run(go())
+    assert derived(ledger, bad) == {("mem0", d1)}
+    # Excise with deletion: excise runs off the event loop, as documented.
+    r = dod.excise(ledger, "mem0", bad, mode="delete", stores={"mem0": m0.DeleteAdapter(amem)})
+    assert sorted(r.done["mem0"]) == sorted([bad, d1])
+    assert reconcile(ledger, {"mem0": m0.ReconcileAdapter(amem)}).ok
+
+    async def inside_loop():
+        with pytest.raises(RuntimeError, match="outside the event loop"):
+            m0.DeleteAdapter(amem).delete(ids_left[0])
+
+    amem.llm.script = [["Another fact here"]]
+    ids_left = ids(asyncio.run(amem.add("x", user_id="u5")))
+    asyncio.run(inside_loop())
