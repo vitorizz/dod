@@ -1,3 +1,4 @@
+import os
 import hashlib
 import shutil
 import sqlite3
@@ -936,3 +937,20 @@ def test_two_ledgers_racing_on_the_same_new_context(path):
     for i, (wa, wb) in enumerate(zip(*wids)):
         assert set_of(path, wa) == set_of(path, wb)
         assert edges(path, wa) == edges(path, wb) == sorted(context(i))
+
+
+def test_wal_stays_bounded_under_continuous_writes(tmp_path, monkeypatch):
+    # With autocheckpoint off, SQLite rarely restarts the WAL by itself while
+    # writes keep coming; the writer restarts it at _WAL_RESTART_BYTES.
+    import dod.ledger as ledger_mod
+    monkeypatch.setattr(ledger_mod, "_WAL_RESTART_BYTES", 1 << 20)
+    path = tmp_path / "ledger.db"
+    with Ledger(path) as led:
+        peak = 0
+        for i in range(300):
+            led.append_tombstones([{"store": "s", "record_id": f"r{i}-{j}", "reason": "forget"}
+                                   for j in range(200)])
+            peak = max(peak, os.path.getsize(str(path) + "-wal"))
+        (n,) = led._conn.execute("SELECT count(*) FROM tombstones").fetchone()
+    assert n == 300 * 200
+    assert peak < 4 << 20, f"WAL grew to {peak} bytes"

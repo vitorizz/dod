@@ -208,6 +208,16 @@ _FILL_BUSY_SHARE = 0.02
 # fills back to back while a full batch or more is waiting.
 _FILL_QUIET = 0.1
 _FILL_IDLE_POLL = 0.02
+# The writer restarts the WAL once its file is this large (see
+# Ledger._restart_wal).
+_WAL_RESTART_BYTES = 16 * 1024 * 1024
+
+
+def _wal_bytes(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 def _append_only(tables, prefix: str = "", replace=()) -> str:
     """Triggers that reject UPDATE and DELETE on ``tables`` and an INSERT
@@ -876,6 +886,7 @@ class Ledger:
         self._walk_pool: List[sqlite3.Connection] = []
         self._walk_pool_lock = threading.Lock()
 
+        self._wal = self._file + "-wal" if self._file else None
         self._ckpt_conn = sqlite3.connect(
             str(path), isolation_level=None, check_same_thread=False
         )
@@ -913,6 +924,10 @@ class Ledger:
         # fills take at most _FILL_BUSY_SHARE of the time.
         rest_until = 0.0
         while not self._stop.wait(pause):
+            if self._wal and _wal_bytes(self._wal) > _WAL_RESTART_BYTES // 2:
+                # A burst of writes: copy now, so the writer's restart at
+                # _WAL_RESTART_BYTES finds little left to copy.
+                next_ckpt = 0.0
             if time.monotonic() >= next_ckpt:
                 next_ckpt = time.monotonic() + interval
                 try:
@@ -955,6 +970,28 @@ class Ledger:
             else:
                 pause = _FILL_IDLE_POLL
             pause = max(0.0, min(pause, until_ckpt))
+
+    def _restart_wal(self) -> None:
+        """Start the WAL over once it is large. Called by the writer after a
+        commit, holding the write lock.
+
+        With autocheckpoint off, SQLite restarts the WAL only when a writer
+        begins at a moment the log is fully copied and no reader is on it;
+        under continuous writes, with the index fill reading, that rarely
+        happens, so the file grows without bound and commits slow down with
+        it. The background PASSIVE checkpoint has copied most frames, so a
+        TRUNCATE here copies the rest and resets: once per
+        _WAL_RESTART_BYTES of writes. It gives up at once if a reader is in
+        the way (the next commit tries again).
+        """
+        conn = self._conn
+        conn.execute("PRAGMA busy_timeout=0")
+        try:
+            conn.execute("PRAGMA main.wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.execute("PRAGMA busy_timeout=5000")
 
     def _index_watermarks(self, conn: sqlite3.Connection) -> Tuple[int, int, int]:
         """``(writes_upto, sets_upto, bindings_upto)``: the last write
@@ -1194,6 +1231,8 @@ class Ledger:
                 conn.execute("ROLLBACK")
                 raise
             conn.execute("COMMIT")
+            if self._wal and _wal_bytes(self._wal) > _WAL_RESTART_BYTES:
+                self._restart_wal()
             for key, hint in hints.items():
                 self._chains[key] = hint
                 self._chains.move_to_end(key)
