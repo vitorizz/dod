@@ -67,16 +67,25 @@ def test_shipping_adds_under_half_ms_to_capture_p99(tmp_path, prefix):  # noqa: 
                  "--node", "perf", "--prefix", prefix],  # the default 1 s interval
                 env=env, preexec_fn=lambda: os.nice(19))  # low priority, as recommended
             try:
-                # Steady state: its start-up (imports, schema DDL) isn't measured.
-                deadline = time.time() + 30
+                # Steady state: the shipper has started (imports, schema DDL) and
+                # caught up on the baseline's ~18k writes and their context sets,
+                # which is a backlog, not what this measures.
+                local = {t: ledger._conn.execute(f"SELECT coalesce(max({c}), 0) FROM {t}")
+                         .fetchone()[0] for t, c in (("writes", "seq"), ("context_sets", "seq"),
+                                                     ("bindings", "rowid"))}
+                deadline = time.time() + 120
                 while time.time() < deadline:
                     try:
-                        PgLineage(DSN, prefix).trace("mem", "seed")
-                        break
-                    except (KeyError, psycopg.errors.UndefinedTable):  # not yet
-                        time.sleep(0.1)
+                        with psycopg.connect(DSN) as pg:
+                            hi = dict(pg.execute(f"SELECT tbl, hi FROM {prefix}ship_state"
+                                                 " WHERE node_id = 'perf'").fetchall())
+                        if all(hi.get(t, 0) >= n for t, n in local.items()):
+                            break
+                    except psycopg.errors.UndefinedTable:
+                        pass
+                    time.sleep(0.2)
                 else:
-                    pytest.fail("dod ship shipped nothing")
+                    pytest.fail(f"dod ship didn't catch up: {local}")
                 p99 = p99_ms(append, n=5_000, rounds=3,
                              label="append_write (10 context) while `dod ship` (nice 19)"
                                    " ships and pulls")
