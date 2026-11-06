@@ -36,7 +36,7 @@ import hashlib
 import os
 import random
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")  # crewai's, not ours
@@ -185,6 +185,10 @@ class RunResult:
     planted: List[Item]
     wrong: Set[Item]
     tasks: Dict[str, int]
+    # The wrong items that state the planted value (the rest are the agent's
+    # own mistakes, at error_rate): what an excision of the planted fact
+    # should remove.
+    wrong_planted: Set[Item] = field(default_factory=set)
 
 
 def run(cfg: Config, workdir: str, ledger, agent=None) -> RunResult:
@@ -263,13 +267,14 @@ def run(cfg: Config, workdir: str, ledger, agent=None) -> RunResult:
                 if excess > 0:
                     memory.forget(record_ids=[i[1] for i, _ in kept[:excess]])
 
-    wrong = ground_truth(memory, store, topics)
+    wrong, wrong_planted = ground_truth(memory, store, topics)
     memory.close()
-    return RunResult(planted=[planted], wrong=wrong, tasks=counts)
+    return RunResult(planted=[planted], wrong=wrong, tasks=counts, wrong_planted=wrong_planted)
 
 
-def ground_truth(memory, store, topics: List[Topic]) -> Set[Item]:
-    """Live items whose stated value differs from the topic's true value.
+def ground_truth(memory, store, topics: List[Topic]) -> Tuple[Set[Item], Set[Item]]:
+    """Live items whose stated value differs from the topic's true value, and
+    the subset stating the planted (false) value of the planted topic.
 
     The only reader of store content outside the agent. Runs outside any
     scope, so nothing it reads becomes a parent. Returns IDs only.
@@ -277,14 +282,19 @@ def ground_truth(memory, store, topics: List[Topic]) -> Set[Item]:
     from dod.integrations import langgraph
 
     truth = {t.name: t.true for t in topics}
-    wrong = set()
-    for rec in memory.list_records(limit=100_000):
-        topic, _, value = parse(rec.content)
+    planted = (topics[0].name, topics[0].false)
+    wrong, wrong_planted = set(), set()
+
+    def judge(item, text):
+        topic, _, value = parse(text)
         if value != truth[topic]:
-            wrong.add(("crewai", rec.id))
+            wrong.add(item)
+            if (topic, value) == planted:
+                wrong_planted.add(item)
+
+    for rec in memory.list_records(limit=100_000):
+        judge(("crewai", rec.id), rec.content)
     for ns in (("kb",), ("tickets",)):
         for it in store.search(ns, limit=100_000):
-            topic, _, value = parse(it.value["text"])
-            if value != truth[topic]:
-                wrong.add(("langgraph", langgraph.record_id(it.namespace, it.key)))
-    return wrong
+            judge(("langgraph", langgraph.record_id(it.namespace, it.key)), it.value["text"])
+    return wrong, wrong_planted

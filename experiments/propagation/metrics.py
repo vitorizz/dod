@@ -85,10 +85,14 @@ def _reach(start: Iterable[str], edges, forward: bool, tag: Optional[str]) -> Se
     return seen
 
 
-def _split(items: Iterable[Item], wrong: Set[Item]) -> Dict[str, int]:
+def _split(items: Iterable[Item], wrong: Set[Item],
+           wrong_planted: Optional[Set[Item]] = None) -> Dict[str, int]:
     items = list(items)
     n_wrong = sum(1 for i in items if i in wrong)
-    return {"items": len(items), "wrong": n_wrong, "correct": len(items) - n_wrong}
+    out = {"items": len(items), "wrong": n_wrong, "correct": len(items) - n_wrong}
+    if wrong_planted is not None:
+        out["wrong_planted"] = sum(1 for i in items if i in wrong_planted)
+    return out
 
 
 def _frac(n: int, d: int) -> Optional[float]:
@@ -96,7 +100,7 @@ def _frac(n: int, d: int) -> Optional[float]:
 
 
 def planted_metrics(ledger: Ledger, planted: Item, live: Set[Item], wrong: Set[Item],
-                    steps: int) -> dict:
+                    steps: int, wrong_planted: Optional[Set[Item]] = None) -> dict:
     b = blast_radius(ledger, *planted)
     starts = [w.write_id for w in b.items]
     in_prompt = _reach(starts, b.edges, forward=True, tag="in_prompt") - set(starts)
@@ -113,8 +117,11 @@ def planted_metrics(ledger: Ledger, planted: Item, live: Set[Item], wrong: Set[I
 
     tags = {"in_prompt": len(b.edges_tagged("in_prompt")),
             "retrieved_in_scope": len(b.edges_tagged("retrieved_in_scope"))}
-    targets = excise(ledger, *planted, dry_run=True).targets
-    target_items = [(s, r) for s, rs in targets.items() for r in rs]
+    def plan(**options) -> List[Item]:
+        targets = excise(ledger, *planted, dry_run=True, **options).targets
+        return [(s, r) for s, rs in targets.items() for r in rs]
+
+    target_items = plan()
     derived_items = {i for w in b.descendants for i in b.bindings.get(w.write_id, ())}
     ip_items = {planted}.union(*(b.bindings.get(w, ()) for w in in_prompt))
     return {
@@ -128,8 +135,18 @@ def planted_metrics(ledger: Ledger, planted: Item, live: Set[Item], wrong: Set[I
         "contaminating_edges": dict(tags, in_prompt_share=_frac(
             tags["in_prompt"], tags["in_prompt"] + tags["retrieved_in_scope"])),
         "deleted_derived_items": sum(1 for i in derived_items if i in b.deleted),
-        "excise": _split((i for i in target_items if i in live), wrong),
-        "excise_in_prompt": _split(sorted(i for i in ip_items if i in live), wrong),
+        "excise": _split((i for i in target_items if i in live), wrong, wrong_planted),
+        "excise_in_prompt": _split(sorted(i for i in ip_items if i in live), wrong, wrong_planted),
+        # The library's own options (excise(in_prompt_only=, precise=)):
+        # precise leaves out writes that only read an earlier, clean version
+        # of an item (the scenario rewrites knowledge-base entries).
+        "excise_lib_in_prompt": _split((i for i in plan(in_prompt_only=True) if i in live),
+                                       wrong, wrong_planted),
+        "excise_precise": _split((i for i in plan(precise=True) if i in live), wrong,
+                                 wrong_planted),
+        "excise_precise_in_prompt": _split(
+            (i for i in plan(in_prompt_only=True, precise=True) if i in live), wrong,
+            wrong_planted),
     }
 
 
@@ -161,7 +178,8 @@ def output_metrics(ledger: Ledger, outputs: List[Item], planted: List[Item],
 
 
 def compute(ledger: Ledger, path: str, planted: List[Item], wrong: Set[Item], steps: int,
-            output: Callable[[Item], bool] = is_output) -> dict:
+            output: Callable[[Item], bool] = is_output,
+            wrong_planted: Optional[Set[Item]] = None) -> dict:
     """All metrics for one run. ``path`` is the ledger file ``ledger`` has open."""
     items, dead, writes = _ledger_items(path)
     live = {i for i in items if i not in dead}
@@ -169,7 +187,10 @@ def compute(ledger: Ledger, path: str, planted: List[Item], wrong: Set[Item], st
     outputs = [i for i in items if output(i) and i in live]
     return {
         "ledger": {"writes": writes, "items": len(items), "tombstoned_items": len(dead)},
-        "planted": [planted_metrics(ledger, p, live, wrong, steps) for p in planted],
+        "planted": [planted_metrics(ledger, p, live, wrong, steps,
+                                    None if wrong_planted is None else wrong_planted & live)
+                    for p in planted],
         "outputs": output_metrics(ledger, outputs, planted, wrong),
-        "wipe": _split(sorted(live), wrong),
+        "wipe": _split(sorted(live), wrong,
+                       None if wrong_planted is None else wrong_planted & live),
     }
