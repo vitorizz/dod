@@ -163,3 +163,79 @@ def test_cli_ship_once_pulls_quarantine_into_another_process_ledger(tmp_path, pr
         assert b.quarantined() == {("mem", "x")}
     with pytest.raises(SystemExit, match="DSN"):
         main(["ship", "--ledger", str(tmp_path / "a.db"), "--node", "a"])
+
+
+def test_excise_from_postgres_reaches_every_node(tmp_path, prefix):
+    a, b = Ledger(tmp_path / "a.db"), Ledger(tmp_path / "b.db")
+    sa = Shipper(a, DSN, "host-a", prefix=prefix)
+    sb = Shipper(b, DSN, "host-b", prefix=prefix)
+    write(a, "mem", "bad")
+    write(b, "crm", "reply", context=[("mem", "bad", "in_prompt")])
+    write(b, "crm", "fine")
+    sa.sync()
+    sb.sync()
+    lin = PgLineage(DSN, prefix)
+    plan = lin.excise("mem", "bad", dry_run=True)
+    assert plan == [("mem", "bad"), ("crm", "reply")]
+    assert lin.quarantined() == set()
+    assert lin.excise("mem", "bad", actor="alice") == plan
+    sa.sync()
+    sb.sync()
+    assert a.quarantined() == set(plan) and b.quarantined() == set(plan)
+    assert lin.excise("mem", "bad") == plan  # already quarantined: no new rows
+    lin.release([("crm", "reply")])
+    sb.sync()
+    assert b.quarantined() == {("mem", "bad")}
+    import psycopg
+    with psycopg.connect(DSN) as pg:
+        n = pg.execute(f"SELECT count(*) FROM {prefix}quarantine WHERE node_id = 'dod-console'"
+                       ).fetchone()[0]
+    assert n == 3
+    with pytest.raises(ValueError):
+        Shipper(a, DSN, "dod-console", prefix=prefix)
+    a.close()
+    b.close()
+
+
+def test_cli_pg_commands(tmp_path, prefix, capsys):
+    import json as _json
+
+    from dod.cli import main
+    led = Ledger(tmp_path / "a.db")
+    write(led, "mem", "bad")
+    write(led, "crm", "reply", context=[("mem", "bad", "in_prompt")])
+    Shipper(led, DSN, "a", prefix=prefix).sync()
+    common = ["--dsn", DSN, "--prefix", prefix, "--json"]
+
+    def run(*argv):
+        assert main(["pg", *argv, *common]) == 0
+        return _json.loads(capsys.readouterr().out)
+
+    assert run("blast-radius", "mem", "bad")["items"] == [["crm", "reply"]]
+    assert run("trace", "crm", "reply")["roots"]
+    assert run("excise", "mem", "bad", "--dry-run")["items"] == [["mem", "bad"], ["crm", "reply"]]
+    run("excise", "mem", "bad", "--actor", "alice")
+    assert run("quarantined")["quarantined"] == [["crm", "reply"], ["mem", "bad"]]
+    run("release", "crm", "reply")
+    assert run("quarantined")["quarantined"] == [["mem", "bad"]]
+    with pytest.raises(SystemExit, match="no node recorded"):
+        main(["pg", "trace", "mem", "nope", *common])
+    led.close()
+
+
+def test_pg_excise_options_and_errors(tmp_path, prefix):
+    led = Ledger(tmp_path / "a.db")
+    write(led, "mem", "bad")
+    write(led, "crm", "prompted", context=[("mem", "bad", "in_prompt")])
+    write(led, "crm", "retrieved", context=[("mem", "bad", "retrieved_in_scope")])
+    Shipper(led, DSN, "a", prefix=prefix).sync()
+    lin = PgLineage(DSN, prefix)
+    assert lin.excise("mem", "bad", in_prompt_only=True, dry_run=True) == [
+        ("mem", "bad"), ("crm", "prompted")]
+    assert set(lin.excise("mem", "bad", dry_run=True)) == {
+        ("mem", "bad"), ("crm", "prompted"), ("crm", "retrieved")}
+    with pytest.raises(KeyError):
+        lin.excise("mem", "nope")
+    with pytest.raises(ValueError, match="not quarantined"):
+        lin.release([("mem", "bad")])
+    led.close()

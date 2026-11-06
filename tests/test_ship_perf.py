@@ -4,7 +4,6 @@ process (the recommended deployment: no contention for the interpreter)."""
 import os
 import subprocess
 import sys
-import threading
 import time
 import uuid
 
@@ -21,6 +20,21 @@ from dod.ledger import Ledger  # noqa: E402
 from dod.ship import PgLineage  # noqa: E402
 
 DSN = os.environ.get("DOD_TEST_POSTGRES_URI", "")
+
+# Another node: quarantine an item and ship it, every 200 ms, until killed.
+OTHER_NODE = """
+import sys, time
+from dod.ledger import Ledger
+from dod.ship import Shipper
+led = Ledger(sys.argv[1])
+s = Shipper(led, sys.argv[2], "other", prefix=sys.argv[3], pull=False)
+n = 0
+while True:
+    n += 1
+    led.quarantine([("mem", f"rec-{n}")])
+    s.ship_once()
+    time.sleep(0.2)
+"""
 
 
 def test_shipping_adds_under_half_ms_to_capture_p99(tmp_path, prefix):  # noqa: F811
@@ -54,32 +68,23 @@ def test_shipping_adds_under_half_ms_to_capture_p99(tmp_path, prefix):  # noqa: 
                     time.sleep(0.1)
             else:
                 pytest.fail("dod ship shipped nothing")
-            # Meanwhile another node quarantines items, so this node's shipper
-            # also appends pulled quarantine rows to the ledger during capture.
-            from dod.ship import Shipper
-            other = Ledger(tmp_path / "other.db")
-            remote = Shipper(other, DSN, "other", prefix=prefix, pull=False)
-            stop = threading.Event()
-
-            def quarantine_elsewhere():
-                n = 0
-                while not stop.wait(0.2):
-                    n += 1
-                    other.quarantine([("mem", f"rec-{n}")])
-                    remote.ship_once()
-
-            t = threading.Thread(target=quarantine_elsewhere, daemon=True)
-            t.start()
+            # Meanwhile another node (its own process) quarantines items, so
+            # this node's shipper also appends pulled quarantine rows to the
+            # ledger during capture.
+            other = subprocess.Popen([sys.executable, "-c", OTHER_NODE, str(tmp_path / "other.db"),
+                                      DSN, prefix],
+                                     env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
             try:
                 p99 = p99_ms(append, n=5_000, rounds=3,
                              label="append_write (10 context) while `dod ship` (nice 19) runs"
                                    " every 250 ms and pulls quarantines")
             finally:
-                stop.set()
-                t.join()
-                other.close()
-            time.sleep(0.6)
-            assert ledger.quarantined(), "no quarantine was pulled during the run"
+                other.terminate()
+                other.wait(timeout=30)
+            deadline = time.time() + 30  # the shipper's next pass pulls them
+            while not ledger.quarantined() and time.time() < deadline:
+                time.sleep(0.1)
+            assert ledger.quarantined(), "no quarantine was pulled"
         finally:
             proc.terminate()
             assert proc.wait(timeout=30) == 0

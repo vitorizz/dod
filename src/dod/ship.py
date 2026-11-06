@@ -5,7 +5,7 @@ the same latency and code as always. A ``Shipper`` copies committed rows to
 shared Postgres tables in the background, tagged with the ledger's
 ``node_id``. ``PgLineage`` answers ``trace`` and ``blast_radius`` over every
 node's rows at once, so a memory written on one host and read on another
-links up. Quarantine actions taken anywhere reach every node: each shipper
+links up. ``PgLineage.excise`` quarantines across nodes. Quarantine actions taken anywhere reach every node: each shipper
 also pulls the other nodes' quarantine rows into its local ledger, so every
 node's instrumented stores stop returning a quarantined item.
 
@@ -47,6 +47,7 @@ Quarantine
 import logging
 import sqlite3
 import threading
+import time
 from typing import Dict, List, Optional, Set, Tuple
 
 from dod.ledger import Ledger
@@ -55,6 +56,8 @@ logger = logging.getLogger(__name__)
 
 Item = Tuple[str, str]
 PULLED = "dod-ship:"
+# The node name quarantine actions taken from Postgres (PgLineage) go under.
+CONSOLE = "dod-console"
 
 _PG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS {p}writes (
@@ -139,8 +142,9 @@ class Shipper:
 
     def __init__(self, ledger: Ledger, dsn: str, node_id: str, *, prefix: str = "dod_",
                  interval: float = 1.0, batch: int = 5000, pull: bool = True) -> None:
-        if not node_id or PULLED in node_id:
-            raise ValueError("node_id must be a non-empty name without 'dod-ship:'")
+        if not node_id or PULLED in node_id or node_id == CONSOLE:
+            raise ValueError(f"node_id must be a non-empty name, not {CONSOLE!r},"
+                             " without 'dod-ship:'")
         if not getattr(ledger, "_file", None):
             raise ValueError("shipping needs an on-disk ledger")
         self.ledger, self.dsn, self.node_id, self.p = ledger, dsn, node_id, prefix
@@ -406,6 +410,56 @@ class PgLineage:
                 FROM {self.p}quarantine ORDER BY store, record_id, ts DESC, seq DESC
             """).fetchall()
         return {(s, r) for s, r, a in rows if a == "quarantine"}
+
+    def quarantine(self, items: List[Item], reason: Optional[str] = None,
+                   actor: Optional[str] = None, node: str = CONSOLE) -> None:
+        """Quarantine ``items`` on every node: the rows go in under ``node``,
+        and each node's shipper pulls them into its ledger on its next pass."""
+        self._append(items, "quarantine", reason, actor, node)
+
+    def release(self, items: List[Item], reason: Optional[str] = None,
+                actor: Optional[str] = None, node: str = CONSOLE) -> None:
+        """Release ``items`` on every node (pulled like ``quarantine``).
+        Raises ``ValueError``, releasing nothing, if any isn't quarantined."""
+        items = list(items)
+        missing = [i for i in items if i not in self.quarantined()]
+        if missing:
+            raise ValueError(f"not quarantined: {missing}; nothing was released")
+        self._append(items, "release", reason, actor, node)
+
+    def excise(self, store: str, record_id: str, *, in_prompt_only: bool = False,
+               dry_run: bool = False, reason: Optional[str] = None,
+               actor: Optional[str] = None, node: str = CONSOLE) -> List[Item]:
+        """Quarantine ``(store, record_id)`` and everything derived from it on
+        any node; return the items, root first. ``dry_run`` only returns them."""
+        derived = self.blast_radius(store, record_id, in_prompt_only=in_prompt_only)["items"]
+        items = [(store, record_id)] + sorted(derived)
+        if not dry_run:
+            already = self.quarantined()
+            todo = [i for i in items if i not in already]
+            if todo:
+                self._append(todo, "quarantine",
+                             reason or f"excision of {store} {record_id}", actor, node)
+        return items
+
+    def _append(self, items: List[Item], action: str, reason: Optional[str],
+                actor: Optional[str], node: str) -> None:
+        items = list(items)
+        if not items:
+            return
+        ts = time.time_ns()
+        with _connect(self.dsn) as pg:
+            # One writer per node name at a time, so its seq stays dense.
+            pg.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (self.p + "q:" + node,))
+            (top,) = pg.execute(f"SELECT coalesce(max(seq), 0) FROM {self.p}quarantine"
+                                " WHERE node_id = %s", (node,)).fetchone()
+            with pg.cursor() as cur:
+                cur.executemany(
+                    f"INSERT INTO {self.p}quarantine (node_id, seq, ts, store, record_id, action,"
+                    " reason, actor) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    [(node, top + i + 1, ts, s, r, action, reason, actor)
+                     for i, (s, r) in enumerate(items)])
+            pg.commit()
 
 
 __all__ = ["Shipper", "PgLineage", "ensure_schema"]
