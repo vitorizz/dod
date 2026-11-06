@@ -224,6 +224,10 @@ app.invoke({"messages": [user_msg]}, {"configurable": {"thread_id": "ana"}})
 
 Every run is scoped to `(graph name, thread_id)`, so no `agent_task_scope` is needed around it. Each state channel of a thread is an item (`langgraph_state`): the run's input is recorded with source `user`, each node's update as a write, and the thread's saved state is context for the run. A memory a node writes to the store then traces back to the user message it came from.
 
+## TypeScript
+
+Node agents capture with [`@dod-lineage/capture`](ts/README.md). It writes the same ledger file format, so everything here (trace, blast radius, excise, ship, audit report) works on what TypeScript agents record. It also includes a tool wrapper for the Vercel AI SDK and similar tool-calling setups.
+
 ## Command line
 
 Installing the package adds a `dod` command (or `python -m dod`) for the ledger:
