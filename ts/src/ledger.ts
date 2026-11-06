@@ -28,7 +28,7 @@ export interface WriteInput {
 export class LedgerError extends Error {}
 
 /** The writer restarts the WAL past this size (as dod.ledger does). */
-export let WAL_RESTART_BYTES = 16 * 1024 * 1024;
+export let WAL_RESTART_BYTES = 64 * 1024 * 1024;
 /** For tests. */
 export function setWalRestartBytes(n: number): void {
   WAL_RESTART_BYTES = n;

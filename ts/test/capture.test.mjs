@@ -181,6 +181,6 @@ test("the WAL stays bounded under continuous writes", async () => {
     assert.equal(Number(led.db.prepare("SELECT count(*) n FROM tombstones").get().n), 40000);
     led.close();
   } finally {
-    setWalRestartBytes(16 * 1024 * 1024);
+    setWalRestartBytes(64 * 1024 * 1024);
   }
 });
