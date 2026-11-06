@@ -19,8 +19,10 @@ Writes: the memories Mem0 extracts in ``add``
     ``agent_inference``. A call outside ``agent_task_scope`` gets its own
     scope, so Mem0's internal retrieval is still recorded.
 
-    ``update(id, data)`` is a compaction of the memory (the new text is its
-    content).
+    Every rewrite of an existing memory (``update(id, data)``, or an
+    ``UPDATE`` Mem0 makes inside ``add``) goes through ``_update_memory``,
+    which is wrapped: a compaction of the memory, with the new text as its
+    content. Inside ``add``, its parents are the add's context.
 
 Deletes
     ``delete`` and ``delete_all`` record a tombstone per memory removed
@@ -50,6 +52,8 @@ logger = logging.getLogger(__name__)
 _MARK = "_dod_instrumented"
 # The internal search results of the add() in progress (a list), else None.
 _internal: contextvars.ContextVar = contextvars.ContextVar("dod_mem0_internal", default=None)
+# The scope key of the add() in progress, for rewrites Mem0 makes inside it.
+_add_key: contextvars.ContextVar = contextvars.ContextVar("dod_mem0_add_key", default=None)
 
 
 def _results(value: Any) -> List[dict]:
@@ -67,8 +71,8 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
         raise TypeError(f"{type(memory).__name__} is not a mem0 Memory")
     _scope.register(capture)
     quarantine = QuarantineCache(capture._ledger)
-    base = {n: getattr(memory, n) for n in ("add", "search", "get", "get_all", "update",
-                                             "_delete_memory")}
+    base = {n: getattr(memory, n) for n in ("add", "search", "get", "get_all",
+                                             "_update_memory", "_delete_memory")}
     vs_search = memory.vector_store.search
 
     def retrieved(key, rows: Iterable[Tuple[str, str]]) -> None:
@@ -133,11 +137,12 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
         if own:
             key = ("mem0", f"add-{uuid.uuid4().hex}")
         found: list = []
-        token = _internal.set(found)
+        token, ktoken = _internal.set(found), _add_key.set((key, own, found))
         try:
             out = base["add"](messages, *args, **kwargs)
         finally:
             _internal.reset(token)
+            _add_key.reset(ktoken)
         try:
             added = [r for r in _results(out) if r.get("event", "ADD") == "ADD" and r.get("id")]
             if found:
@@ -159,15 +164,27 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
                 capture.reset(key)
         return out
 
-    @functools.wraps(base["update"])
-    def update(memory_id, data, *args, **kwargs):
-        out = base["update"](memory_id, data, *args, **kwargs)
-        key = _scope.current_key()
-        if key is None:
-            logger.warning("dod: mem0 update outside agent_task_scope; recorded with no parents")
-        agent_id, session_id = key if key is not None else (None, None)
+    # Every rewrite of an existing memory goes through _update_memory: the
+    # public update(), and any UPDATE Mem0 decides on inside add().
+    @functools.wraps(base["_update_memory"])
+    def update_memory(memory_id, data, *args, **kwargs):
+        out = base["_update_memory"](memory_id, data, *args, **kwargs)
+        in_add = _add_key.get()
+        if in_add is not None:
+            key, own, found = in_add
+            if found:  # the matches Mem0 retrieved for this add's prompt
+                retrieved(key, found)
+                capture.confirm(key, "\n".join(t for _, t in found if t))
+            agent_id, session_id = (None, None) if own else key
+        else:
+            key = _scope.current_key()
+            if key is None:
+                logger.warning("dod: mem0 update outside agent_task_scope;"
+                               " recorded with no parents")
+            agent_id, session_id = key if key is not None else (None, None)
+            key = key if key is not None else object()
         try:
-            capture.on_batch(key if key is not None else object(), store,
+            capture.on_batch(key, store,
                              [([(store, memory_id)], data, "agent_inference", memory_id)],
                              agent_id=agent_id, session_id=session_id)
         except Exception:
@@ -186,7 +203,7 @@ def instrument(memory: Any, capture: Capture, store: str = "mem0") -> Any:
             logger.exception("dod: recording the deletion of mem0 memory %r failed", memory_id)
         return out
 
-    memory.add, memory.update, memory.get = add, update, get
+    memory.add, memory.get, memory._update_memory = add, get, update_memory
     memory.search, memory.get_all = listing("search"), listing("get_all")
     memory._delete_memory = delete_memory
     memory.vector_store.search = vector_search

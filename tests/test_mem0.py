@@ -150,3 +150,24 @@ def test_instrument_twice_and_type_check(ledger, mem):
     assert m0.instrument(mem, Capture(ledger)) is mem
     with pytest.raises(TypeError):
         m0.instrument(object(), Capture(ledger))
+
+
+def test_updates_inside_add_are_recorded(ledger, mem):
+    # mem0 2.0.5's add() only adds; a version (or custom pipeline) that
+    # rewrites inside add goes through _update_memory, which is captured.
+    mem.llm.script = [["User likes tea"], ["User likes green tea"]]
+    (a,) = ids(mem.add("tea", user_id="u1"))
+    original = mem._dod_base["add"]
+
+    def add_that_updates(messages, **kwargs):
+        out = original(messages, **kwargs)
+        mem._update_memory(a, "User likes green tea", {"User likes green tea": [0.1] * 8})
+        return out
+
+    mem._dod_base["add"] = add_that_updates
+    with agent_task_scope("agent", "t"):
+        mem.add("actually green tea", user_id="u1")
+    rows = ledger._read_conn.execute(
+        "SELECT w.agent_id, d.parent_record_id, d.tag FROM writes w"
+        " JOIN direct_parents d ON d.write_id = w.write_id").fetchall()
+    assert rows == [("agent", a, "in_prompt")]
