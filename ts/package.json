@@ -1,0 +1,20 @@
+{
+  "name": "@dod-lineage/capture",
+  "version": "0.1.0",
+  "description": "Lineage capture for AI agent memory: records which retrieved items were in context at every write, into the same ledger file the Python dod library reads.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "npm run build && node --no-warnings --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "typescript": "^5.6.0"
+  },
+  "repository": { "type": "git", "url": "https://github.com/vitorizz/dod", "directory": "ts" }
+}

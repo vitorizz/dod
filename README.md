@@ -246,6 +246,10 @@ A quarantine taken on any node reaches every other node: each `dod ship` pulls t
 
 An item can be rewritten: a profile updated, a file edited. `trace` only follows a parent to versions written before the child. `blast_radius(..., precise=True)` (and `excise(..., precise=True)`, `dod blast-radius --precise`) does the same going forward: it leaves out writes that read an item only before its contaminated version was written. The default stays item-level, so it can over-include but never misses a version.
 
+## TypeScript
+
+Node agents capture with [`@dod-lineage/capture`](ts/README.md). It writes the same ledger file format, so everything here (trace, blast radius, excise, ship, audit report) works on what TypeScript agents record. It also includes a tool wrapper for the Vercel AI SDK and similar tool-calling setups.
+
 ## Command line
 
 Installing the package adds a `dod` command (or `python -m dod`) for the ledger:
