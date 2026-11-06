@@ -1,0 +1,11 @@
+model: anthropic/claude-sonnet-5-5  steps: 60  seeds: 3  code: 2255bc4f4fe90cb5efe8b03693cf04859bc7bec4
+llm mode: 3 run(s) x 60 steps = ~180 LLM calls to anthropic/claude-sonnet-5-5, one per step.
+   seed  p_use  derived  in_prompt  depth  stores    ip_share  wrong_out      traced   traced_ip  excise  excise_ok  excise_ip  excise_ip_ok  excise_pr  excise_pr_ok  excise_pr_ip  excise_pr_ip_ok    wipe  wipe_ok  pl_wrong  pr_missed
+-------  -----  -------  ---------  -----  ------  ----------  ---------  ----------  ----------  ------  ---------  ---------  ------------  ---------  ------------  ------------  ---------------  ------  -------  --------  ---------
+      0      -       41          9      4       2        0.80          5        1.00        1.00      35         26          9             0         16             7             9                0      54       45         9          0
+      1      -       43          9      4       2        0.57          6        1.00        1.00      37         28          9             0         32            23             9                0      57       48         9          0
+      2      -       36          8      6       2        0.76          4        1.00        1.00      33         26          7             0          9             2             7                0      57       50         7          0
+mean(3)      -    40.00       8.67   4.67    2.00        0.71       5.00        1.00        1.00   35.00      26.67       8.33          0.00      19.00         10.67          8.33             0.00   56.00    47.67      8.33       0.00
+  range          36..43       8..9   4..6    2..2  0.57..0.80       4..6  1.00..1.00  1.00..1.00  33..37     26..28       7..9          0..0      9..32         2..23          7..9             0..0  54..57   45..50      7..9       0..0
+
+Wrote /home/runner/work/_temp/out/20261106T222550Z-run42304531744.json (3 run(s), 213.08 s).
