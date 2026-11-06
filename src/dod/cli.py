@@ -6,6 +6,7 @@
     dod release      STORE RECORD_ID...  undo a quarantine
     dod quarantined                      what is quarantined now
     dod stats                            what the ledger holds
+    dod doctor                           is the ledger healthy (exit 1 on errors)
 
 The ledger is ``--ledger PATH``, else ``$DOD_LEDGER``. ``--json`` prints
 machine-readable output. Deleting through stores needs their adapters, so
@@ -184,6 +185,17 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def cmd_doctor(args) -> int:
+    from dod.doctor import check
+    findings = check(_path(args), unbound_after=args.unbound_after)
+    mark = {"ok": "ok   ", "warn": "WARN ", "error": "ERROR"}
+    lines = [f"{mark[f.level]} {f.check}: {f.message}" for f in findings]
+    worst = max((("ok", "warn", "error").index(f.level) for f in findings), default=0)
+    _out(args, {"findings": [{"check": f.check, "level": f.level, "message": f.message,
+                              "value": f.value} for f in findings]}, lines)
+    return 1 if worst == 2 or (args.strict and worst == 1) else 0
+
+
 def cmd_verify(args) -> int:
     with _ledger(args) as led:
         v = audit.verify(led, expected_head=args.expect_head)
@@ -331,6 +343,12 @@ def parser() -> argparse.ArgumentParser:
     q.set_defaults(fn=cmd_quarantined)
     s = sub.add_parser("stats", parents=[common], help="what the ledger holds")
     s.set_defaults(fn=cmd_stats)
+    d = sub.add_parser("doctor", parents=[common],
+                       help="health check: schema, WAL, index lag, unbound writes, audit")
+    d.add_argument("--unbound-after", type=float, default=300.0,
+                   help="count writes unbound for longer than this many seconds (default 300)")
+    d.add_argument("--strict", action="store_true", help="exit 1 on warnings too")
+    d.set_defaults(fn=cmd_doctor)
     sh = sub.add_parser("ship", parents=[common],
                         help="copy the ledger to Postgres (runs until stopped)")
     sh.add_argument("--dsn", help="Postgres connection string (or $DOD_SHIP_DSN)")
