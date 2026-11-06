@@ -197,3 +197,41 @@ def test_updates_inside_add_are_recorded(ledger, mem):
         "SELECT w.agent_id, d.parent_record_id, d.tag FROM writes w"
         " JOIN direct_parents d ON d.write_id = w.write_id").fetchall()
     assert rows == [("agent", a, "in_prompt")]
+
+
+def test_infer_false_sources_follow_the_role(ledger, mem):
+    out = mem.add([{"role": "user", "content": "I moved to Boston"},
+                   {"role": "assistant", "content": "Noted: Boston"}], user_id="u1", infer=False)
+    assert [r["role"] for r in out["results"]] == ["user", "assistant"]
+    sources = [s for (s,) in ledger._read_conn.execute("SELECT source FROM writes ORDER BY seq")]
+    assert sources == ["user", "agent_inference"]
+
+
+def test_concurrent_adds_keep_their_own_parents(ledger, mem):
+    import threading
+    mem.llm.script = [["Alice likes jazz music"], ["Bob likes heavy metal"]]
+    (alice,) = ids(mem.add("jazz", user_id="alice"))
+    (bob,) = ids(mem.add("metal", user_id="bob"))
+    barrier = threading.Barrier(2)
+    script = {"alice": "Play jazz for Alice tonight", "bob": "Play metal for Bob tonight"}
+    out = {}
+
+    class PerUserLLM:
+        def generate_response(self, messages, response_format=None, **kwargs):
+            barrier.wait(timeout=10)  # both adds are mid-flight together
+            user = "alice" if "jazz" in messages[-1]["content"] else "bob"
+            return json.dumps({"memory": [{"text": script[user]}]})
+
+    mem.llm = PerUserLLM()
+
+    def go(user):
+        with agent_task_scope(user, "t"):
+            out[user] = ids(mem.add(f"what should {user} hear?", user_id=user))[0]
+
+    threads = [threading.Thread(target=go, args=(u,)) for u in ("alice", "bob")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert derived(ledger, alice) == {("mem0", out["alice"])}
+    assert derived(ledger, bob) == {("mem0", out["bob"])}
