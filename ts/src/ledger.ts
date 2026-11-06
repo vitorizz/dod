@@ -1,6 +1,7 @@
 // The ledger file, in the format dod (Python) reads and writes.
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
+import { statSync } from "node:fs";
 import { contentHash, contextSet, nowNs, TAGS, writeId, type Parent, type Tag } from "./hash.js";
 import { SCHEMA, SCHEMA_VERSION } from "./schema.js";
 
@@ -25,6 +26,23 @@ export interface WriteInput {
 }
 
 export class LedgerError extends Error {}
+
+/** The writer restarts the WAL past this size (as dod.ledger does). */
+export let WAL_RESTART_BYTES = 64 * 1024 * 1024;
+/** For tests. */
+export function setWalRestartBytes(n: number): void {
+  WAL_RESTART_BYTES = n;
+}
+
+const WAL_CHECK_EVERY = 16;
+
+function walBytes(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
 
 // Checkpoints the WAL from its own thread and connection (PASSIVE: never
 // waits for writers), so a commit never runs one. Like dod.ledger's
@@ -100,14 +118,45 @@ export class Ledger {
 
   private tx<T>(fn: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
+    let out: T;
     try {
-      const out = fn();
+      out = fn();
       this.db.exec("COMMIT");
-      return out;
     } catch (e) {
       this.db.exec("ROLLBACK");
       throw e;
     }
+    // The WAL's size is looked at every WAL_CHECK_EVERY commits, not on each.
+    if (this.path !== ":memory:" && ++this.commits % WAL_CHECK_EVERY === 0
+      && walBytes(this.path + "-wal") > WAL_RESTART_BYTES) this.restartWal();
+    return out;
+  }
+
+  private commits = 0;
+
+  /**
+   * Start the WAL over once it is large. With autocheckpoint off, SQLite
+   * restarts it only when a writer begins while the log is fully copied and
+   * unread, which continuous writes rarely allow, so it would grow without
+   * bound (as in dod.ledger, which does the same). No busy wait: if a reader
+   * is in the way, a commit 50 ms later tries again.
+   */
+  private walRetryAt = 0;
+
+  private restartWal(): void {
+    const now = Date.now();
+    if (now < this.walRetryAt) return;
+    let busy = 1;
+    this.db.exec("PRAGMA busy_timeout=0");
+    try {
+      busy = Number((this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as any).busy);
+    } catch {
+      busy = 1;
+    } finally {
+      this.db.exec("PRAGMA busy_timeout=5000");
+    }
+    // Each try still copies frames and syncs: after a busy one, wait a while.
+    if (busy) this.walRetryAt = now + 50;
   }
 
   /** Record a write (and its parent edges) in one transaction; return its ID. */
