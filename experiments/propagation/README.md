@@ -90,10 +90,24 @@ ground-truth set labels items; it never adds or removes edges.
 | `deleted_derived_items` | Derived items that already have a tombstone. |
 | `excise` | Live items (bound, no tombstone) a quarantine `excise` of the planted item would remove, split wrong/correct. |
 | `excise_in_prompt` | The same over `in_prompt` edges only (the planted item plus items bound to `derived_writes_in_prompt`). |
+| `excise_lib_in_prompt`, `excise_precise`, `excise_precise_in_prompt` | What the library's `excise(in_prompt_only=, precise=)` would remove. `precise` leaves out writes that only read an earlier, clean version of an item (the scenario rewrites knowledge-base entries). |
+| `wrong_planted` (in each split) | Of the wrong items, those stating the planted value. The rest are the agent's own mistakes (`error_rate`), which an excision of the planted fact shouldn't touch. |
 | `wipe` | Every live item: what wiping all memory removes. |
 | `outputs.fraction_wrong_tracing` | Of the wrong outputs, the share whose `trace` reaches the planted item's write. |
 | `outputs.fraction_wrong_tracing_in_prompt` | The same over `in_prompt` edges only. |
 | `outputs.correct_tracing_to_planted` | Correct outputs whose trace still reaches it (over-inclusion). |
+
+## Scripted results: precise excision (2026-11-06)
+
+`--mode scripted --sweep --sweep-seeds 5 --steps 60`, means over 5 seeds:
+
+| `use_prob` | Planted-value wrong items | Correct items removed: excise | `precise` | `in_prompt_only` | wipe |
+|---|---|---|---|---|---|
+| 0.1 | 1.4 | 29.8 | 17.4 | 6.6 | 50.6 |
+| 0.5 | 3.2 | 26.0 | 14.0 | 3.6 | 46.2 |
+| 0.9 | 4.8 | 22.4 | 10.6 | 1.2 | 42.4 |
+
+Every variant removed every planted-value wrong item, in all 15 runs. `precise` cuts the correct items removed by 40–53% over the default. In this scenario, `in_prompt_only` already makes it surgical, and adding `precise` on top changes nothing there.
 
 ## `results.json`
 

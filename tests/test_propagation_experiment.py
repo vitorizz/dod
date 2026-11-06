@@ -97,6 +97,41 @@ def test_metrics_match_hand_computed(hand_ledger):
     }
 
 
+def test_precise_excise_and_planted_wrong(tmp_path):
+    """K is rewritten: v1 is clean, v2 is derived from the planted P.
+
+    A read K before v2 (clean, correct); B read K after v2 (wrong, planted
+    value); M is the agent's own mistake, unrelated to P.
+    """
+    path = str(tmp_path / "ledger.db")
+    ledger = Ledger(path)
+    cap = Capture(ledger)
+    K, P, A, B, M = (("langgraph", x) for x in ("k", "p", "a", "b", "m"))
+
+    def write(name, item, ip=()):
+        key = ("agent", name)
+        cap.on_retrieve(key, ip, "in_prompt")
+        cap.bind(cap.on_write(key, item[1], item[0], "agent_inference", "agent", name), item[1])
+        cap.reset(key)
+
+    write("k1", K)
+    write("a", A, ip=[K])
+    write("plant", P)
+    write("k2", K, ip=[P])
+    write("b", B, ip=[K])
+    write("m", M)
+    wrong, planted_wrong = {P, K, B, M}, {P, K, B}
+    m = metrics.compute(ledger, path, [P], wrong, steps=1, wrong_planted=planted_wrong)
+    (p,) = m["planted"]
+    # Item-level excise also takes A, which only read K's clean v1.
+    assert p["excise"] == {"items": 4, "wrong": 3, "correct": 1, "wrong_planted": 3}
+    assert p["excise_precise"] == {"items": 3, "wrong": 3, "correct": 0, "wrong_planted": 3}
+    assert m["wipe"]["wrong_planted"] == 3 and m["wipe"]["wrong"] == 4  # M isn't P's
+    h = run.headline(m)
+    assert h["planted_wrong"] == 3 and h["planted_wrong_missed_precise"] == 0
+    ledger.close()
+
+
 def test_is_output():
     assert metrics.is_output(("langgraph", _ticket(1)))
     assert not metrics.is_output(("langgraph", json.dumps(["kb", "refunds"])))

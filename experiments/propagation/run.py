@@ -34,8 +34,14 @@ HEADLINE = [
     ("excise_correct", "excise_ok"),
     ("excise_in_prompt_items", "excise_ip"),
     ("excise_in_prompt_correct", "excise_ip_ok"),
+    ("excise_precise_items", "excise_pr"),
+    ("excise_precise_correct", "excise_pr_ok"),
+    ("excise_precise_in_prompt_items", "excise_pr_ip"),
+    ("excise_precise_in_prompt_correct", "excise_pr_ip_ok"),
     ("wipe_items", "wipe"),
     ("wipe_correct", "wipe_ok"),
+    ("planted_wrong", "pl_wrong"),
+    ("planted_wrong_missed_precise", "pr_missed"),
 ]
 
 
@@ -54,8 +60,17 @@ def headline(m: dict) -> dict:
         "excise_correct": p["excise"]["correct"],
         "excise_in_prompt_items": p["excise_in_prompt"]["items"],
         "excise_in_prompt_correct": p["excise_in_prompt"]["correct"],
+        "excise_precise_items": p["excise_precise"]["items"],
+        "excise_precise_correct": p["excise_precise"]["correct"],
+        "excise_precise_in_prompt_items": p["excise_precise_in_prompt"]["items"],
+        "excise_precise_in_prompt_correct": p["excise_precise_in_prompt"]["correct"],
         "wipe_items": m["wipe"]["items"],
         "wipe_correct": m["wipe"]["correct"],
+        # Wrong items stating the planted value, and how many of them the
+        # precise excision would leave behind (should be 0).
+        "planted_wrong": m["wipe"].get("wrong_planted"),
+        "planted_wrong_missed_precise": None if m["wipe"].get("wrong_planted") is None else
+        m["wipe"]["wrong_planted"] - p["excise_precise"].get("wrong_planted", 0),
     }
 
 
@@ -69,7 +84,8 @@ def run_one(cfg: Config, agent=None) -> dict:
         ledger = Ledger(path)
         try:
             r = scenario.run(cfg, d, ledger, agent)
-            m = metrics.compute(ledger, path, r.planted, r.wrong, cfg.steps)
+            m = metrics.compute(ledger, path, r.planted, r.wrong, cfg.steps,
+                                wrong_planted=r.wrong_planted)
         finally:
             ledger.close()
     use_prob = cfg.use_prob if cfg.mode == "scripted" else None
