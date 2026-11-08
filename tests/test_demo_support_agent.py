@@ -119,3 +119,68 @@ def test_story_trace_and_correct(tmp_path):
 def test_story_on_postgres(tmp_path):
     pytest.importorskip("langgraph.store.postgres")
     run(tmp_path, os.environ["DOD_TEST_POSTGRES_URI"])
+
+
+def test_model_match_is_checked_against_the_records():
+    from demo.support_agent.llm import parse_match
+
+    recs = [{"id": "a", "content": "x"}, {"id": "b", "content": "y"}]
+    out = parse_match('Sure: {"topic": "refunds", "relevant": ["a"], "contradicts": ["b", "zzz"]}',
+                      recs, ["refunds", "shipping"])
+    assert out == {"topic": "refunds", "relevant": ["a", "b"], "contradicts": ["b"]}
+    assert parse_match('{"topic": "nope"}', recs, ["refunds"])["topic"] is None
+
+
+def test_candidates_come_from_the_model(tmp_path):
+    """With a real model, the model picks what contradicts the correction;
+    the plan and apply then work from what the person confirmed."""
+    from demo.support_agent import correction
+    from demo.support_agent.world import CORRECTION
+
+    class Model:
+        def __init__(self, inner):
+            self.inner, self.name, self.seen = inner, "fake", None
+
+        def decide(self, ctx):
+            return self.inner.decide(ctx)
+
+        def match(self, text, records, topics):
+            self.seen = text
+            ids = [r["id"] for r in records if r["kind"] == "policy_note"]
+            return {"topic": "refunds", "relevant": ids, "contradicts": ids}
+
+    async def main():
+        w = World(str(tmp_path / "world"), "scripted")
+        await w.start()
+        try:
+            w.llm = Model(w.llm)
+            await w.run_story()
+            c = correction.candidates(w, "refunds are a month, actually")
+            assert w.llm.seen == "refunds are a month, actually"
+            assert [x["kind"] for x in c["candidates"]] == ["policy_note"]
+            assert all(x["conflicts"] for x in c["candidates"])
+            p = correction.plan(w, CORRECTION, [x["box"] for x in c["candidates"]], c["topic"])
+            assert len(p["roots"]) == 1 and p["groups"]["cancel"]
+        finally:
+            await w.stop()
+
+    asyncio.run(main())
+
+
+def test_env_file_and_default_model(tmp_path, monkeypatch):
+    from demo.support_agent.app import default_model, load_env
+
+    for k in ("ANTHROPIC_API_KEY", "DEMO_MODEL", "DOD_DEMO_X"):
+        monkeypatch.delenv(k, raising=False)
+    assert default_model() == "scripted"
+    env = tmp_path / ".env"
+    env.write_text("# key\nexport ANTHROPIC_API_KEY='sk-test'\nDOD_DEMO_X=1\n")
+    monkeypatch.setenv("DOD_DEMO_X", "kept")
+    try:
+        load_env(str(env))
+        assert os.environ["ANTHROPIC_API_KEY"] == "sk-test" and os.environ["DOD_DEMO_X"] == "kept"
+        assert default_model() == "anthropic/claude-sonnet-5-5"
+        monkeypatch.setenv("DEMO_MODEL", "openai/qwen3:8b")
+        assert default_model() == "openai/qwen3:8b"
+    finally:
+        os.environ.pop("ANTHROPIC_API_KEY", None)  # set by load_env, not monkeypatch

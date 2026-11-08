@@ -111,9 +111,10 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
             if step == "candidates":
                 result = correction.candidates(w, text)
             elif step == "plan":
-                result = correction.plan(w, text, list(body.get("boxes") or []))
+                result = correction.plan(w, text, list(body.get("boxes") or []), body.get("topic"))
             elif step == "apply":
-                result = await correction.apply(w, text, list(body.get("boxes") or []))
+                result = await correction.apply(w, text, list(body.get("boxes") or []),
+                                                body.get("topic"))
             else:
                 return JSONResponse({"error": f"unknown step {step}"}, status_code=404)
         if "error" in result:
@@ -159,10 +160,32 @@ def _report(w: World, lin: Lineage, box: str) -> dict:
             "chain": rep["chain"], "markdown": "\n".join(docs)}
 
 
+def load_env(path: str) -> None:
+    """``KEY=value`` lines from a git-ignored ``.env`` (so an API key isn't
+    typed every run, nor committed); variables already set win."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        key, sep, value = line.strip().removeprefix("export ").partition("=")
+        if sep and key and not key.startswith("#"):
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+def default_model() -> str:
+    """``DEMO_MODEL``, else Claude when an Anthropic key is set, else scripted."""
+    if os.environ.get("DEMO_MODEL"):
+        return os.environ["DEMO_MODEL"]
+    return "anthropic/claude-sonnet-5-5" if os.environ.get("ANTHROPIC_API_KEY") else "scripted"
+
+
 def main() -> None:
+    load_env(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--model", default=os.environ.get("DEMO_MODEL", "scripted"),
-                   help="scripted, anthropic/<model> or openai/<model>")
+    p.add_argument("--model", default=default_model(),
+                   help="scripted, anthropic/<model> or openai/<model> (default: Claude if"
+                        " ANTHROPIC_API_KEY is set, in the environment or .env, else scripted)")
     p.add_argument("--pg", default=os.environ.get("DEMO_PG_URI"),
                    help="Postgres URI (pgvector); in-memory store if omitted")
     p.add_argument("--host", default="127.0.0.1")
