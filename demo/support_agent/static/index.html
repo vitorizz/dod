@@ -146,7 +146,13 @@
   .card .col.lose { border-color: #efc7c3; background: var(--blast-bg); }
   .card .foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
   .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
-  .busy { opacity: .6; pointer-events: none; }
+  .busy main, .busy header button { pointer-events: none; }
+  .busy #graph, .busy #log { opacity: .75; }
+  #working { display: none; position: fixed; top: 64px; left: 50%; transform: translateX(-50%); z-index: 50;
+    background: var(--ink); color: #fff; padding: 7px 14px; border-radius: 20px; font-size: 13px; box-shadow: 0 4px 14px #0003; }
+  .busy #working { display: flex; align-items: center; gap: 8px; }
+  #working i { width: 12px; height: 12px; border: 2px solid #fff6; border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -161,6 +167,7 @@
   <button id="reset" title="Start over with empty memory">Reset</button>
   <button class="help" id="helpbtn" title="What is going on here?">?</button>
 </header>
+<div id="working"><i></i><span id="worktext"></span></div>
 <main>
   <section id="chat">
     <div id="tabs"></div>
@@ -265,7 +272,15 @@ async function api(path, body) {
   if (!r.ok) throw new Error(data.error || r.statusText);
   return data;
 }
-async function busy(fn, quiet) { document.body.classList.add("busy"); try { return await fn(); } catch (e) { if (!quiet) alert(e.message); } finally { document.body.classList.remove("busy"); } }
+// Calls to a real model take seconds: say what we're waiting for, and for how long.
+async function busy(fn, quiet) {
+  const t0 = Date.now(), who = !S || S.model === "scripted" ? "Working" : `Waiting for ${S.model.split("/").pop()}`;
+  const tick = () => { $("worktext").textContent = `${who}… ${Math.floor((Date.now() - t0) / 1000)}s`; };
+  tick(); const timer = setInterval(tick, 500);
+  document.body.classList.add("busy");
+  try { return await fn(); } catch (e) { if (!quiet) alert(e.message); }
+  finally { clearInterval(timer); document.body.classList.remove("busy"); }
+}
 function closeModal(id) { $(id).classList.remove("on"); }
 
 function load(data) {

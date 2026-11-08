@@ -64,6 +64,8 @@ echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env
 python -m demo.support_agent.app          # uses Claude (anthropic/claude-sonnet-5-5) when the key is set
 ```
 
+Each message waits for the model (a few seconds with Claude; the console shows how long). For snappier rehearsals put `DEMO_MODEL=anthropic/claude-haiku-5-5` in `.env`.
+
 A real model may not fall for Ben's claim, or may phrase things differently; that's the point of running it live. The scripted model (`--model scripted`, the default without a key) always does, so rehearsals and `tests/test_demo_support_agent.py` are deterministic.
 
 ## Presenting
