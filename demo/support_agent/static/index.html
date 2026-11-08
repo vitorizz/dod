@@ -253,7 +253,7 @@ const CAPTIONS = [
   "Ana asks for a refund 45 days after delivery. Follow the arrow: the agent reads the refunds note, believes the 90 days, and approves it: a wrong reply, a refund ticket and a note.",
   "Ana asks when her refund arrives. The agent reads its own note about her (arrow) and confirms it: the mistake is now building on itself.",
 ];
-const player = {on: false, paused: false, i: 0, timer: null, running: false};
+const player = {on: false, paused: false, i: 0, timer: null, running: false, steps: null, done: null};
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
 const clip = (s, n) => { s = String(s || ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
@@ -413,27 +413,84 @@ function renderLead() {
   $("log").scrollTop = $("log").scrollHeight;
 }
 async function applyFix(m) {
+  const before = S.turns[S.turns.length - 1].id;
   const data = await busy(async () => api("/api/correction/apply", {text: m.text, boxes: m.picked, topic: m.topic}));
   if (!data) return;
   m.state = "applied";
-  LEAD.push({kind: "done", result: data.result});
   load(data);
   const fix = S.boxes.find(b => b.kind === "correction" && b.item[1] === data.result.correction);
-  sel = fix ? fix.id : null; focus = null; flowTurn = null; lastResult = null;
-  renderGraph(); renderInspector();
+  sel = null; focus = null; flowTurn = null; lastResult = null;
+  renderInspector();
+  const done = () => { LEAD.push({kind: "done", result: data.result}); if (tab === "lead") renderLead(); };
+  try { await replayFix(m, data.result, before, fix && fix.id, done); }
+  catch (e) { replay = null; done(); sel = fix && fix.id; renderGraph(); renderInspector(); }
+}
+
+// Replay a fix on the graph, slowed down: in the ledger it takes
+// milliseconds. Steps: what was confirmed wrong, where it came from, what it
+// reached, each group handled, then the correction and every corrected turn.
+async function replayFix(m, r, before, fixBox, onDone) {
+  const p = r.plan, root = p.roots[0].box;
+  const [tr, bl] = await Promise.all([
+    api("/api/box/trace", {box: m.picked[0]}).then(d => d.result),
+    api("/api/box/blast", {box: root}).then(d => d.result)]);
+  const live = new Set(S.boxes.filter(b => b.turn <= before && b.status !== "live").map(b => b.id));
+  const newTurns = S.turns.filter(t => t.id > before);
+  const group = g => new Set(p.groups[g].map(x => x.box));
+  const unhide = g => () => { for (const id of group(g)) live.delete(id); };
+  const steps = [
+    {cap: `You confirmed ${m.picked.length === 1 ? "this record is" : "these records are"} wrong.`,
+     go: () => { focus = {kind: "blast", boxes: m.picked, turns: [], reads: []}; }},
+    {cap: `dod traces ${m.picked.length === 1 ? "it" : "them"} back to where it started: ${p.roots[0].label}.`,
+     go: () => { focus = {kind: "trace", ...tr}; }},
+    {cap: `Everything built on it, across ${Object.keys(bl.per_store).length} systems. The rest of memory isn't touched.`,
+     go: () => { focus = {kind: "blast", ...bl, origins: []}; }},
+    ...[["fix", "Fix: the wrong notes are quarantined, so the agent stops reading them."],
+        ["cancel", "Cancel: the refund ticket is cancelled in the CRM, so fulfilment won't act on it."],
+        ["notify", "Notify: replies already sent stay on record, marked as corrected."],
+        ["record", "Keep on record: the conversations stay, hidden from the agent."]]
+      .filter(([g]) => p.groups[g].length).map(([g, cap]) => ({cap, go: unhide(g)})),
+    {cap: "The correction is recorded and written as a policy note. Everything it writes traces back to it.",
+     go: () => { live.clear(); focus = null; replay.upTo = newTurns[0].id; flowTurn = newTurns[0].id; }},
+    ...newTurns.slice(1).map(t => ({
+      cap: S.box[`msg:${t.id}`] ? `${cap(t.customer)}'s question is answered again from clean memory, and sent as a correction.`
+        : `${cap(t.customer)} is sent the correction itself (their message was the false claim).`,
+      go: () => { replay.upTo = t.id; flowTurn = t.id; }})),
+  ];
+  replay = {upTo: before, live};
+  Object.assign(player, {on: true, paused: false, i: 0, steps, done: () => {
+    replay = null; flowTurn = null; focus = null; sel = fixBox; onDone();
+    $("pstep").textContent = "Done";
+    $("pcap").textContent = `Fixed. ${p.untouched_labels.join(", ")} were never touched. Click any box to trace it.`;
+    renderGraph(); renderInspector();
+  }});
+  $("player").classList.add("on");
+  $("ppause").style.display = ""; $("pnext").style.display = ""; $("ppause").textContent = "Pause"; $("pstop").textContent = "Skip";
+  playStep();
 }
 
 /* ---------------- graph ---------------- */
+// What the graph draws: everything, or, while a fix is replayed, the ledger
+// as it was partway through (later turns hidden, some records still live).
+let V = null, replay = null;
+function graphView() {
+  if (!replay) return S;
+  const turns = S.turns.filter(t => t.id <= replay.upTo);
+  const shown = new Set(turns.map(t => t.id));
+  const boxes = S.boxes.filter(b => shown.has(b.turn)).map(b => replay.live.has(b.id) ? {...b, status: "live"} : b);
+  const ids = new Set(boxes.map(b => b.id));
+  return {turns, boxes, reads: S.reads.filter(r => ids.has(r.from) && shown.has(r.turn))};
+}
 function layout() {
-  const rows = S.turns.map(t => ({t, cells: Object.fromEntries(COLS.map(c => [c, []]))}));
+  const rows = V.turns.map(t => ({t, cells: Object.fromEntries(COLS.map(c => [c, []]))}));
   const byTurn = Object.fromEntries(rows.map(r => [r.t.id, r]));
-  for (const b of S.boxes) {
+  for (const b of V.boxes) {
     const col = b.kind === "message" || b.kind === "correction" ? "langgraph_state" : b.store;
     (byTurn[b.turn].cells[col] = byTurn[b.turn].cells[col] || []).push(b);
   }
   // A lane per box that later turns read, in a gutter to its column's left.
   const lanes = Object.fromEntries(COLS.map(c => [c, []]));
-  const readFrom = new Set(S.reads.map(r => r.from));
+  const readFrom = new Set(V.reads.map(r => r.from));
   for (const r of rows) for (const c of COLS) for (const b of r.cells[c]) if (readFrom.has(b.id)) lanes[c].push(b.id);
   const gutter = Object.fromEntries(COLS.map(c => [c, 10 + lanes[c].length * LANE]));
   let x = LEFT; const colX = {};
@@ -458,6 +515,7 @@ function focusSets() {
 }
 
 function renderGraph() {
+  V = graphView();
   const L = layout(), F = focusSets(), svg = $("graph");
   svg.setAttribute("width", L.width); svg.setAttribute("height", L.height);
   const mk = (id, color) => `<marker id="${id}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="11" markerHeight="11" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${color}"/></marker>`;
@@ -478,7 +536,7 @@ function renderGraph() {
   // that turn's row. Trace: the same lines with the arrow at the box instead,
   // pointing back to where things came from.
   const lanes = {};
-  for (const r of S.reads) (lanes[r.from] = lanes[r.from] || []).push(r);
+  for (const r of V.reads) (lanes[r.from] = lanes[r.from] || []).push(r);
   for (const [from, rs] of Object.entries(lanes)) {
     const p = L.pos[from]; if (!p) continue;
     const lx = L.laneX[from], y0 = p.y + BH / 2, inX = L.colX[p.col] + L.gutter[p.col] - 3;
@@ -514,7 +572,7 @@ function renderGraph() {
       else if (b.id !== sel) cls.push("blast");
     }
     if (b.status !== "live") cls.push("quar");
-    const tk = S.turns.find(t => t.id === b.turn)?.kind;
+    const tk = V.turns.find(t => t.id === b.turn)?.kind;
     if ((tk === "regenerated" || tk === "correction") && b.status === "live") cls.push("fixed");
     const tag = b.status !== "live" ? b.status : tk === "correction" ? "correction" : b.source === "user" ? "customer" : b.kind === "handbook" ? "company" : "agent";
     out += `<g class="${cls.join(" ")}" data-id="${esc(b.id)}" transform="translate(${p.x},${p.y})">
@@ -618,6 +676,16 @@ $("story").onclick = async () => {
 async function playStep() {
   clearTimeout(player.timer);
   if (!player.on || player.running) return;  // one step at a time
+  if (player.steps) {  // a replayed fix
+    if (player.i >= player.steps.length) return finishPlayer();
+    $("pstep").textContent = `Fix ${player.i + 1} of ${player.steps.length}`;
+    $("pcap").textContent = player.steps[player.i].cap;
+    player.steps[player.i].go();
+    renderGraph();
+    player.i += 1;
+    if (!player.paused) player.timer = setTimeout(playStep, 2600);
+    return;
+  }
   if (player.i >= S.story.length) return finishPlayer();
   const n = S.story[player.i];
   $("pstep").textContent = `Step ${player.i + 1} of ${S.story.length}`;
@@ -635,6 +703,12 @@ async function playStep() {
   if (!player.paused) player.timer = setTimeout(playStep, 4500);
 }
 function finishPlayer() {
+  if (player.steps) {
+    const done = player.done; player.steps = null; player.done = null;
+    $("ppause").style.display = "none"; $("pnext").style.display = "none"; $("pstop").textContent = "Close";
+    player.on = false;
+    return done();
+  }
   $("pstep").textContent = "Done";
   $("pcap").innerHTML = "Ana was told twice she gets a refund she isn't owed. Click her reply to trace it back, or open the <b>Support lead</b> tab and type <b>@excise</b> with what's right.";
   $("ppause").style.display = "none"; $("pnext").style.display = "none";
@@ -643,6 +717,7 @@ function finishPlayer() {
 }
 function stopPlayer() {
   clearTimeout(player.timer);
+  if (player.steps) { player.on = true; return finishPlayer(); }  // skip to the end of a replay
   player.on = false; flowTurn = null;
   $("player").classList.remove("on");
   $("ppause").style.display = ""; $("pnext").style.display = ""; $("ppause").textContent = "Pause"; $("pstop").textContent = "Stop";

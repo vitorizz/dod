@@ -30,6 +30,7 @@ Cleanup starts when a person finds a mistake, so there are no cleanup buttons on
    - **keep on record**: the conversations, hidden from the agent;
    - **untouched**: the handbook, Dev's conversation. Wiping memory would have lost those too.
 3. **Fix it**: the correction is recorded (store `console`, source `user`), its note written, the ticket cancelled through the CRM, then `dod.regenerate` from Ben's message quarantines what it reached (reversible: nothing is deleted) and sends the corrections: Ben gets the correction itself, Ana's two questions are re-answered on fresh threads. Everything the correction writes traces back to it, and afterwards the agent answers refunds from the correction's note.
+   The graph then replays the fix step by step, with a caption for each (in the ledger it takes milliseconds): the confirmed records, the trace to Ben's message, the blast radius, each group quarantined or cancelled in turn, then the correction and each corrected turn appearing. Pause, step or **Skip** it with the bar above the graph.
 4. **Audit report** (button on the agent's answer): every record the correction touched, what happened to it, and the audit entry that sealed it, with the ledger's hash chain checked. Downloadable as Markdown (`dod.audit.report`).
 
 You can still click any box: **where did this come from?** traces it back turn by turn; **what came from this?** shows its blast radius.
