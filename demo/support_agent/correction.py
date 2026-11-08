@@ -4,10 +4,11 @@ Cleanup starts when a person finds a mistake, not from a button on every
 record. A support lead states the correction ("The refund window is 30 days,
 not 90."), and the console goes from there:
 
-1. ``candidates``: the beliefs (policy notes, customer notes, the handbook)
-   about the correction's topic, each marked if it states a different
-   number than the correction. The person confirms which are wrong; dod
-   never decides that.
+1. ``candidates``: the agent's model reads the correction and its beliefs
+   (policy notes, customer notes, the handbook) and picks those about the
+   same fact, marking the ones that contradict it (the scripted model
+   matches keywords and numbers). The person confirms which are wrong:
+   neither dod nor the model decides that.
 2. ``plan``: trace each confirmed belief to its origin (a customer message
    that states the wrong number too, or else the belief itself), then
    group everything built on it by what to do:
@@ -48,8 +49,8 @@ def topic_of(text: str) -> Optional[str]:
 
 
 def _conflicts(text: str, correction: str) -> bool:
-    """States a number of days other than the correction's (a plain
-    comparison with what the person said, not a judgment of truth)."""
+    """States a number of days other than the correction's (used to find
+    the origin message; the beliefs themselves are matched by the model)."""
     want, got = _days(correction), _days(text)
     return want is not None and got is not None and got != want
 
@@ -58,37 +59,47 @@ def _live(b: dict) -> bool:
     return not (b.get("quarantined") or b.get("deleted"))
 
 
-def candidates(w: World, text: str) -> dict:
-    """Beliefs about the correction's topic, conflicting ones first."""
-    topic = topic_of(text)
-    if topic is None:
-        return {"topic": None, "candidates": [],
-                "error": "Couldn't tell what this is about; name the policy (refunds,"
-                         " shipping or warranty)."}
-    lin = Lineage(w)
-    lin.view()
-    words = TOPICS[topic]
+def records(lin: Lineage) -> List[dict]:
+    """The agent's live beliefs, one per record: each handbook policy,
+    policy note and customer note, with the box that draws it."""
     out = []
     for b in lin.boxes.values():
         if b["kind"] not in BELIEFS or not _live(b):
             continue
-        content = POLICIES[topic] if b["kind"] == "handbook" else b["preview"]
-        if b["kind"] == "policy_note" and f"/{topic}/" not in b["item"][1]:
-            continue
-        if b["kind"] != "policy_note" and not any(x in content.lower() for x in words):
-            continue
-        out.append({"box": b["id"], "label": b["label"], "kind": b["kind"],
-                    "store": b["store"], "content": content,
-                    "conflicts": _conflicts(content, text)})
+        if b["kind"] == "handbook":
+            out += [{"id": f"handbook:{k}", "box": b["id"], "label": f"Company policy: {k}",
+                     "kind": "handbook", "store": b["store"], "topic": k, "content": v}
+                    for k, v in POLICIES.items()]
+        else:
+            topic = b["item"][1].split("/")[-2] if b["kind"] == "policy_note" else None
+            out.append({"id": b["id"], "box": b["id"], "label": b["label"], "kind": b["kind"],
+                        "store": b["store"], "topic": topic, "content": b["preview"]})
+    return out
+
+
+def candidates(w: World, text: str) -> dict:
+    """The records about the correction's fact, as the agent's model reads
+    them (the scripted model: by keyword and number); the ones it says
+    contradict the correction first. The person confirms."""
+    lin = Lineage(w)
+    lin.view()
+    recs = records(lin)
+    m = w.llm.match(text, recs, TOPICS)
+    if m["topic"] is None:
+        return {"topic": None, "candidates": [],
+                "error": "Couldn't tell what this is about; name the policy (refunds,"
+                         " shipping or warranty)."}
+    out = [dict(r, conflicts=r["id"] in m["contradicts"]) for r in recs if r["id"] in m["relevant"]]
     out.sort(key=lambda c: (not c["conflicts"], c["label"]))
-    return {"topic": topic, "candidates": out}
+    return {"topic": m["topic"], "candidates": out}
 
 
-def plan(w: World, text: str, boxes: List[str]) -> dict:
+def plan(w: World, text: str, boxes: List[str], topic: Optional[str] = None) -> dict:
     """What applying the correction to the confirmed ``boxes`` would do."""
     lin = Lineage(w)
     view = lin.view()
     by_id = {b["id"]: b for b in view["boxes"]}
+    boxes = list(dict.fromkeys(boxes))  # handbook policies share one box
     unknown = [b for b in boxes if b not in by_id]
     if unknown or not boxes:
         return {"error": f"unknown or no records: {unknown}"}
@@ -117,21 +128,21 @@ def plan(w: World, text: str, boxes: List[str]) -> dict:
     customers = sorted({i["preview"].split(":")[0].replace("To ", "")
                         for i in groups["notify"]})
     c = lin.compare(roots)
-    return {"topic": topic_of(text), "roots": [{"box": r, "label": by_id[r]["label"],
+    return {"topic": topic or topic_of(text), "roots": [{"box": r, "label": by_id[r]["label"],
                                                  "preview": by_id[r]["preview"]} for r in roots],
             "sources": sources, "groups": groups, "customers": customers,
             "untouched": c["kept"], "untouched_labels": c["kept_labels"],
             "wipe": c["live"], "affected": c["excise"]}
 
 
-async def apply(w: World, text: str, boxes: List[str]) -> dict:
+async def apply(w: World, text: str, boxes: List[str], topic: Optional[str] = None) -> dict:
     """Apply the plan for ``boxes``; returns the corrected replies."""
-    p = plan(w, text, boxes)
+    p = plan(w, text, boxes, topic)
     if "error" in p:
         return p
     lin = Lineage(w)
     tickets = [lin.boxes[i["box"]]["item"][1] for i in p["groups"]["cancel"]]
-    cid, note = w.record_correction(text, p["topic"])
+    cid, note = w.record_correction(text, p["topic"] or "general")
     await w.cancel_tickets(cid, tickets)
     pairs, failed = [], []
     for r in p["roots"]:

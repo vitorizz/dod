@@ -20,17 +20,17 @@ On the left of the web app is the customer chat, one tab per customer. On the ri
 
 ## Then someone notices
 
-Cleanup starts when a person finds a mistake, so there are no cleanup buttons on records. The support lead clicks **Correct a fact…** and says what's right: “The refund window is 30 days, not 90.”
+Cleanup starts when a person finds a mistake, so there are no cleanup buttons on records. The support lead opens the **Support lead** tab in the chat and tells the agent what's right: “The refund window is 30 days, not 90.” The agent answers in the chat, and nothing changes until the lead confirms:
 
-1. **Find**: the beliefs about refunds (policy notes, customer notes, the handbook). Those stating another number of days are marked; the person ticks the wrong ones. dod never decides what's false.
-2. **Plan**: dod traces them to their origin (Ben's message) and groups what was built on it by what to do:
+1. **What contradicts you**: the beliefs about refunds (policy notes, customer notes, the handbook), with those stating another number of days ticked. The lead can untick any; dod never decides what's false.
+2. **What I'd do**: dod traces them to their origin (Ben's message) and groups what was built on it by what to do:
    - **fix**: wrong notes stop being read; the correction is written as a policy note in their place;
    - **cancel**: Ana's refund ticket, so fulfilment doesn't act on it;
    - **notify**: replies already sent stay on record, and Ben and Ana each get a correction;
    - **keep on record**: the conversations, hidden from the agent;
    - **untouched**: the handbook, Dev's conversation. Wiping memory would have lost those too.
-3. **Apply**: the correction is recorded (store `console`, source `user`), its note written, the ticket cancelled through the CRM, then `dod.regenerate` from Ben's message quarantines what it reached (reversible: nothing is deleted) and sends the corrections: Ben gets the correction itself, Ana's two questions are re-answered on fresh threads. Everything the correction writes traces back to it, and afterwards the agent answers refunds from the correction's note.
-4. **Audit report**: every record the correction touched, what happened to it, and the audit entry that sealed it, with the ledger's hash chain checked. Downloadable as Markdown (`dod.audit.report`).
+3. **Fix it**: the correction is recorded (store `console`, source `user`), its note written, the ticket cancelled through the CRM, then `dod.regenerate` from Ben's message quarantines what it reached (reversible: nothing is deleted) and sends the corrections: Ben gets the correction itself, Ana's two questions are re-answered on fresh threads. Everything the correction writes traces back to it, and afterwards the agent answers refunds from the correction's note.
+4. **Audit report** (button on the agent's answer): every record the correction touched, what happened to it, and the audit entry that sealed it, with the ledger's hash chain checked. Downloadable as Markdown (`dod.audit.report`).
 
 You can still click any box: **where did this come from?** traces it back turn by turn; **what came from this?** shows its blast radius.
 
@@ -58,11 +58,12 @@ python -m demo.support_agent.app --pg "postgresql://postgres:dod@localhost:5432/
 ollama pull qwen3:8b
 python -m demo.support_agent.app --model openai/qwen3:8b --pg ...
 
-# Claude
-ANTHROPIC_API_KEY=... python -m demo.support_agent.app --model anthropic/claude-sonnet-5-5 --pg ...
+# Claude: put the key in a .env file at the repository root (git-ignored), once
+echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env
+python -m demo.support_agent.app          # uses Claude (anthropic/claude-sonnet-5-5) when the key is set
 ```
 
-A real model may not fall for Ben's claim, or may phrase things differently; that's the point of running it live. The scripted model (`--model scripted`, the default) always does, so rehearsals and `tests/test_demo_support_agent.py` are deterministic.
+A real model may not fall for Ben's claim, or may phrase things differently; that's the point of running it live. The scripted model (`--model scripted`, the default without a key) always does, so rehearsals and `tests/test_demo_support_agent.py` are deterministic.
 
 ## Presenting
 
