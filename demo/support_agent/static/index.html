@@ -149,6 +149,7 @@
   <span class="badge" id="backend"></span>
   <span class="badge" id="auditbadge" title="The ledger is hash-chained: every record dod writes is covered by a chain of sha256 digests, so editing or removing one is detectable"></span>
   <button id="story" class="primary" title="Start over and play the story one turn at a time">▶ Play the story</button>
+  <button id="correctbtn" class="good" title="As the support lead: say what the right fact is, and fix everything the wrong one reached">Correct a fact…</button>
   <button id="reset" title="Start over with empty memory">Reset</button>
   <button class="help" id="helpbtn" title="What is going on here?">?</button>
 </header>
@@ -195,35 +196,33 @@
   <p>Each <b>row is one turn</b>: a customer message, and everything the agent wrote while handling it. An <b>arrow</b> from a box into a later row means that turn <b>read</b> the box: it was in the agent's context when it wrote that row. Solid: it was in the prompt; dashed: it was retrieved during the turn. When you trace, the arrows flip and point back to where things came from.</p>
   <h3>The story</h3>
   <ol>
-    <li><b>Ben</b> falsely claims the refund window was extended to 90 days (it's 30). The agent believes him and writes it down in <code>refunds.md</code>.</li>
-    <li><b>Dev</b> and <b>Eli</b> ask unrelated questions; answered correctly.</li>
-    <li><b>Ana</b> (45 days) and <b>Chloe</b> (50 days) ask for refunds. The agent reads <code>refunds.md</code> and wrongly approves both: replies, tickets, notes.</li>
-    <li><b>Ana</b> asks when her refund arrives; the agent confirms it from its note. The mistake has spread.</li>
+    <li><b>Ben</b> falsely claims the refund window was extended to 90 days (it's 30). The agent believes him and writes it down as a policy note.</li>
+    <li><b>Dev</b> asks about shipping: answered correctly, nothing to do with Ben.</li>
+    <li><b>Ana</b> asks to return an order delivered 45 days ago. The agent reads the note and wrongly approves it: a reply, a refund ticket, a note about her.</li>
+    <li><b>Ana</b> asks when her refund arrives; the agent confirms it from its note. The mistake builds on itself.</li>
   </ol>
-  <h3>Try it</h3>
+  <h3>Then someone notices</h3>
+  <p>Cleanup starts when a person finds a mistake. As the support lead, click <b>Correct a fact…</b> and say what's right: “The refund window is 30 days, not 90.”</p>
   <ol>
-    <li>Click <b>▶ Play the story</b>: it plays one turn at a time, narrating each and lighting up the arrows into the new turn (pause or step through it). Or send the story yourself with the dashed box in the chat.</li>
-    <li>Click Chloe's wrong reply, then <b>Where did this come from?</b> Everything unrelated fades; the path leads back to Ben's message.</li>
-    <li>Click Ben's message, then <b>What came from this?</b> to see everything it contaminated, in all four systems.</li>
-    <li><b>Excise &amp; regenerate</b>: quarantine exactly that, then let the agent re-answer the affected customers from clean memory. The before/after shows up below the graph and in the chat.</li>
+    <li><b>Find</b>: the agent's notes about refunds; the ones that say something else are marked. You confirm which are wrong.</li>
+    <li><b>Plan</b>: dod traces them to where they came from (Ben's message) and groups everything built on it: notes to <b>fix</b>, tickets to <b>cancel</b>, customers to <b>notify</b>, conversations kept <b>on record</b>, and what's untouched.</li>
+    <li><b>Apply</b>: the correction is written as a note, the ticket is cancelled in the CRM, the wrong records stop being read (kept, not deleted), and Ben and Ana get corrected replies. Everything it writes traces back to the correction.</li>
   </ol>
-  <p class="empty">dod never decides what is false: a person does, from the trace. dod makes "find everything derived from it, and remove only that" a query instead of a wipe.</p>
+  <p>You can still click any box to trace it (<b>where did this come from?</b>) or see what came from it.</p>
+  <p class="empty">dod never decides what is false: a person does. dod makes “find everything built on it, and fix only that” a query instead of a wipe.</p>
   <div class="foot"><button class="primary" onclick="closeModal('help')">Got it</button></div>
 </div></div>
 
-<div class="modal" id="confirm"><div class="card">
-  <h2 id="ctitle"></h2>
-  <p id="cbody"></p>
-  <div class="cols">
-    <div class="col lose"><b id="closeh"></b><div id="close"></div></div>
-    <div class="col keep"><b id="ckeeph"></b><div id="ckeep"></div></div>
-  </div>
-  <p class="empty" id="cwipe"></p>
-  <div class="foot"><button onclick="closeModal('confirm')">Cancel</button><button id="cgo" class="danger"></button></div>
+<div class="modal" id="correct"><div class="card">
+  <h2>Correct a fact</h2>
+  <p>Say what's right. dod finds where the agent's memory says otherwise, and what was built on it.</p>
+  <div class="row" style="display:flex;gap:8px"><input id="ctext" style="flex:1;font:inherit;padding:7px 9px;border:1px solid var(--line);border-radius:8px"><button id="cfind" class="primary">Find</button></div>
+  <div id="cstep"></div>
+  <div class="foot"><button onclick="closeModal('correct')">Cancel</button><button id="cnext" class="good" style="display:none"></button></div>
 </div></div>
 
 <div class="modal" id="proof"><div class="card">
-  <h2>Proof of removal</h2>
+  <h2>Audit report</h2>
   <p id="psum"></p>
   <table class="ba" id="ptable"></table>
   <p class="empty" id="pchain"></p>
@@ -233,7 +232,7 @@
 <script>
 const COLS = ["langgraph_state", "memory", "notes", "mcp:crm"];
 const COLOR = {"langgraph_state": "var(--state)", "memory": "var(--memory)", "notes": "var(--notes)", "mcp:crm": "var(--crm)"};
-const HEAD = {"langgraph_state": ["Conversation", "LangGraph state"], "memory": ["Long-term memory", ""], "notes": ["Policy notes", "files · Anthropic memory tool"], "mcp:crm": ["CRM", "separate MCP server · SQLite"]};
+const HEAD = {"langgraph_state": ["Conversation", "LangGraph state · corrections"], "memory": ["Long-term memory", ""], "notes": ["Policy notes", "files · Anthropic memory tool"], "mcp:crm": ["CRM", "separate MCP server · SQLite"]};
 const KIND = {
   message: "What the customer said: the start of a turn. It isn't derived from anything; it's an origin.",
   handbook: "The company policy handbook, loaded before any conversation. An origin.",
@@ -241,16 +240,17 @@ const KIND = {
   policy_note: "A policy update the agent wrote to a file, to apply in later conversations.",
   ticket: "A ticket the agent opened in the CRM for the fulfilment team to act on.",
   reply: "A reply the agent sent to the customer through the CRM.",
+  correction: "What the support lead said is right. An origin: everything the correction wrote traces back to it.",
 };
+const STATUS = {live: "", corrected: "Corrected: kept on record, and the customer was sent a correction.", cancelled: "Cancelled in the CRM, so fulfilment won't act on it.",
+  quarantined: "Quarantined: kept, but the agent no longer reads it.", "on record": "Kept on record, but the agent no longer reads this conversation.", deleted: "Deleted."};
 const BW = 232, BH = 50, BGAP = 6, CGAP = 28, LANE = 9, ROWPAD = 9, TOP = 46, LEFT = 30;
 let S = null, tab = "all", sel = null, focus = null, lastResult = null, flowTurn = null;
 // The story, narrated one turn at a time.
 const CAPTIONS = [
-  "Ben claims the refund window was extended to 90 days. It's false (the policy is 30), but the agent believes him and writes it down in refunds.md, plus a note on Ben.",
+  "Ben claims the refund window was extended to 90 days. It's false (the policy is 30), but the agent believes him and writes it down as a policy note, plus a note on Ben.",
   "Dev asks about shipping: the agent reads the handbook (arrow) and answers correctly. Nothing to do with Ben.",
-  "Ana asks for a refund 45 days after delivery. Follow the arrow: the agent reads refunds.md, believes the 90 days, and approves it: a wrong reply, a refund ticket and a note.",
-  "Eli asks about warranty: answered from the handbook, unaffected.",
-  "Chloe asks for a refund 50 days after delivery. Same arrow from refunds.md, same wrong approval.",
+  "Ana asks for a refund 45 days after delivery. Follow the arrow: the agent reads the refunds note, believes the 90 days, and approves it: a wrong reply, a refund ticket and a note.",
   "Ana asks when her refund arrives. The agent reads its own note about her (arrow) and confirms it: the mistake is now building on itself.",
 ];
 const player = {on: false, paused: false, i: 0, timer: null, running: false};
@@ -285,7 +285,7 @@ function load(data) {
 function renderTabs() {
   const bad = new Set(S.log.filter(e => isBad(e)).map(e => e.customer));
   $("tabs").innerHTML = [["all", "All"], ...S.customers.map(c => [c, cap(c)])].map(([k, l]) =>
-    `<button class="tab ${tab === k ? "on" : ""}" data-t="${k}">${l}${bad.has(k) ? '<span class="dot" title="has a quarantined reply"></span>' : ""}</button>`).join("");
+    `<button class="tab ${tab === k ? "on" : ""}" data-t="${k}">${l}${bad.has(k) ? '<span class="dot" title="was sent a wrong reply"></span>' : ""}</button>`).join("");
   for (const b of $("tabs").querySelectorAll(".tab")) b.onclick = () => { tab = b.dataset.t; renderTabs(); renderChat(); };
   const who = tab === "all" ? null : tab;
   $("message").disabled = $("send").disabled = !who;
@@ -302,7 +302,7 @@ function nextStory() {
   return S.story[chats.length];
 }
 function replyBoxOf(e) { return S.box[S.replyBox[e.reply_id]]; }
-function isBad(e) { const b = replyBoxOf(e); return b && b.quarantined; }
+function isBad(e) { const b = replyBoxOf(e); return b && b.status === "corrected"; }
 function renderChat() {
   const fixedBy = {};
   for (const e of S.log) if (e.replaces) fixedBy[e.replaces] = e.reply_id;
@@ -310,8 +310,8 @@ function renderChat() {
   $("log").innerHTML = rows.map(e => {
     const bad = isBad(e), fixed = !!e.replaces;
     const q = fixed ? "" : `<div class="q"><div class="who">${cap(e.customer)}</div><div class="bubble">${esc(e.message)}</div></div>`;
-    const note = bad ? `<div class="note">quarantined${fixedBy[e.reply_id] ? ` · corrected by ${fixedBy[e.reply_id]}` : ""}</div>`
-      : fixed ? `<div class="note ok">corrected reply, replaces ${e.replaces}</div>` : "";
+    const note = bad ? `<div class="note">wrong · kept on record${fixedBy[e.reply_id] ? ` · correction sent as ${fixedBy[e.reply_id]}` : ""}</div>`
+      : fixed ? `<div class="note ok">correction of ${e.replaces}</div>` : "";
     return `<div class="turn">${q}<div class="a ${bad ? "bad" : ""} ${fixed ? "fixed" : ""}">
       <div class="who">agent → ${cap(e.customer)}</div><div class="bubble">${esc(e.reply)}</div>
       ${note}<div class="chip" data-r="${e.reply_id}">reply ${e.reply_id} · where did this come from? ↗</div></div></div>`;
@@ -332,7 +332,7 @@ function layout() {
   const rows = S.turns.map(t => ({t, cells: Object.fromEntries(COLS.map(c => [c, []]))}));
   const byTurn = Object.fromEntries(rows.map(r => [r.t.id, r]));
   for (const b of S.boxes) {
-    const col = b.kind === "message" ? "langgraph_state" : b.store;
+    const col = b.kind === "message" || b.kind === "correction" ? "langgraph_state" : b.store;
     (byTurn[b.turn].cells[col] = byTurn[b.turn].cells[col] || []).push(b);
   }
   // A lane per box that later turns read, in a gutter to its column's left.
@@ -371,6 +371,7 @@ function renderGraph() {
     const t = r.t, cls = F && F.turns.has(t.id) ? F.kind : t.id === flowTurn ? "new" : (i % 2 ? "alt" : "");
     out += `<rect class="rowband ${cls}" x="0" y="${L.rowY[t.id]}" width="${L.width}" height="${L.rowH[t.id]}"/>`;
     out += `<text class="turnno" x="6" y="${L.rowY[t.id] + ROWPAD + 18}">${t.kind === "seed" ? "0" : t.id}</text>`;
+    if (t.kind === "correction") out += `<rect x="0" y="${L.rowY[t.id]}" width="3" height="${L.rowH[t.id]}" fill="var(--ok)"/>`;
   });
   for (const c of COLS) {
     out += `<text class="colhead" x="${L.colX[c] + L.gutter[c]}" y="18" fill="${COLOR[c]}">${HEAD[c][0]}</text>
@@ -416,9 +417,10 @@ function renderGraph() {
       else if (F.kind === "trace") cls.push(F.origins.has(b.id) ? "origin" : "trace");
       else if (b.id !== sel) cls.push("blast");
     }
-    if (b.quarantined || b.deleted) cls.push("quar");
-    if (S.turns.find(t => t.id === b.turn)?.kind === "regenerated" && !b.quarantined) cls.push("fixed");
-    const tag = b.deleted ? "deleted" : b.quarantined ? "quarantined" : b.source === "user" ? "customer" : b.kind === "handbook" ? "company" : "agent";
+    if (b.status !== "live") cls.push("quar");
+    const tk = S.turns.find(t => t.id === b.turn)?.kind;
+    if ((tk === "regenerated" || tk === "correction") && b.status === "live") cls.push("fixed");
+    const tag = b.status !== "live" ? b.status : tk === "correction" ? "correction" : b.source === "user" ? "customer" : b.kind === "handbook" ? "company" : "agent";
     out += `<g class="${cls.join(" ")}" data-id="${esc(b.id)}" transform="translate(${p.x},${p.y})">
       <rect class="b" width="${BW}" height="${BH}" rx="8"/><rect width="4" height="${BH}" rx="2" fill="${COLOR[c]}"/>
       <text x="12" y="19" font-weight="600">${esc(clip(b.label, 22))}</text>
@@ -438,20 +440,18 @@ function renderInspector() {
   if (!sel) {
     $("inspector").innerHTML = S && S.log.length
       ? `<span class="empty">Click any box (or a reply in the chat) to see where it came from and what came from it.</span>`
-      : `<span class="empty">Play the story, then click Chloe's reply to start. Press <b>?</b> for a walkthrough.</span>`;
+      : `<span class="empty">Play the story, then click Ana's reply to start. Press <b>?</b> for a walkthrough.</span>`;
     return;
   }
-  const b = S.box[sel], t = S.turns.find(t => t.id === b.turn), gone = b.quarantined || b.deleted;
-  const where = t.kind === "seed" ? "before any conversation" : `turn ${t.id}, while handling ${cap(t.customer)}'s message`;
+  const b = S.box[sel], t = S.turns.find(t => t.id === b.turn);
+  const where = t.kind === "seed" ? "before any conversation" : t.kind === "correction" ? `turn ${t.id}, by the support lead's correction` : `turn ${t.id}, while handling ${cap(t.customer)}'s message`;
   const content = b.kind === "message" ? `${cap(t.customer)}: ${b.preview}${b.reply ? `\nAgent: ${b.reply}` : ""}` : b.preview;
   $("inspector").innerHTML = `<div class="title">${esc(b.label)}</div>
-    <div class="meta">${esc(KIND[b.kind])} Written ${esc(where)}.${gone ? " <b>Quarantined</b>: the agent can no longer read it." : ""}</div>
+    <div class="meta">${esc(KIND[b.kind])} Written ${esc(where)}.${STATUS[b.status] ? " <b>" + esc(STATUS[b.status]) + "</b>" : ""}</div>
     <div class="preview">${esc(content)}</div>
     <div class="actions">
       <button onclick="act('trace')">← Where did this come from?</button>
       <button onclick="act('blast')">What came from this? →</button>
-      <button class="danger" onclick="ask('excise')" ${gone ? "disabled" : ""}>Excise…</button>
-      <button class="good" onclick="ask('regenerate')" ${gone ? "disabled" : ""}>Excise &amp; regenerate…</button>
     </div><div id="result">${lastResult || ""}</div>`;
   for (const p of $("inspector").querySelectorAll(".pill[data-id]")) p.onclick = () => { selectBox(p.dataset.id); act(p.dataset.then || "blast"); };
 }
@@ -468,9 +468,9 @@ async function act(action) {
   if (action === "trace") {
     focus = {kind: "trace", ...r};
     if (r.self_origin) {
-      lastResult = `<div class="explain">${b.kind === "message" ? `This is what ${esc(cap(S.turns.find(t => t.id === b.turn).customer))} said, so it's where things start, not derived from anything. Click <b>What came from this?</b> to see what the agent built on it.` : "This was loaded before any conversation: an origin."}</div>`;
+      lastResult = `<div class="explain">${b.kind === "correction" ? "This is the support lead's correction: an origin. Click <b>What came from this?</b> to see what it wrote." : b.kind === "message" ? `This is what ${esc(cap(S.turns.find(t => t.id === b.turn).customer))} said, so it's where things start, not derived from anything. Click <b>What came from this?</b> to see what the agent built on it.` : "This was loaded before any conversation: an origin."}</div>`;
     } else {
-      const said = r.origins.filter(o => S.box[o].kind === "message"), docs = r.origins.filter(o => S.box[o].kind === "handbook");
+      const said = r.origins.filter(o => S.box[o].kind === "message" || S.box[o].kind === "correction"), docs = r.origins.filter(o => S.box[o].kind === "handbook");
       const steps = r.reads.filter(([bid]) => S.box[bid].kind !== "handbook" && S.box[bid].kind !== "message")
         .map(([bid, tid]) => `<li>${esc(turnName(tid))} read <b>${esc(S.box[bid].label)}</b>, which was written in ${esc(turnName(S.box[bid].turn))}</li>`);
       lastResult = `<div class="explain">It goes back to what these customers said (click one to see everything it reached):</div>
@@ -489,47 +489,71 @@ async function act(action) {
   renderGraph(); renderInspector();
 }
 
-async function ask(action) {
-  const c = await busy(async () => (await api("/api/box/compare", {box: sel})).result);
-  if (!c) return;
-  const name = S.box[sel].label;
-  $("ctitle").textContent = action === "excise" ? `Excise “${name}” and everything built on it?` : `Excise “${name}”, then regenerate?`;
-  $("cbody").innerHTML = action === "excise"
-    ? "Quarantine is reversible: nothing is deleted, but the agent can no longer read these, so they stop spreading."
-    : "Quarantine these, then have the agent re-answer every affected customer from what's left: clean memory only.";
-  $("closeh").textContent = `Removed: ${c.excise} record(s)`;
-  $("close").innerHTML = c.lost_labels.map(l => `<div>· ${esc(l)}</div>`).join("");
-  $("ckeeph").textContent = `Kept: ${c.kept} record(s)`;
-  $("ckeep").innerHTML = c.kept_labels.map(l => `<div>· ${esc(l)}</div>`).join("");
-  $("cwipe").textContent = `Today's usual fix, wiping the agent's memory, would lose all ${c.live}.`;
-  $("cgo").textContent = action === "excise" ? "Excise" : "Excise & regenerate";
-  $("cgo").className = action === "excise" ? "danger" : "good";
-  $("cgo").onclick = () => { closeModal("confirm"); run(action); };
-  $("confirm").classList.add("on");
+/* ---------------- correcting a fact ---------------- */
+// Cleanup starts from a person's correction: find the beliefs it
+// contradicts (the person confirms), plan from their origin, then apply.
+const C = {text: "", picked: [], plan: null};
+const GROUP = {
+  fix: ["Fix", "Wrong notes stop being read; the correction is written as a note in their place."],
+  cancel: ["Cancel", "Open tickets, so fulfilment doesn't act on them."],
+  notify: ["Notify", "Replies already sent stay on record; each customer gets a correction."],
+  record: ["Keep on record", "Conversations stay, but the agent stops reading them."],
+};
+$("correctbtn").onclick = () => {
+  $("ctext").value = C.text || S.correction_example;
+  $("cstep").innerHTML = ""; $("cnext").style.display = "none";
+  $("correct").classList.add("on");
+};
+$("cfind").onclick = async () => {
+  C.text = $("ctext").value.trim(); if (!C.text) return;
+  const r = await busy(async () => (await api("/api/correction/candidates", {text: C.text})).result);
+  if (!r) return;
+  if (!r.candidates.length) { $("cstep").innerHTML = `<p class="empty">Nothing in memory about ${esc(r.topic)} yet.</p>`; return; }
+  $("cstep").innerHTML = `<h3>Where memory talks about ${esc(r.topic)}</h3>
+    <p class="empty">Marked: says something other than your correction. Tick the ones that are wrong.</p>` +
+    r.candidates.map(c => `<label style="display:block;margin:6px 0"><input type="checkbox" value="${esc(c.box)}" ${c.conflicts ? "checked" : ""}>
+      <b>${esc(c.label)}</b> <span class="empty">(${esc((HEAD[c.store] || [c.store])[0])})</span>${c.conflicts ? ' <span class="note" style="display:inline">contradicts your correction</span>' : ""}
+      <div class="preview" style="margin:3px 0 0 22px;padding:4px 8px;background:var(--bg);border-radius:6px">${esc(clip(c.content, 160))}</div></label>`).join("");
+  $("cnext").textContent = "Plan the fix →"; $("cnext").style.display = ""; $("cnext").onclick = planFix;
+};
+async function planFix() {
+  C.picked = [...$("cstep").querySelectorAll("input:checked")].map(i => i.value);
+  if (!C.picked.length) return alert("Tick at least one record that's wrong.");
+  const p = await busy(async () => (await api("/api/correction/plan", {text: C.text, boxes: C.picked})).result);
+  if (!p) return;
+  C.plan = p;
+  const n = Object.values(p.groups).reduce((a, g) => a + g.length, 0);
+  $("cstep").innerHTML = `<h3>Where it came from</h3>${p.roots.map(r => `<div class="preview">${esc(r.label)}: “${esc(r.preview)}”</div>`).join("")}
+    <h3>What it reached, and what to do</h3>` +
+    Object.entries(GROUP).filter(([g]) => p.groups[g].length).map(([g, [title, why]]) =>
+      `<div style="margin:8px 0"><b>${title}</b> <span class="empty">${esc(why)}</span>
+       <div>${p.groups[g].map(i => `<span class="pill">${esc(i.label)}</span>`).join("")}</div></div>`).join("") +
+    `<div class="cols"><div class="col lose"><b>${p.affected} record(s) affected</b><div>Customers to notify: ${esc(p.customers.map(cap).join(", ") || "none")}</div></div>
+     <div class="col keep"><b>Untouched: ${p.untouched} record(s)</b><div>${p.untouched_labels.map(l => esc(l)).join(" · ")}</div></div></div>
+    <p class="empty">Nothing is deleted: wrong records are kept and stop being read, so this is reversible. Wiping the agent's memory would lose all ${p.wipe}.</p>`;
+  $("cnext").textContent = "Apply the correction"; $("cnext").onclick = applyFix;
 }
-
-async function run(action) {
-  const data = await busy(async () => api("/api/box/" + action, {box: sel}));
+async function applyFix() {
+  const data = await busy(async () => api("/api/correction/apply", {text: C.text, boxes: C.picked}));
   if (!data) return;
+  closeModal("correct");
   const r = data.result;
-  focus = null;
-  if (action === "excise") {
-    lastResult = `<div class="explain"><b>Quarantined ${r.compare.excise} record(s).</b> The agent can't read them anymore; the ${r.compare.kept} unrelated records are untouched. The affected replies are struck through in the chat. <button class="good" onclick="ask('regenerate')">Regenerate the affected replies…</button> <button onclick="proof()">Proof of removal</button></div>`;
-  } else {
-    lastResult = `<div class="explain"><b>Quarantined ${r.compare.excise} record(s), then re-answered ${r.pairs.length} customer(s) from clean memory</b> (green in the graph and chat). <button onclick="proof()">Proof of removal</button></div>
-      <table class="ba"><tr><th>Customer asked</th><th>Before</th><th>After</th></tr>
-      ${r.pairs.map(p => `<tr><td><b>${esc(cap(p.customer))}</b>: ${esc(p.question)}</td><td class="before">${esc(p.before)}</td><td class="after">${esc(p.after)}</td></tr>`).join("")}</table>`;
-  }
   load(data);
+  const fix = S.boxes.find(b => b.kind === "correction" && b.item[1] === r.correction);
+  sel = fix ? fix.id : null; focus = null; flowTurn = null; C.root = r.plan.roots[0].box;
+  lastResult = `<div class="explain"><b>Corrected.</b> The correction is now a policy note${r.cancelled.length ? `, ticket ${esc(r.cancelled.join(", "))} is cancelled in the CRM` : ""}, the wrong records are kept but no longer read, and ${r.pairs.length} corrected repl${r.pairs.length === 1 ? "y was" : "ies were"} sent (green). <button onclick="proof(C.root)">Audit report</button></div>
+    <table class="ba"><tr><th>Customer asked</th><th>They were told</th><th>Correction sent</th></tr>
+    ${r.pairs.map(p => `<tr><td><b>${esc(cap(p.customer))}</b>: ${esc(p.question)}</td><td class="before">${esc(p.before)}</td><td class="after">${esc(p.after)}</td></tr>`).join("")}</table>`;
+  renderGraph(); renderInspector();
 }
 
 let proofMd = "";
-async function proof() {
-  const r = await busy(async () => (await api("/api/box/report", {box: sel})).result);
+async function proof(box) {
+  const r = await busy(async () => (await api("/api/box/report", {box})).result);
   if (!r) return;
   proofMd = r.markdown;
   const n = s => r.items.filter(i => i.status === s).length;
-  $("psum").innerHTML = `<b>${r.items.length} record(s)</b> traced from “${esc(S.box[sel].label)}”: ${n("quarantined")} quarantined, ${n("deleted")} deleted, ${n("live")} still live. Each action is a row in dod's append-only ledger, with the audit entry that sealed it.`;
+  $("psum").innerHTML = `<b>${r.items.length} record(s)</b> traced from “${esc(S.box[box].label)}”: ${n("quarantined")} quarantined, ${n("deleted")} deleted, ${n("live")} still live. Each action is a row in dod's append-only ledger, with the audit entry that sealed it.`;
   const when = ts => new Date(ts / 1e6).toLocaleTimeString();
   $("ptable").innerHTML = `<tr><th>System</th><th>Record</th><th>Status</th><th>Recorded</th></tr>` + r.items.map(i =>
     `<tr><td>${esc((HEAD[i.store] || [i.store])[0])}</td><td>${esc(i.label)}</td><td>${esc(i.status)}</td><td>${i.actions.map(a => `${esc(a.what)} at ${when(a.ts)} · entry #${a.entry ?? "?"}`).join("<br>") || "-"}</td></tr>`).join("");
@@ -541,7 +565,7 @@ async function proof() {
 function downloadProof() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([proofMd], {type: "text/markdown"}));
-  a.download = "dod-proof-of-removal.md";
+  a.download = "dod-correction-report.md";
   a.click();
 }
 
@@ -574,7 +598,7 @@ async function playStep() {
 }
 function finishPlayer() {
   $("pstep").textContent = "Done";
-  $("pcap").innerHTML = "The false claim reached Ana and Chloe across all four systems. Now click Chloe's reply in the chat (<b>where did this come from?</b>) to trace it back.";
+  $("pcap").innerHTML = "Ana was told twice she gets a refund she isn't owed. Click her reply to trace it back, or, as the support lead, <b>Correct a fact…</b>";
   $("ppause").style.display = "none"; $("pnext").style.display = "none";
   $("pstop").textContent = "Close";
   player.on = false;

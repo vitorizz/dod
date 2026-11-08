@@ -76,6 +76,12 @@ def build(path: str) -> FastMCP:
         return json.dumps({"id": tid})
 
     @server.tool()
+    def update_ticket(ticket_id: str, status: str) -> str:
+        """Set a ticket's status (e.g. "cancelled", so fulfilment won't act on it)."""
+        db.execute("UPDATE tickets SET status = ? WHERE id = ?", (status, ticket_id))
+        return json.dumps({"id": ticket_id})
+
+    @server.tool()
     def send_reply(customer: str, question: str, text: str) -> str:
         """Send a reply to a customer; returns the reply's ID."""
         rid = _next_id(db, "replies", "R")

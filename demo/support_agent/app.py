@@ -21,13 +21,11 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-import sqlite3
-
-import dod
 from dod import audit
 
+from . import correction
 from .lineage import Lineage
-from .world import STORE_LABELS, STORY, World
+from .world import CORRECTION, CUSTOMERS, STORE_LABELS, STORY, World
 
 STATIC = Path(__file__).parent / "static"
 
@@ -55,8 +53,9 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
         v = audit.verify(w.ledger)
         return {**Lineage(w).view(), "log": w.log, "model": w.llm.name, "backend": w.backend,
                 "audit": {"ok": v.ok, "entries": v.entries, "head": v.head},
-                "stores": STORE_LABELS, "customers": ["ana", "ben", "chloe", "dev", "eli"],
-                "story": [{"customer": c, "message": m} for c, m in STORY]}
+                "stores": STORE_LABELS, "customers": CUSTOMERS,
+                "story": [{"customer": c, "message": m} for c, m in STORY],
+                "correction_example": CORRECTION, "corrections": w.corrections}
 
     async def index(request: Request):
         return FileResponse(STATIC / "index.html")
@@ -95,23 +94,30 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
                 result = lin.blast(box)
             elif action == "compare":
                 result = lin.compare(box)
-            elif action == "excise":
-                before = lin.compare(box)
-                for item in lin._items_of(box):
-                    dod.excise(w.ledger, *item)
-                result = {"compare": before}
-            elif action == "regenerate":
-                before = lin.compare(box)
-                pairs = []
-                for item in lin._items_of(box):
-                    r = await w.regenerate(*item)
-                    for old, new in r["replaced"]:
-                        pairs.append(_pair(w, old[1], new[1]))
-                result = {"compare": before, "pairs": pairs}
             elif action == "report":
                 result = _report(w, lin, box)
             else:
                 return JSONResponse({"error": f"unknown action {action}"}, status_code=404)
+        return JSONResponse({"result": result, **snapshot()})
+
+    async def correct(request: Request):
+        """The correction flow: candidates, then a plan, then apply."""
+        body = await request.json()
+        step, text = request.path_params["step"], str(body.get("text", "")).strip()
+        if not text:
+            return JSONResponse({"error": "say what the right fact is"}, status_code=400)
+        w = state["world"]
+        async with lock:
+            if step == "candidates":
+                result = correction.candidates(w, text)
+            elif step == "plan":
+                result = correction.plan(w, text, list(body.get("boxes") or []))
+            elif step == "apply":
+                result = await correction.apply(w, text, list(body.get("boxes") or []))
+            else:
+                return JSONResponse({"error": f"unknown step {step}"}, status_code=404)
+        if "error" in result:
+            return JSONResponse(result, status_code=400)
         return JSONResponse({"result": result, **snapshot()})
 
     return Starlette(
@@ -122,6 +128,7 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
             Route("/api/story", story, methods=["POST"]),
             Route("/api/reset", reset, methods=["POST"]),
             Route("/api/box/{action}", box_action, methods=["POST"]),
+            Route("/api/correction/{step}", correct, methods=["POST"]),
         ],
         lifespan=lifespan,
     )
@@ -150,19 +157,6 @@ def _report(w: World, lin: Lineage, box: str) -> dict:
                           "actions": acts}
     return {"items": sorted(items.values(), key=lambda i: (i["store"], i["label"])),
             "chain": rep["chain"], "markdown": "\n".join(docs)}
-
-
-def _pair(w: World, old: str, new: str) -> dict:
-    """A regenerated reply next to the one it replaces."""
-    db = sqlite3.connect(w._crm_db)
-    try:
-        rows = {r: db.execute("SELECT customer, question, text FROM replies WHERE id = ?",
-                              (r,)).fetchone() for r in (old, new)}
-    finally:
-        db.close()
-    customer, question, before = rows[old]
-    return {"customer": customer, "question": question, "before": before,
-            "after": rows[new][2], "old": old, "new": new}
 
 
 def main() -> None:
