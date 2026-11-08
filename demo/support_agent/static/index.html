@@ -153,6 +153,12 @@
   .busy #working { display: flex; align-items: center; gap: 8px; }
   #working i { width: 12px; height: 12px; border: 2px solid #fff6; border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .typing .bubble { display: flex; gap: 4px; align-items: center; padding: 11px 13px; }
+  .typing .bubble b { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
+  .typing .bubble b:nth-child(2) { animation-delay: .2s; } .typing .bubble b:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 60%, 100% { opacity: .25; } 30% { opacity: 1; } }
+  .busy.chatting #working { display: none; }
+  .busy.chatting #log { opacity: 1; }
 </style>
 </head>
 <body>
@@ -273,13 +279,14 @@ async function api(path, body) {
   return data;
 }
 // Calls to a real model take seconds: say what we're waiting for, and for how long.
-async function busy(fn, quiet) {
+async function busy(fn, quiet, chatting) {
   const t0 = Date.now(), who = !S || S.model === "scripted" ? "Working" : `Waiting for ${S.model.split("/").pop()}`;
   const tick = () => { $("worktext").textContent = `${who}… ${Math.floor((Date.now() - t0) / 1000)}s`; };
   tick(); const timer = setInterval(tick, 500);
   document.body.classList.add("busy");
+  document.body.classList.toggle("chatting", !!chatting);
   try { return await fn(); } catch (e) { if (!quiet) alert(e.message); }
-  finally { clearInterval(timer); document.body.classList.remove("busy"); }
+  finally { clearInterval(timer); document.body.classList.remove("busy", "chatting"); }
 }
 function closeModal(id) { $(id).classList.remove("on"); }
 
@@ -306,7 +313,7 @@ function renderTabs() {
   $("message").disabled = $("send").disabled = !who;
   $("message").placeholder = who === "lead" ? "@excise and the right fact, e.g. @excise the refund window is 30 days"
     : who ? `Message from ${cap(who)}…` : "Pick a customer tab to send a message as them";
-  const n = player.on ? null : nextStory();
+  const n = player.on || pending || leadTyping ? null : nextStory();
   $("next").style.display = n ? "" : "none";
   if (n) $("next").innerHTML = n.customer === "lead" ? `Next → <b>Support lead</b> tells the agent: “${esc(n.message)}”`
     : `Next in the story → <b>${cap(n.customer)}</b>: “${esc(n.message)}”`;
@@ -338,12 +345,23 @@ function renderChat() {
     return `<div class="turn">${q}<div class="a ${bad ? "bad" : ""} ${fixed ? "fixed" : ""}">
       <div class="who">agent → ${cap(e.customer)}</div><div class="bubble">${esc(e.reply)}</div>
       ${note}<div class="chip" data-r="${e.reply_id}">reply ${e.reply_id} · where did this come from? ↗</div></div></div>`;
-  }).join("") || `<p class="empty">${tab === "all" ? "No conversations yet. Click <b>▶ Play the story</b>, or send the first story message below." : "No messages from " + cap(tab) + " yet."}</p>`;
+  }).join("") + (pending && (tab === "all" || tab === pending.customer)
+    ? `<div class="turn"><div class="q"><div class="who">${cap(pending.customer)}</div><div class="bubble">${esc(pending.message)}</div></div>${TYPING(cap(pending.customer))}</div>` : "")
+  || `<p class="empty">${tab === "all" ? "No conversations yet. Click <b>▶ Play the story</b>, or send the first story message below." : "No messages from " + cap(tab) + " yet."}</p>`;
   for (const c of $("log").querySelectorAll(".chip")) c.onclick = () => { selectBox(S.replyBox[c.dataset.r]); act("trace"); };
   $("log").scrollTop = $("log").scrollHeight;
 }
+// The customer's message shows at once, with the agent typing until the
+// model's decision comes back (seconds with a real model).
+let pending = null;
+const TYPING = who => `<div class="a typing"><div class="who">agent → ${esc(who)}</div><div class="bubble"><b></b><b></b><b></b></div></div>`;
+async function chatTurn(customer, message) {
+  pending = {customer, message}; renderTabs(); renderChat();
+  try { await busy(async () => { load(await api("/api/chat", {customer, message})); }, false, true); }
+  finally { pending = null; renderTabs(); renderChat(); }
+}
 async function send(customer, message) {
-  await busy(async () => { load(await api("/api/chat", {customer, message})); });
+  await chatTurn(customer, message);
   flowTurn = S.turns[S.turns.length - 1].id; renderGraph();
 }
 $("send").onclick = () => {
@@ -362,7 +380,7 @@ $("next").onclick = () => {
 // Cleanup starts when a person tells the agent what's wrong. The agent
 // answers with what contradicts it, where that came from and what fixing it
 // does; the person adjusts the ticks and confirms, all in the chat.
-let LEAD = [];
+let LEAD = [], leadTyping = false;
 const GROUP = {
   fix: ["Fix", "stop reading the wrong notes; write the correction as a note"],
   cancel: ["Cancel", "so fulfilment doesn't act on them"],
@@ -376,7 +394,9 @@ async function leadSays(said) {
   if (!cmd) return say(`To fix something I got wrong, start with @excise and tell me what's right, e.g. “@excise ${S.correction_example}”`);
   const text = cmd[2].trim();
   if (!text) return say("What's the right fact? e.g. “@excise " + S.correction_example + "”");
-  const r = await busy(async () => (await api("/api/correction/candidates", {text})).result, true);
+  leadTyping = true; renderTabs(); renderLead();
+  const r = await busy(async () => (await api("/api/correction/candidates", {text})).result, true, true);
+  leadTyping = false;
   if (!r) return say("I couldn't work out which policy that's about. Name it (refunds, shipping or warranty).");
   const wrong = r.candidates.filter(c => c.conflicts);
   if (!wrong.length) return say(r.candidates.length
@@ -386,7 +406,7 @@ async function leadSays(said) {
   LEAD.push(m);
   await replan(m);
 }
-function say(text) { LEAD.push({kind: "agent", text}); renderLead(); }
+function say(text) { LEAD.push({kind: "agent", text}); renderTabs(); renderLead(); }
 async function replan(m) {
   m.plan = m.picked.length ? await busy(async () => (await api("/api/correction/plan", {text: m.text, boxes: m.picked, topic: m.topic})).result) : null;
   renderLead();
@@ -416,6 +436,7 @@ function renderLead() {
     ? `<div class="turn"><div class="q lead"><div class="who">Support lead</div><div class="bubble">${esc(m.text)}</div></div></div>`
     : `<div class="turn"><div class="a"><div class="who">agent → support lead</div><div class="${m.kind === "agent" ? "bubble" : "prop"}">${
         m.kind === "agent" ? esc(m.text) : m.kind === "done" ? doneHtml(m.result) : proposalHtml(m, i)}</div></div></div>`).join("")
+    + (leadTyping ? `<div class="turn">${TYPING("support lead")}</div>` : "")
     || `<p class="empty">Found a mistake? Type <b>@excise</b> and what's right, e.g. “@excise ${esc(S.correction_example)}” The agent shows what in its memory contradicts you and what fixing it involves; nothing changes until you confirm.</p>`;
   for (const cb of $("log").querySelectorAll("input[data-m]")) cb.onchange = () => {
     const m = LEAD[+cb.dataset.m];
@@ -708,7 +729,7 @@ async function playStep() {
   $("pnext").disabled = true;
   player.running = true;
   try {
-    await busy(async () => { load(await api("/api/chat", {customer: n.customer, message: n.message})); });
+    await chatTurn(n.customer, n.message);
   } finally { player.running = false; }
   flowTurn = S.turns[S.turns.length - 1].id;
   renderGraph();
