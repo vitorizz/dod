@@ -19,58 +19,89 @@ from demo.support_agent.world import World  # noqa: E402
 
 
 def run(tmp_path, pg=None):
+    from demo.support_agent import correction
+    from demo.support_agent.app import _report
     from demo.support_agent.lineage import Lineage
+    from demo.support_agent.world import CORRECTION
 
     async def main():
         w = World(str(tmp_path / "world"), "scripted", pg)
         await w.start()
         try:
             await w.run_story()
-            chloe = next(e for e in w.log if e["customer"] == "chloe")
-            assert "90-day" in chloe["reply"]  # the false policy reached her
+            first, second = [e for e in w.log if e["customer"] == "ana"]
+            assert "90-day" in first["reply"]  # the false policy reached her
+            assert "approved" in second["reply"]  # and the next answer built on it
             lin = Lineage(w)
-            reply = lin.box_for("mcp:crm", chloe["reply_id"])
+            reply = lin.box_for("mcp:crm", second["reply_id"])
 
-            # Trace goes turn by turn: Chloe's turn read refunds.md, written in
-            # Ben's turn; the origins are what Ben and Chloe said, and the handbook.
+            # Trace goes turn by turn: Ana's second turn read her note from the
+            # first, which read the refunds note written in Ben's turn.
             t = lin.trace(reply)
-            labels = {lin.boxes[b]["kind"] + ":" + str(lin.boxes[b]["turn"]) for b in t["origins"]}
             ben_turn = next(x["id"] for x in w.turns if x.get("customer") == "ben")
-            chloe_turn = lin.boxes[reply]["turn"]
-            assert labels == {f"message:{ben_turn}", f"message:{chloe_turn}", "handbook:0"}
-            assert [[lin.boxes[b]["kind"], tid] for b, tid in t["reads"]
-                    if lin.boxes[b]["kind"] == "policy_note"] == [["policy_note", chloe_turn]]
-            # A customer's own message is an origin, not derived from anything.
+            ana_turns = [x["id"] for x in w.turns if x.get("customer") == "ana"]
+            labels = {lin.boxes[b]["kind"] + ":" + str(lin.boxes[b]["turn"]) for b in t["origins"]}
+            assert labels == {f"message:{ben_turn}", "handbook:0"} | {
+                f"message:{a}" for a in ana_turns}
             assert lin.trace(f"msg:{ben_turn}")["self_origin"]
 
-            # Blast radius from Ben's message spans all four stores, and spares
-            # the unrelated customers.
-            b = lin.blast(f"msg:{ben_turn}")
-            assert set(b["per_store"]) == {"langgraph_state", "memory", "notes", "mcp:crm"}
-            untouched = {x["id"] for x in w.turns if x.get("customer") in ("dev", "eli")}
-            assert not any(lin.boxes[x]["turn"] in untouched for x in b["boxes"])
-            c = lin.compare(f"msg:{ben_turn}")
-            assert (c["excise"], c["kept"], c["live"]) == (13, 10, 23)
+            # 1. Candidates: beliefs about refunds; the person confirms the
+            # ones that contradict the correction (the handbook doesn't).
+            c = correction.candidates(w, CORRECTION)
+            assert c["topic"] == "refunds"
+            wrong = [x for x in c["candidates"] if x["conflicts"]]
+            assert sorted(x["kind"] for x in wrong) == ["customer_note", "policy_note"]
+            assert not any(x["conflicts"] for x in c["candidates"] if x["kind"] == "handbook")
+            boxes = [x["box"] for x in wrong]
 
-            g = await w.regenerate(*lin._items_of(f"msg:{ben_turn}")[0])
-            assert g["failed"] == [] and len(g["replaced"]) == 3
-            new = [e for e in w.log if e["replaces"]]
-            assert len(new) == 3 and all(
-                "outside our 30-day" in e["reply"] or "don't see" in e["reply"] for e in new)
-            view = Lineage(w).view()
+            # 2. The plan starts from where they came from, Ben's message, and
+            # spares Dev.
+            p = correction.plan(w, CORRECTION, boxes)
+            assert [r["box"] for r in p["roots"]] == [f"msg:{ben_turn}"]
+            kinds = {g: sorted(lin.boxes[i["box"]]["kind"] for i in items)
+                     for g, items in p["groups"].items()}
+            assert kinds == {"fix": ["customer_note", "customer_note", "policy_note"],
+                             "cancel": ["ticket"], "notify": ["reply"] * 3,
+                             "record": ["message"] * 3}
+            assert p["customers"] == ["ana", "ben"]
             dev = next(e for e in w.log if e["customer"] == "dev")
-            assert not any(x["quarantined"] for x in view["boxes"]
-                           if x["item"] == ["mcp:crm", dev["reply_id"]])
-            assert {x["kind"] for x in view["turns"]} == {"seed", "chat", "regenerated"}
+            dev_box = lin.box_for("mcp:crm", dev["reply_id"])
+            assert all(i["box"] != dev_box for g in p["groups"].values() for i in g)
+            assert p["affected"] + p["untouched"] == p["wipe"]
 
-            # Proof of removal: every excised record, sealed in a verified chain.
-            from demo.support_agent.app import _report
+            # 3. Apply: the ticket is cancelled in the CRM, Ben gets the
+            # correction itself, Ana gets her questions answered again.
+            r = await correction.apply(w, CORRECTION, boxes)
+            assert r["failed"] == [] and len(r["cancelled"]) == 1
+            assert w.ticket_status(r["cancelled"][0]) == "cancelled"
+            after = {(x["customer"], x["old"]): x["after"] for x in r["pairs"]}
+            assert len(after) == 3 and all(a.startswith("Correction to my earlier reply:")
+                                           for a in after.values())
+            assert after[("ana", first["reply_id"])].endswith("outside our 30-day refund window.")
+            assert "don't see" in after[("ana", second["reply_id"])]
+            assert CORRECTION in next(a for (cu, _), a in after.items() if cu == "ben")
+
+            lin = Lineage(w)
+            view = lin.view()
+            status = {b["id"]: b["status"] for b in view["boxes"]}
+            assert status[reply] == "corrected"
+            assert status[f"msg:{ben_turn}"] == "on record"
+            assert status[dev_box] == "live"
+            assert {x["kind"] for x in view["turns"]} == {"seed", "chat", "correction",
+                                                           "regenerated"}
+            # Every corrected reply traces back to the correction.
+            for x in r["pairs"]:
+                origins = lin.trace(lin.box_for("mcp:crm", x["new"]))["origins"]
+                assert any(lin.boxes[o]["kind"] == "correction" for o in origins), x
+
+            # The agent is right afterwards, from the correction's note.
+            later = await w.chat("ben", "Can I return order 2002 for a refund?")
+            assert "30-day" in later["reply"]
+
+            # Audit: every record the correction touched, in a verified chain.
             rep = _report(w, Lineage(w), f"msg:{ben_turn}")
             assert rep["chain"]["ok"]
-            quarantined = [i for i in rep["items"] if i["status"] == "quarantined"]
-            assert len(quarantined) >= 13  # items: a box can hold several versions
-            assert {i["label"] for i in quarantined} >= set(c["lost_labels"])
-            assert all(a["entry"] for i in quarantined for a in i["actions"])
+            assert sum(i["status"] == "quarantined" for i in rep["items"]) >= p["affected"]
             assert "# Excision report" in rep["markdown"]
         finally:
             await w.stop()
@@ -78,7 +109,7 @@ def run(tmp_path, pg=None):
     asyncio.run(main())
 
 
-def test_story_trace_blast_and_regenerate(tmp_path):
+def test_story_trace_and_correct(tmp_path):
     run(tmp_path)
 
 

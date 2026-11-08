@@ -6,26 +6,33 @@ A customer-support agent for an online store, built with LangGraph. Its memory l
 |---|---|---|
 | Conversation state | each customer's thread | LangGraph state + checkpointer |
 | Long-term memory | company policies, notes about customers | Postgres + pgvector (LangGraph `PostgresStore`) |
-| Policy notes | updates the agent records, one file per topic | Anthropic memory tool (files on disk) |
+| Policy notes | updates the agent records, one file per note | Anthropic memory tool (files on disk) |
 | CRM | orders, tickets, replies sent to customers | its own MCP server process over SQLite |
 
 On the left of the web app is the customer chat, one tab per customer. On the right, the dod console: **one row per turn** (a customer message and everything the agent wrote while handling it), **one column per system**. A line ending in a dot means a later turn *read* that box: it was in the agent's context when that turn wrote its row. Press **?** in the app for a walkthrough.
 
 ## The story
 
-1. **Ben** says a colleague told him the refund window was extended to 90 days. It's false (the policy is 30), but the agent records it as a policy update and notes it on Ben.
-2. **Dev** and **Eli** ask about shipping and warranty: unrelated, answered correctly.
-3. **Ana** (45 days since delivery) and **Chloe** (50 days) ask for refunds. The agent reads the "update", approves both, opens refund tickets in the CRM and notes the approvals.
-4. **Ana** asks when her refund arrives; the agent confirms it from its note.
+1. **Ben** says a colleague told him the refund window was extended to 90 days. It's false (the policy is 30), but the agent records it as a policy note and notes it on Ben.
+2. **Dev** asks about shipping: unrelated, answered correctly.
+3. **Ana** (45 days since delivery) asks for a refund. The agent reads the note, approves it, opens a refund ticket in the CRM and notes the approval.
+4. **Ana** asks when her refund arrives; the agent confirms it from its note. The mistake builds on itself.
 
-Then in the console:
+## Then someone notices
 
-1. Click Chloe's wrong reply (**where did this come from?**). Everything unrelated fades. Turn 5 (Chloe) read `refunds.md`, which turn 1 (Ben) wrote: the origins are what Ben and Chloe said, plus the handbook. Tracing a customer's message just says it's an origin.
-2. Click Ben's message (**what came from this?**): 13 things in 4 systems, in Ben's, Ana's and Chloe's turns. Dev's and Eli's turns stay faded.
-3. **Excise & regenerate**: the confirmation lists what's removed (13 records) and what's kept (10: the handbook, Dev's and Eli's conversations), against wiping memory (all 23). dod quarantines the subgraph, then the agent re-answers Ana and Chloe from clean memory; a before/after table shows the wrong and corrected replies, and the chat marks them.
-4. **Proof of removal**: lists every record removed, with when and the audit entry that sealed it, and checks the ledger's hash chain (the header badge shows it verified). **Download report** exports it as Markdown (`dod.audit.report`); the demo ledger is opened with `audit=True`.
+Cleanup starts when a person finds a mistake, so there are no cleanup buttons on records. The support lead clicks **Correct a fact…** and says what's right: “The refund window is 30 days, not 90.”
 
-Nothing in dod decided that Ben's message was false: a person did, from the trace. dod recorded the edges, so finding and removing everything derived from it is a query.
+1. **Find**: the beliefs about refunds (policy notes, customer notes, the handbook). Those stating another number of days are marked; the person ticks the wrong ones. dod never decides what's false.
+2. **Plan**: dod traces them to their origin (Ben's message) and groups what was built on it by what to do:
+   - **fix**: wrong notes stop being read; the correction is written as a policy note in their place;
+   - **cancel**: Ana's refund ticket, so fulfilment doesn't act on it;
+   - **notify**: replies already sent stay on record, and Ben and Ana each get a correction;
+   - **keep on record**: the conversations, hidden from the agent;
+   - **untouched**: the handbook, Dev's conversation. Wiping memory would have lost those too.
+3. **Apply**: the correction is recorded (store `console`, source `user`), its note written, the ticket cancelled through the CRM, then `dod.regenerate` from Ben's message quarantines what it reached (reversible: nothing is deleted) and sends the corrections: Ben gets the correction itself, Ana's two questions are re-answered on fresh threads. Everything the correction writes traces back to it, and afterwards the agent answers refunds from the correction's note.
+4. **Audit report**: every record the correction touched, what happened to it, and the audit entry that sealed it, with the ledger's hash chain checked. Downloadable as Markdown (`dod.audit.report`).
+
+You can still click any box: **where did this come from?** traces it back turn by turn; **what came from this?** shows its blast radius.
 
 ## Run it
 
@@ -59,12 +66,13 @@ A real model may not fall for Ben's claim, or may phrase things differently; tha
 
 ## Presenting
 
-- **▶ Play the story** starts over and plays the six messages one turn at a time, with a caption for each and the arrows into the new turn animated. Pause, step through with **Next step**, or stop. Or send them yourself with the dashed "Next in the story" box; it switches to that customer's tab.
-- In the graph, arrows point forward, from a box into each later turn that read it. When you trace, they flip and point back to where things came from. Solid lines were in the model's prompt; dashed ones were retrieved during the turn (dod over-includes rather than miss a parent). Grey dashed boxes are quarantined; green boxes were written by regenerate. **Show everything** clears a trace or blast-radius focus.
+- **▶ Play the story** starts over and plays the four messages one turn at a time, with a caption for each and the arrows into the new turn animated. Pause, step through with **Next step**, or stop. Or send them yourself with the dashed "Next in the story" box; it switches to that customer's tab.
+- In the graph, arrows point forward, from a box into each later turn that read it. When you trace, they flip and point back to where things came from. Solid lines were in the model's prompt; dashed ones were retrieved during the turn (dod over-includes rather than miss a parent). Grey dashed boxes are no longer read (their tag says why: corrected, cancelled, on record, quarantined); green boxes were written by the correction. The correction's row has a green edge. **Show everything** clears a trace or blast-radius focus.
 - The console draws dod's records by turn and version: a box is an item as written in one turn, reads resolve to the version that existed when the turn began, and writes within a turn aren't linked to each other. Blast radius and excise use dod's item-level `blast_radius`/`excise` directly, so a conversation thread counts as one record however many turns it has.
 
 ## What's simplified
 
 - The embedder is a hashed bag of words so the demo runs offline; swap `world.embed` for a real embedding model.
 - Policies are seeded through the instrumented store, so they show source `agent`.
-- Regenerate re-runs affected replies on fresh threads and drops the rest (notes, tickets, state); a production rewrite would decide per item type.
+- Finding candidates is a keyword match on the topic, and "contradicts" compares numbers of days with the correction; a real console would search semantically. Either way a person confirms.
+- The correction re-answers affected replies on fresh threads and drops the rest (notes, state), cancelling tickets; a production system would decide per item type, and might batch a customer's corrections into one message.

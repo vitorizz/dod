@@ -7,7 +7,8 @@ version of an item, written in one turn:
 - conversation: the customer's message (the turn's user-sourced state
   write). The agent's own update to the thread state is folded into it.
 - the handbook: the six seeded policies, shown as one box.
-- every other write the agent made: notes, policy files, tickets, replies.
+- a correction: what the support lead said (store ``console``), an origin.
+- every other write: notes, policy files, tickets, replies.
 
 A *read* edge says a turn had a box in its context: for each write in the
 turn, each parent item recorded by dod is resolved to its latest version
@@ -30,6 +31,7 @@ from .world import POLICIES, World
 
 COLUMNS = ["langgraph_state", "memory", "notes", "mcp:crm"]
 HANDBOOK = "handbook"
+ORIGINS = ("message", "handbook", "correction")  # not derived from anything
 
 Item = Tuple[str, str]
 
@@ -93,6 +95,11 @@ class Lineage:
                     alias[wid] = bid
                 else:
                     later.append((wid, tid))
+            elif bstore == "console":
+                bid = f"fix:{rid}"
+                self._box(bid, tid, item, "correction", source, quarantined, tombstoned)
+                message_box[tid] = bid  # the origin of its turn, like a message
+                alias[wid] = bid
             elif bstore == w.memory_store and json.loads(rid)[0] == "policies":
                 self._box(HANDBOOK, tid, None, "handbook", source, quarantined, tombstoned)
                 self.boxes[HANDBOOK].setdefault("items", []).append(list(item))
@@ -158,14 +165,19 @@ class Lineage:
                 b["quarantined"] = any(tuple(i) in q for i in b.get("items", ()))
                 b["label"] = f"Company policies ({len(POLICIES)})"
                 b["preview"] = " · ".join(POLICIES.values())
+            elif b["kind"] == "correction":
+                b["label"] = "Support lead's correction"
+                b["preview"] = next((c["text"] for c in w.corrections
+                                     if c["id"] == b["item"][1]), "")
             elif b["kind"] == "message":
-                b["label"] = (f"{t['customer'].capitalize()} asks again" if t["kind"] == "regenerated"
+                b["label"] = (f"{t['customer'].capitalize()}, re-answered" if t["kind"] == "regenerated"
                               else f"{t['customer'].capitalize()} says")
                 b["preview"] = t["message"]
                 b["reply"] = next((e["reply"] for e in w.log if e["turn"] == t["id"]), "")
             else:
                 b["label"] = self.label(*b["item"])
                 b["preview"] = self.preview(*b["item"])
+            b["status"] = self.status(b)
             out_boxes.append(b)
         return {
             "columns": COLUMNS,
@@ -176,11 +188,32 @@ class Lineage:
                       for tid, edges in self.reads.items() for bid, tag in edges.items()],
         }
 
+    def status(self, b: dict) -> str:
+        """What a box is now, in the words of what was done to it: a
+        correction keeps history on record and cancels pending actions."""
+        if b.get("deleted"):
+            return "deleted"
+        if b["kind"] == "ticket":
+            st = self.w.ticket_status(b["item"][1])
+            if st == "cancelled":
+                return "cancelled"
+        if not b.get("quarantined"):
+            return "live"
+        return {"reply": "corrected", "message": "on record"}.get(b["kind"], "quarantined")
+
     def label(self, store: str, rid: str) -> str:
         if store == "mcp:crm":
-            return {"R": "Reply ", "T": "Ticket "}.get(rid[:1], "") + rid
+            if rid.startswith("R"):
+                db = sqlite3.connect(self.w._crm_db)
+                try:
+                    row = db.execute("SELECT customer FROM replies WHERE id = ?", (rid,)).fetchone()
+                finally:
+                    db.close()
+                return f"Reply to {row[0].capitalize()} ({rid})" if row else f"Reply {rid}"
+            return {"T": "Ticket "}.get(rid[:1], "") + rid
         if store == "notes":
-            return rid.rsplit("/", 1)[-1]
+            topic, name = rid.rsplit("/", 2)[-2:]
+            return f"{topic} note {name}"
         parts = json.loads(rid)
         return f"Note on {parts[1]}"
 
@@ -219,7 +252,7 @@ class Lineage:
         """Everything ``box_id`` was derived from, turn by turn, back to the
         origins: what customers said, and the handbook."""
         box = self.boxes[box_id]
-        if box["kind"] in ("message", "handbook"):
+        if box["kind"] in ORIGINS:
             return {"boxes": [box_id], "turns": [box["turn"]], "reads": [],
                     "origins": [box_id], "self_origin": True}
         boxes: Set[str] = {box_id}
@@ -238,7 +271,7 @@ class Lineage:
                 boxes.add(bid)
                 edges.add((bid, tid))
                 stack.append(self.boxes[bid]["turn"])
-        origins = [b for b in boxes if self.boxes[b]["kind"] in ("message", "handbook")]
+        origins = [b for b in boxes if self.boxes[b]["kind"] in ORIGINS]
         return {"boxes": sorted(boxes), "turns": sorted(seen),
                 "reads": [list(e) for e in sorted(edges)], "origins": origins,
                 "self_origin": False}
@@ -271,12 +304,14 @@ class Lineage:
             return [tuple(i) for i in b["items"]]
         return [tuple(b["item"])]
 
-    def compare(self, box_id: str) -> dict:
-        """Excising ``box_id``'s item vs. wiping every store, counted in live
+    def compare(self, box_ids) -> dict:
+        """Excising the boxes' items vs. wiping every store, counted in live
         records (items), with the boxes each keeps and loses."""
+        if isinstance(box_ids, str):
+            box_ids = [box_ids]
         self.view()  # labels
         hit: Set[Item] = set()
-        for item in self._items_of(box_id):
+        for item in (i for b in box_ids for i in self._items_of(b)):
             r = dod.excise(self.w.ledger, *item, dry_run=True)
             hit |= {(s, rid) for s, rids in r.targets.items() for rid in rids}
         live: Set[Item] = set()
