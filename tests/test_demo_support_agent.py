@@ -45,14 +45,15 @@ def run(tmp_path, pg=None):
                 f"message:{a}" for a in ana_turns}
             assert lin.trace(f"msg:{ops_turn}")["self_origin"]
 
-            # 1. Candidates: beliefs about refunds; the person confirms the
-            # ones that contradict the correction (the handbook doesn't).
+            # 1. Candidates (dod.admin.find): beliefs about refunds; the
+            # person confirms the ones that contradict the correction (the
+            # handbook doesn't).
             c = correction.candidates(w, CORRECTION)
-            assert c["topic"] == "refunds"
             wrong = [x for x in c["candidates"] if x["conflicts"]]
-            assert [x["kind"] for x in wrong] == ["policy_note"]
-            assert not any(x["conflicts"] for x in c["candidates"] if x["kind"] == "handbook")
-            boxes = [x["box"] for x in wrong]
+            assert [x["item"][0] for x in wrong] == ["notes"]
+            hb = [x for x in c["candidates"] if x["label"] == "Company policy: refunds"]
+            assert hb and not hb[0]["conflicts"]
+            boxes = [x["item"] for x in wrong]
 
             # 2. The plan starts from where they came from, the ops update, and
             # spares Dev.
@@ -103,6 +104,16 @@ def run(tmp_path, pg=None):
             assert rep["chain"]["ok"]
             assert sum(i["status"] == "quarantined" for i in rep["items"]) >= p["affected"]
             assert "# Excision report" in rep["markdown"]
+
+            # The other commands run dod.admin as is, with what they name
+            # mapped to boxes; @undo releases what the fix quarantined.
+            t = correction.command(w, f"@trace mcp:crm {second['reply_id']}")
+            assert t["focus"] == {"kind": "trace", "box": reply} and t["code"]
+            i = correction.command(w, "@impact the refund window is 30 days")
+            assert i["focus"]["kind"] == "blast"  # the correction's note states it
+            assert "writes" in correction.command(w, "@ledger")["text"]
+            assert "Released" in correction.command(w, "@undo")["text"]
+            assert {b["id"]: b["status"] for b in Lineage(w).view()["boxes"]}[reply] == "live"
         finally:
             await w.stop()
 
@@ -121,19 +132,11 @@ def test_story_on_postgres(tmp_path):
     run(tmp_path, os.environ["DOD_TEST_POSTGRES_URI"])
 
 
-def test_model_match_is_checked_against_the_records():
-    from demo.support_agent.llm import parse_match
-
-    recs = [{"id": "a", "content": "x"}, {"id": "b", "content": "y"}]
-    out = parse_match('Sure: {"topic": "refunds", "relevant": ["a"], "contradicts": ["b", "zzz"]}',
-                      recs, ["refunds", "shipping"])
-    assert out == {"topic": "refunds", "relevant": ["a", "b"], "contradicts": ["b"]}
-    assert parse_match('{"topic": "nope"}', recs, ["refunds"])["topic"] is None
-
-
 def test_candidates_come_from_the_model(tmp_path):
-    """With a real model, the model picks what contradicts the correction;
-    the plan and apply then work from what the person confirmed."""
+    """With a real model, dod.admin's llm_matcher asks it which records
+    contradict the correction; the plan then works from what was confirmed."""
+    import re
+
     from demo.support_agent import correction
     from demo.support_agent.world import CORRECTION
 
@@ -144,22 +147,24 @@ def test_candidates_come_from_the_model(tmp_path):
         def decide(self, ctx):
             return self.inner.decide(ctx)
 
-        def match(self, text, records, topics):
-            self.seen = text
-            ids = [r["id"] for r in records if r["kind"] == "policy_note"]
-            return {"topic": "refunds", "relevant": ids, "contradicts": ids}
+        def complete(self, system, user):
+            self.seen = user
+            hits = re.findall(r"- (r\d+): Refund window extended", user)
+            return '{"about": %s, "contradicts": %s}' % (str(hits).replace("'", '"'),
+                                                           str(hits).replace("'", '"'))
 
     async def main():
         w = World(str(tmp_path / "world"), "scripted")
         await w.start()
         try:
             w.llm = Model(w.llm)
+            w.admin = w._admin()  # picks llm_matcher now the model can complete
             await w.run_story()
             c = correction.candidates(w, "refunds are a month, actually")
-            assert w.llm.seen == "refunds are a month, actually"
-            assert [x["kind"] for x in c["candidates"]] == ["policy_note"]
+            assert "STATEMENT: refunds are a month, actually" in w.llm.seen
+            assert [x["item"][0] for x in c["candidates"]] == ["notes"]
             assert all(x["conflicts"] for x in c["candidates"])
-            p = correction.plan(w, CORRECTION, [x["box"] for x in c["candidates"]], c["topic"])
+            p = correction.plan(w, CORRECTION, [x["item"] for x in c["candidates"]])
             assert len(p["roots"]) == 1 and p["groups"]["cancel"]
         finally:
             await w.stop()

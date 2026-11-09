@@ -8,8 +8,8 @@
 - ``mcp:crm``: the CRM, a separate MCP server process over SQLite: orders,
   tickets and replies sent to customers.
 - ``langgraph_state``: the agent's conversation state, per customer thread.
-- ``console``: corrections a support lead makes (``correction:<n>``); see
-  ``correction.py``.
+- ``admin``: corrections a support lead makes, recorded by ``dod.admin``
+  (``correction:<plan id>``); see ``correction.py``.
 
 Every store is instrumented with dod against one ledger; the graph run is the
 unit of work, so one customer message links everything it read to
@@ -39,6 +39,7 @@ import operator
 
 import dod
 from dod import prompt as dod_prompt
+from dod.admin import Actions, Admin, keyword_matcher, llm_matcher
 from dod.capture import Capture
 from dod.integrations import anthropic_memory, langgraph, langgraph_graph
 from dod.integrations import mcp as dmcp
@@ -84,7 +85,7 @@ STORE_LABELS = {
     "memory": "Long-term memory",
     "notes": "Policy notes (files)",
     "mcp:crm": "CRM (MCP)",
-    "console": "Corrections",
+    "admin": "Corrections",
 }
 
 
@@ -140,6 +141,7 @@ class World:
 
             raw = InMemoryStore(index={"dims": 64, "embed": embed, "fields": ["text"]})
             self.backend = "in-memory (no Postgres URI given)"
+        self._raw_memory = raw
         self.memory = langgraph.instrument(raw, self.cap, store_name=self.memory_store)
         self.notes = anthropic_memory.instrument(
             BetaLocalFilesystemMemoryTool(base_path=str(self.dir / "notes")), self.cap,
@@ -178,6 +180,7 @@ class World:
         self.graph = langgraph_graph.instrument_graph(
             g.compile(checkpointer=InMemorySaver(), store=self.memory, name="support"),
             self.cap)
+        self.admin = self._admin()
         self._seed()
 
     async def stop(self) -> None:
@@ -304,60 +307,136 @@ class World:
         self.notes.call({"command": "create", "path": path, "file_text": text + "\n"})
         return path
 
-    async def regenerate(self, store: str, rid: str, correction: Tuple[str, str]) -> dict:
-        """``dod.regenerate`` from a bad item, for a correction
-        (``(record ID, text)``): what it reached is quarantined (kept on
-        record, hidden from the agent), and every reply it reached is
-        answered again as a correction.
+    # --- dod.admin: readers, actions and the correction's turn ---------------
 
-        A reply built on the bad item gets the question re-run through the
-        agent on a fresh thread (the old conversation is contaminated too).
-        A reply to the bad message itself gets the correction's text instead:
-        re-running the message would repeat the mistake. Notes and state
-        aren't rewritten; a re-run writes again what it still needs.
-        """
-        loop = asyncio.get_running_loop()
-        cid, text = correction
-        runs = [0]
+    def _admin(self) -> Admin:
+        """``dod.admin`` over the four stores. Readers read the stores
+        directly (not through capture: reading for a person isn't the agent
+        reading); actions do the app's side of a fix."""
+        llm_complete = getattr(self.llm, "complete", None)
+        matcher = llm_matcher(llm_complete) if llm_complete else keyword_matcher
+        return Admin(
+            self.ledger,
+            readers={"notes": _Rows(self._read_notes), self.memory_store: _Rows(self._read_memory),
+                     "langgraph_state": _Rows(self._read_threads), "mcp:crm": _Rows(self._read_crm)},
+            capture=self.cap, matcher=matcher, classify=self._classify,
+            searchable=["notes", self.memory_store],
+            actions=Actions(correct=self._correct, cancel=self._cancel,
+                            rerun=self._rerun, notify=self._notify),
+            label=self.label)
 
-        def rewrite(task):
-            if task.store != "mcp:crm" or not task.record_id.startswith("R"):
-                return None
-            db = sqlite3.connect(self._crm_db)
-            try:
-                customer, question = db.execute(
-                    "SELECT customer, question FROM replies WHERE id = ?",
-                    (task.record_id,)).fetchone()
-            finally:
-                db.close()
-            key = current_key()
-            notice = any(p.status == "bad" for p in task.parents)
-            runs[0] += 1
-            thread = f"{customer}-corrected-{runs[0]}"
+    def _read_notes(self):
+        base = self.dir / "notes"
+        for f in sorted(base.rglob("*.md")):
+            yield "/" + str(f.relative_to(base)), f.read_text()
 
-            async def again():
-                with use_key(*key):
-                    if notice:
-                        return await self._notice(customer, question, task.record_id, cid, text)
-                    return await self.chat(customer, question, thread=thread,
-                                           replaces=task.record_id)
+    def _read_memory(self):
+        for ns in [("policies",)] + list(self._raw_memory.list_namespaces(prefix=("customers",))):
+            for item in self._raw_memory.search(ns, limit=1000):
+                text = item.value.get("text", "")
+                if ns[0] == "customers":
+                    text = f"Note on {ns[1]}: {text}"
+                yield json.dumps([*ns, item.key]), text
 
-            entry = asyncio.run_coroutine_threadsafe(again(), loop).result()
-            return ("mcp:crm", entry["reply_id"])
+    def _read_threads(self):
+        threads: Dict[str, List[str]] = {}
+        for e in self.log:
+            threads.setdefault(e["thread"], []).extend([e["message"], e["reply"]])
+        for t, lines in threads.items():
+            yield langgraph_graph.record_id(t, "", "messages"), "\n".join(lines)
 
-        result = await asyncio.to_thread(dod.regenerate, self.ledger, store, rid, rewrite)
-        return {
-            "replaced": [[list(a), list(b)] for a, b in result.replaced.items()],
-            "dropped": [list(i) for i in result.dropped],
-            "failed": [list(f) for f in result.failed],
-            "targets": result.targets,
-        }
+    def _read_crm(self):
+        db = sqlite3.connect(self._crm_db)
+        try:
+            for rid, customer, text in db.execute("SELECT id, customer, text FROM replies"):
+                yield rid, f"To {customer}: {text}"
+            for rid, summary, status in db.execute("SELECT id, summary, status FROM tickets"):
+                yield rid, f"{summary} ({status})"
+        finally:
+            db.close()
 
-    async def _notice(self, customer: str, question: str, replaces: str, cid: str,
-                      text: str) -> dict:
-        """Send the correction itself as the reply to a bad message."""
+    def _classify(self, item) -> str:
+        store, rid = item
+        if store == "mcp:crm":  # tickets, replies, and read tools' results (history)
+            return {"T": "cancel", "R": "notify"}.get(rid[:1], "record")
+        return "record" if store == "langgraph_state" else "fix"
+
+    def label(self, item) -> str:
+        from .lineage import item_label  # lazy: lineage imports world
+        return item_label(self, *item)
+
+    def _on_loop(self, coro_fn):
+        """Run an async action on the event loop, under the caller's key, from
+        the worker thread ``Admin.apply`` runs in."""
+        key = current_key()
+
+        async def run():
+            with use_key(*key):
+                return await coro_fn()
+        return asyncio.run_coroutine_threadsafe(run(), self._loop).result()
+
+    def _correct(self, text: str, plan) -> None:
+        topics = [rid.split("/")[-2] for s, rid in plan.wrong if s == "notes"]
+        topic = topics[0] if topics else (next(
+            (t for t, w in TOPICS.items() if any(x in text.lower() for x in w)), "general"))
+        path = self._append_note(topic, f"Correction by the support lead: {text}")
+        self.corrections.append({"id": f"correction:{plan.id}", "text": text, "note": path})
+
+    def _cancel(self, item) -> None:
+        self._on_loop(lambda: self.crm.call_tool(
+            "update_ticket", {"ticket_id": item[1], "status": "cancelled"}))
+
+    def _close_correction_turn(self) -> None:
+        """The correction's own writes (its record, note, cancellations) are
+        one turn, up to the first corrected answer."""
+        c = getattr(self, "_open_correction", None)
+        if c is not None:
+            self._open_correction = None
+            self.turns.append({"id": len(self.turns), "kind": "correction", "customer": None,
+                               "message": c["text"], "correction": c["id"],
+                               "start": c["start"], "end": self._seq()})
+
+    def _question(self, rid: str) -> Tuple[str, str]:
+        db = sqlite3.connect(self._crm_db)
+        try:
+            return db.execute("SELECT customer, question FROM replies WHERE id = ?",
+                              (rid,)).fetchone()
+        finally:
+            db.close()
+
+    def _rerun(self, item):
+        """Ask the reply's question again, on a fresh thread (the old
+        conversation is contaminated too), and send it as a correction."""
+        self._close_correction_turn()
+        customer, question = self._question(item[1])
+        self._reruns = getattr(self, "_reruns", 0) + 1
+        entry = self._on_loop(lambda: self.chat(
+            customer, question, thread=f"{customer}-corrected-{self._reruns}", replaces=item[1]))
+        return ("mcp:crm", entry["reply_id"])
+
+    def _notify(self, item, text):
+        """A reply to the bad message itself: re-running it would repeat the
+        mistake, so send the correction's text."""
+        self._close_correction_turn()
+        customer, question = self._question(item[1])
+        entry = self._on_loop(lambda: self._notice(customer, question, item[1], text))
+        return ("mcp:crm", entry["reply_id"])
+
+    async def correct(self, statement: str, wrong: List[Tuple[str, str]]) -> dict:
+        """Plan and apply the fix for ``wrong`` through ``dod.admin``; the
+        correction's turn is recorded around it."""
+        self._loop = asyncio.get_running_loop()
+        plan = self.admin.plan(statement, wrong)
+        self._open_correction = {"id": f"correction:{plan.id}", "text": statement,
+                                 "start": self._seq()}
+        try:
+            applied = await asyncio.to_thread(self.admin.apply, plan, "support-lead")
+        finally:
+            self._close_correction_turn()
+        return {"plan": plan, "applied": applied}
+
+    async def _notice(self, customer: str, question: str, replaces: str, text: str) -> dict:
         start = self._seq()
-        self.cap.on_retrieve(current_key(), [("console", cid)], "in_prompt")
         reply = f"Correction to my earlier reply: {text}"
         r = await self.crm.call_tool("send_reply", {
             "customer": customer, "question": question, "text": reply})
@@ -369,35 +448,6 @@ class World:
                            "message": question, "reply_id": entry["reply_id"],
                            "replaces": replaces, "start": start, "end": self._seq()})
         return entry
-
-    def record_correction(self, text: str, topic: str) -> Tuple[str, str]:
-        """Start a correction: record what the support lead said (store
-        ``console``, source ``user``), then, with it as the only context,
-        write it as a policy note. Returns its record ID and the note's path.
-        Tickets are cancelled by ``cancel_tickets`` in the same turn."""
-        cid = f"correction:{len(self.corrections) + 1}"
-        self._correction_start = self._seq()
-        with agent_task_scope("support-lead", cid):
-            key = current_key()
-            wid = self.cap.on_write(key, text, "console", "user")
-            self.cap.bind(wid, cid)
-            self.cap.on_retrieve(key, [("console", cid)], "in_prompt")
-            path = self._append_note(topic, f"Correction by the support lead: {text}")
-        self.corrections.append({"id": cid, "text": text, "note": path})
-        return cid, path
-
-    async def cancel_tickets(self, cid: str, tickets: List[str]) -> None:
-        """Cancel the tickets a correction reached, in the CRM (so fulfilment
-        doesn't act on them), with the correction as their context; then
-        close the correction's turn."""
-        with agent_task_scope("support-lead", cid):
-            self.cap.on_retrieve(current_key(), [("console", cid)], "in_prompt")
-            for t in tickets:
-                await self.crm.call_tool("update_ticket", {"ticket_id": t, "status": "cancelled"})
-        text = next(c["text"] for c in self.corrections if c["id"] == cid)
-        self.turns.append({"id": len(self.turns), "kind": "correction", "customer": None,
-                           "message": text, "correction": cid,
-                           "start": self._correction_start, "end": self._seq()})
 
     def reply_pair(self, old: str, new: str) -> dict:
         """A corrected reply next to the one it replaces."""
@@ -424,6 +474,16 @@ class World:
             return self.ledger._conn.execute(
                 "SELECT store, record_id FROM bindings WHERE write_id = ?", (write_id,)
             ).fetchall()
+
+
+class _Rows:
+    """A ``dod.admin.Reader`` from a generator function."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def records(self):
+        return list(self.fn())
 
 
 def _result_id(tool: str, arguments: Any, result: Any) -> Optional[str]:

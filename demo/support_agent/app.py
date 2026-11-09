@@ -101,20 +101,23 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
         return JSONResponse({"result": result, **snapshot()})
 
     async def correct(request: Request):
-        """The correction flow: candidates, then a plan, then apply."""
+        """The support lead's chat, through ``dod.admin``: ``@excise`` as
+        candidates, a plan, then apply; other commands as ``command``."""
         body = await request.json()
         step, text = request.path_params["step"], str(body.get("text", "")).strip()
         if not text:
             return JSONResponse({"error": "say what the right fact is"}, status_code=400)
         w = state["world"]
         async with lock:
+            items = list(body.get("items") or [])
             if step == "candidates":
                 result = correction.candidates(w, text)
             elif step == "plan":
-                result = correction.plan(w, text, list(body.get("boxes") or []), body.get("topic"))
+                result = correction.plan(w, text, items)
             elif step == "apply":
-                result = await correction.apply(w, text, list(body.get("boxes") or []),
-                                                body.get("topic"))
+                result = await correction.apply(w, text, items)
+            elif step == "command":
+                result = correction.command(w, text)
             else:
                 return JSONResponse({"error": f"unknown step {step}"}, status_code=404)
         if "error" in result:

@@ -27,6 +27,7 @@ First release of `dod-lineage` (Python, `import dod`) and `@dod-lineage/capture`
 - `excise`: quarantine, or delete through store adapters.
 - `regenerate`: excise, then rebuild derived items through a callback.
 - `reconcile`: compare store contents with the ledger, to check capture completeness.
+- `dod.admin`: trace and fix from a statement instead of record IDs (find what contradicts it, plan from its origin, apply, undo), and the same as `@commands` (`@trace`, `@impact`, `@excise`, `@undo`, `@ledger`) for a chat or Slack bot. Your app supplies readers and the side effects.
 - Cross-host lineage: `dod ship` copies each node's ledger to Postgres. `PgLineage` and `dod pg` trace, show blast radius and excise across nodes, and quarantines fan out to every node.
 
 ### Audit and operations

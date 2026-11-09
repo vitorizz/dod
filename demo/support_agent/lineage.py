@@ -7,7 +7,7 @@ version of an item, written in one turn:
 - conversation: the customer's message (the turn's user-sourced state
   write). The agent's own update to the thread state is folded into it.
 - the handbook: the six seeded policies, shown as one box.
-- a correction: what the support lead said (store ``console``), an origin.
+- a correction: what the support lead said (store ``admin``), an origin.
 - every other write: notes, policy files, tickets, replies.
 
 A *read* edge says a turn had a box in its context: for each write in the
@@ -95,7 +95,7 @@ class Lineage:
                     alias[wid] = bid
                 else:
                     later.append((wid, tid))
-            elif bstore == "console":
+            elif bstore == "admin":
                 bid = f"fix:{rid}"
                 self._box(bid, tid, item, "correction", source, quarantined, tombstoned)
                 message_box[tid] = bid  # the origin of its turn, like a message
@@ -202,20 +202,7 @@ class Lineage:
         return {"reply": "corrected", "message": "on record"}.get(b["kind"], "quarantined")
 
     def label(self, store: str, rid: str) -> str:
-        if store == "mcp:crm":
-            if rid.startswith("R"):
-                db = sqlite3.connect(self.w._crm_db)
-                try:
-                    row = db.execute("SELECT customer FROM replies WHERE id = ?", (rid,)).fetchone()
-                finally:
-                    db.close()
-                return f"Reply to {row[0].capitalize()} ({rid})" if row else f"Reply {rid}"
-            return {"T": "Ticket "}.get(rid[:1], "") + rid
-        if store == "notes":
-            topic, name = rid.rsplit("/", 2)[-2:]
-            return f"{topic} note {name}"
-        parts = json.loads(rid)
-        return f"Note on {parts[1]}"
+        return item_label(self.w, store, rid)
 
     def preview(self, store: str, rid: str) -> str:
         w = self.w
@@ -330,3 +317,27 @@ class Lineage:
             if b["item"] == [store, rid]:
                 return bid
         return None
+
+
+def item_label(w: World, store: str, rid: str) -> str:
+    """A record's name in the console and in ``dod.admin``'s answers."""
+    if store == "mcp:crm":
+        if rid.startswith("R"):
+            db = sqlite3.connect(w._crm_db)
+            try:
+                row = db.execute("SELECT customer FROM replies WHERE id = ?", (rid,)).fetchone()
+            finally:
+                db.close()
+            return f"Reply to {row[0].capitalize()} ({rid})" if row else f"Reply {rid}"
+        return {"T": "Ticket "}.get(rid[:1], "") + rid
+    if store == "notes":
+        topic, name = rid.rsplit("/", 2)[-2:]
+        return f"{topic} note {name}"
+    if store == "langgraph_state":
+        return f"{json.loads(rid)[0].split('-')[0].capitalize()}'s conversation"
+    if store == "admin":
+        return "Support lead's correction"
+    parts = json.loads(rid)
+    if parts[0] == "policies":
+        return f"Company policy: {parts[1]}"
+    return f"Note on {parts[1]}"
