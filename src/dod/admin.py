@@ -253,8 +253,13 @@ class Admin:
         self.classify = classify or (lambda item: "fix")
         self.actions = actions or Actions()
         self.searchable = list(searchable) if searchable is not None else list(self.readers)
+        missing = [s for s in self.searchable if s not in self.readers]
+        if missing:
+            raise ValueError(f"searchable stores without a reader: {missing}")
         self.label = label or (lambda item: f"{item[0]}:{item[1]}")
         self.store = store
+        # In memory only: a restart forgets pending plans and what @undo would
+        # release (the quarantine rows stay in the ledger: dod release works).
         self.pending: Dict[str, Plan] = {}
         self.history: List[Applied] = []
 
@@ -361,7 +366,6 @@ class Admin:
             plan = self.pending[plan]
         if self.capture is None:
             raise ValueError("Admin needs a capture to record the correction")
-        self.pending.pop(plan.id, None)
         cap, a = self.capture, self.actions
         cid = f"correction:{plan.id}"
         correction = (self.store, cid)
@@ -396,6 +400,7 @@ class Admin:
             quarantined += [(s, rid) for s, rids in r.done.items() for rid in rids]
             failed += [((f.store, f.record_id), f.reason) for f in r.failed]
         out = Applied(plan, correction, cancelled, replaced, quarantined, failed)
+        self.pending.pop(plan.id, None)  # only now: if an action raised, it can be retried
         self.history.append(out)
         return out
 

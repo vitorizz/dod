@@ -216,3 +216,19 @@ def test_statements_never_reach_the_ledger(world, tmp_path):
         data = f.read_bytes()
         for needle in ("canary-7f3a", "extended to 90 days"):
             assert needle.encode() not in data and needle.encode("utf-16-le") not in data, f
+
+
+def test_a_failed_fix_stays_pending_and_setup_is_checked(world):
+    led, cap, s, chat = world
+    a, _ = admin_for(world)
+
+    def broken(item):
+        raise RuntimeError("CRM down")
+    a.actions.cancel = broken
+    p = a.plan(STATEMENT)
+    with pytest.raises(RuntimeError):
+        a.apply(p)
+    assert p.id in a.pending  # can be retried once the CRM is back
+    with pytest.raises(ValueError):
+        Admin(led, {"notes": s["notes"]}, searchable=["notes", "nope"])
+    assert "Nothing in memory states that" in a.handle("@impact gift cards never expire").text
