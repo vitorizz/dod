@@ -33,6 +33,8 @@ Cleanup starts when a person finds a mistake, so there are no cleanup buttons on
    The graph then replays the fix step by step, with a caption for each (in the ledger it takes milliseconds): the confirmed records, the trace to the ops update, the blast radius, each group quarantined or cancelled in turn, then the correction and each corrected turn appearing. Pause, step or **Skip** it with the bar above the graph.
 4. **Audit report** (button on the agent's answer): every record the correction touched, what happened to it, and the audit entry that sealed it, with the ledger's hash chain checked. Downloadable as Markdown (`dod.audit.report`).
 
+The Support lead tab runs `dod.admin` (the library's command layer, as a Slack bot would), so it also takes **@trace R3** (where did a reply come from?), **@impact** a fact (what did it affect?), **@undo** (release what the last fix quarantined), **@ledger** (what the ledger holds) and **@help**. Each answer shows the equivalent library call, and what a command names is highlighted on the graph.
+
 You can still click any box: **where did this come from?** traces it back turn by turn; **what came from this?** shows its blast radius.
 
 ## Run it

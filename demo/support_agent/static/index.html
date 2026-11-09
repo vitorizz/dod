@@ -58,6 +58,7 @@
   .prop .pill { font-size: 11px; }
   .prop .acts { margin-top: 10px; display: flex; gap: 8px; }
   .prop table { font-size: 12px; }
+  pre.code { background: #1f1f1f; color: #d6d6d6; font-size: 11px; padding: 6px 8px; border-radius: 6px; margin: 8px 0 0; white-space: pre-wrap; }
   #compose { border-top: 1px solid var(--line); padding: 12px 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
   #compose .row { display: flex; gap: 8px; }
   #compose input { flex: 1; min-width: 0; font: inherit; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; }
@@ -312,7 +313,7 @@ function renderTabs() {
   for (const b of $("tabs").querySelectorAll(".tab")) b.onclick = () => { tab = b.dataset.t; renderTabs(); renderChat(); };
   const who = tab === "all" ? null : tab;
   $("message").disabled = $("send").disabled = !who;
-  $("message").placeholder = who === "lead" ? "@excise and the right fact, e.g. @excise the refund window is 30 days"
+  $("message").placeholder = who === "lead" ? "@excise <the right fact>, @trace, @impact, @undo, @ledger, @help"
     : who ? `Message from ${cap(who)}…` : "Pick a customer tab to send a message as them";
   const n = player.on || pending || leadTyping ? null : nextStory();
   $("next").style.display = n ? "" : "none";
@@ -397,36 +398,38 @@ async function leadSays(said) {
   LEAD.push({kind: "lead", text: said});
   renderTabs(); renderLead();
   const cmd = said.match(/^@(excise|correct)\b[:,]?\s*(.*)$/is);
-  if (!cmd) return say(`To fix something I got wrong, start with @excise and tell me what's right, e.g. “@excise ${S.correction_example}”`);
+  if (!cmd) return adminCommand(said);
   const text = cmd[2].trim();
   if (!text) return say("What's the right fact? e.g. “@excise " + S.correction_example + "”");
   leadTyping = true; renderTabs(); renderLead();
   const r = await busy(async () => (await api("/api/correction/candidates", {text})).result, true, true);
   leadTyping = false;
-  if (!r) return say("I couldn't work out which policy that's about. Name it (refunds, shipping or warranty).");
+  if (!r) return say("Something went wrong looking that up.");
   const wrong = r.candidates.filter(c => c.conflicts);
   if (!wrong.length) return say(r.candidates.length
-    ? `Nothing in my memory about ${r.topic} says otherwise, so there's nothing to fix.`
-    : `I have nothing in memory about ${r.topic} yet.`);
-  const m = {kind: "proposal", text, topic: r.topic, cands: r.candidates, picked: [...new Set(wrong.map(c => c.box))], state: "open"};
+    ? "Nothing in my memory says otherwise, so there's nothing to fix."
+    : "I have nothing in memory about that.");
+  const key = c => JSON.stringify(c.item);
+  const m = {kind: "proposal", text, cands: r.candidates, picked: wrong.map(key), state: "open"};
   LEAD.push(m);
   await replan(m);
 }
 function say(text) { LEAD.push({kind: "agent", text}); renderTabs(); renderLead(); }
 async function replan(m) {
-  m.plan = m.picked.length ? await busy(async () => (await api("/api/correction/plan", {text: m.text, boxes: m.picked, topic: m.topic})).result) : null;
+  m.plan = m.picked.length ? await busy(async () => (await api("/api/correction/plan", {text: m.text, items: m.picked.map(JSON.parse)})).result) : null;
   renderLead();
 }
 function proposalHtml(m, i) {
   const open = m.state === "open", p = m.plan;
-  let h = `<div>Here's what my memory says about ${esc(p ? p.topic : "it")}. The ticked ones contradict you${open ? "; untick any that are actually right" : ""}:</div>`;
-  h += m.cands.map(c => `<label><input type="checkbox" data-m="${i}" value="${esc(c.box)}" ${m.picked.includes(c.box) ? "checked" : ""} ${open ? "" : "disabled"}>
+  let h = `<div>Here's what my memory says about it. The ticked ones contradict you${open ? "; untick any that are actually right" : ""}:</div>`;
+  h += m.cands.map(c => `<label><input type="checkbox" data-m="${i}" value="${esc(JSON.stringify(c.item))}" ${m.picked.includes(JSON.stringify(c.item)) ? "checked" : ""} ${open ? "" : "disabled"}>
     <b>${esc(c.label)}</b>${c.conflicts ? ' <span class="warn">contradicts you</span>' : ""}<div class="c">${esc(clip(c.content, 120))}</div></label>`).join("");
   if (!p) return h + `<div class="c">Nothing ticked, so nothing to fix.</div>`;
   h += `<h4>Where it came from</h4>` + p.roots.map(r => `<div>${esc(r.label)}: “${esc(clip(r.preview, 140))}”</div>`).join("");
   h += `<h4>What I'd do</h4>` + Object.entries(GROUP).filter(([g]) => p.groups[g].length).map(([g, [t, why]]) =>
     `<div><b>${t}</b> <span class="c" style="margin:0">${why}</span><div>${p.groups[g].map(x => `<span class="pill">${esc(x.label)}</span>`).join("")}</div></div>`).join("");
   h += `<div class="c" style="margin:8px 0 0">Untouched: ${p.untouched_labels.map(esc).join(" · ")}. Nothing is deleted, so this can be undone; wiping my memory would lose all ${p.wipe} records.</div>`;
+  h += codeHtml(p.code);
   if (open) h += `<div class="acts"><button class="good" data-apply="${i}">Fix it</button><button data-cancel="${i}">Cancel</button></div>`;
   else h += `<div class="note ${m.state === "applied" ? "ok" : ""}" style="margin-top:6px">${m.state === "applied" ? "applied" : "cancelled"}</div>`;
   return h;
@@ -435,28 +438,48 @@ function doneHtml(r) {
   return `<div>Done. The correction is now a policy note${r.cancelled.length ? `, ticket ${esc(r.cancelled.join(", "))} is cancelled in the CRM` : ""}, the wrong records are kept but I no longer read them, and I sent ${r.pairs.length} correction${r.pairs.length === 1 ? "" : "s"}:</div>
     <table class="ba"><tr><th>Customer</th><th>Was told</th><th>Correction sent</th></tr>
     ${r.pairs.map(p => `<tr><td><b>${esc(cap(p.customer))}</b></td><td class="before">${esc(p.before)}</td><td class="after">${esc(p.after)}</td></tr>`).join("")}</table>
-    <div class="acts"><button data-proof="${esc(r.plan.roots[0].box)}">Audit report</button></div>`;
+    <div class="acts"><button data-proof="${esc(r.roots[0].box)}">Audit report</button></div>
+    <div class="c" style="margin:6px 0 0">Changed your mind? <b>@undo</b> releases what this quarantined.</div>`;
+}
+const codeHtml = lines => lines && lines.length ? `<pre class="code">${esc(lines.join("\n"))}</pre>` : "";
+// Every other command goes to dod.admin as is (Admin.handle); what it names
+// is highlighted on the graph.
+async function adminCommand(text) {
+  leadTyping = true; renderTabs(); renderLead();
+  const data = await busy(async () => api("/api/correction/command", {text}), true, true);
+  leadTyping = false;
+  if (!data) return say("Something went wrong running that.");
+  load(data);
+  const r = data.result;
+  LEAD.push({kind: "admin", result: r});
+  renderTabs(); renderLead();
+  if (r.focus && r.focus.box) { sel = r.focus.box; await act(r.focus.kind); }
+}
+function adminHtml(r, i) {
+  return `<div style="white-space:pre-wrap">${esc(r.text)}</div>${codeHtml(r.code)}` + (r.choices.length
+    ? `<div class="acts">${r.choices.map(([l, c]) => `<button data-cmd="${esc(c)}">${esc(l)}</button>`).join("")}</div>` : "");
 }
 function renderLead() {
   $("log").innerHTML = LEAD.map((m, i) => m.kind === "lead"
     ? `<div class="turn"><div class="q lead"><div class="who">Support lead</div><div class="bubble">${esc(m.text)}</div></div></div>`
     : `<div class="turn"><div class="a"><div class="who">agent → support lead</div><div class="${m.kind === "agent" ? "bubble" : "prop"}">${
-        m.kind === "agent" ? esc(m.text) : m.kind === "done" ? doneHtml(m.result) : proposalHtml(m, i)}</div></div></div>`).join("")
+        m.kind === "agent" ? esc(m.text) : m.kind === "done" ? doneHtml(m.result) : m.kind === "admin" ? adminHtml(m.result, i) : proposalHtml(m, i)}</div></div></div>`).join("")
     + (leadTyping ? `<div class="turn">${TYPING("support lead")}</div>` : "")
-    || `<p class="empty">Found a mistake? Type <b>@excise</b> and what's right, e.g. “@excise ${esc(S.correction_example)}” The agent shows what in its memory contradicts you and what fixing it involves; nothing changes until you confirm.</p>`;
+    || `<p class="empty">Found a mistake? Type <b>@excise</b> and what's right, e.g. “@excise ${esc(S.correction_example)}” The agent shows what in its memory contradicts you and what fixing it involves; nothing changes until you confirm. Also: <b>@trace</b> R3 (where did a reply come from?), <b>@impact</b> &lt;a fact&gt; (what did it affect?), <b>@undo</b>, <b>@ledger</b>, <b>@help</b>. These run <code>dod.admin</code>, the same commands a Slack bot would.</p>`;
   for (const cb of $("log").querySelectorAll("input[data-m]")) cb.onchange = () => {
     const m = LEAD[+cb.dataset.m];
-    m.picked = [...new Set([...$("log").querySelectorAll(`input[data-m="${cb.dataset.m}"]:checked`)].map(x => x.value))];
+    m.picked = [...$("log").querySelectorAll(`input[data-m="${cb.dataset.m}"]:checked`)].map(x => x.value);
     replan(m);
   };
   for (const b of $("log").querySelectorAll("[data-cancel]")) b.onclick = () => { LEAD[+b.dataset.cancel].state = "cancelled"; renderTabs(); renderLead(); };
   for (const b of $("log").querySelectorAll("[data-apply]")) b.onclick = () => applyFix(LEAD[+b.dataset.apply]);
   for (const b of $("log").querySelectorAll("[data-proof]")) b.onclick = () => proof(b.dataset.proof);
+  for (const b of $("log").querySelectorAll("[data-cmd]")) b.onclick = () => leadSays(b.dataset.cmd);
   $("log").scrollTop = $("log").scrollHeight;
 }
 async function applyFix(m) {
   const before = S.turns[S.turns.length - 1].id;
-  const data = await busy(async () => api("/api/correction/apply", {text: m.text, boxes: m.picked, topic: m.topic}));
+  const data = await busy(async () => api("/api/correction/apply", {text: m.text, items: m.picked.map(JSON.parse)}));
   if (!data) return;
   m.state = "applied";
   load(data);
@@ -472,9 +495,10 @@ async function applyFix(m) {
 // milliseconds. Steps: what was confirmed wrong, where it came from, what it
 // reached, each group handled, then the correction and every corrected turn.
 async function replayFix(m, r, before, fixBox, onDone) {
-  const p = r.plan, root = p.roots[0].box;
+  const p = m.plan, root = p.roots[0].box;
+  const picked = m.cands.filter(c => m.picked.includes(JSON.stringify(c.item))).map(c => c.box).filter(Boolean);
   const [tr, bl] = await Promise.all([
-    api("/api/box/trace", {box: m.picked[0]}).then(d => d.result),
+    api("/api/box/trace", {box: picked[0]}).then(d => d.result),
     api("/api/box/blast", {box: root}).then(d => d.result)]);
   const live = new Set(S.boxes.filter(b => b.turn <= before && b.status !== "live").map(b => b.id));
   const newTurns = S.turns.filter(t => t.id > before);
@@ -482,7 +506,7 @@ async function replayFix(m, r, before, fixBox, onDone) {
   const unhide = g => () => { for (const id of group(g)) live.delete(id); };
   const steps = [
     {cap: `You confirmed ${m.picked.length === 1 ? "this record is" : "these records are"} wrong.`,
-     go: () => { focus = {kind: "blast", boxes: m.picked, turns: [], reads: []}; }},
+     go: () => { focus = {kind: "blast", boxes: picked, turns: [], reads: []}; }},
     {cap: `dod traces ${m.picked.length === 1 ? "it" : "them"} back to where it started: ${p.roots[0].label}.`,
      go: () => { focus = {kind: "trace", ...tr}; }},
     {cap: `Everything built on it, across ${Object.keys(bl.per_store).length} systems. The rest of memory isn't touched.`,

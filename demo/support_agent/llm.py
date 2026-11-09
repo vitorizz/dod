@@ -129,62 +129,9 @@ class Scripted:
                       if any(w in p.lower() for w in re.findall(r"[a-z]{5,}", msg))), None)
         return Decision(reply=topic or "Happy to help. Could you tell me more?")
 
-    def match(self, correction: str, records: List[dict], topics: Dict[str, Tuple[str, ...]]) -> dict:
-        """The topic by keyword; a record contradicts the correction when it
-        states a different number of days."""
-        low = correction.lower()
-        topic = next((t for t, words in topics.items() if any(w in low for w in words)), None)
-        if topic is None:
-            return {"topic": None, "relevant": [], "contradicts": []}
-        want = _days(correction)
-        relevant = [r["id"] for r in records
-                    if r.get("topic") == topic
-                    or (r.get("topic") is None and any(w in r["content"].lower() for w in topics[topic]))]
-        contradicts = [i for i in relevant
-                       if want is not None and _days(next(r["content"] for r in records if r["id"] == i))
-                       not in (None, want)]
-        return {"topic": topic, "relevant": relevant, "contradicts": contradicts}
 
 
-MATCH_SYSTEM = """A support lead is correcting a fact the support agent got wrong.
-You get the correction and the records in the agent's memory, each with an id.
-Answer with one JSON object and nothing else:
-{"topic": one of TOPICS, "relevant": [ids of records about the same fact],
- "contradicts": [ids of records that state something the correction says is wrong]}
-Only list ids you were given. A record that agrees with the correction is relevant
-but doesn't contradict it. If you're unsure, leave it out of "contradicts": the
-lead reviews your answer before anything changes."""
-
-
-def match_prompt(correction: str, records: List[dict], topics: List[str]) -> str:
-    return (f"TOPICS: {', '.join(topics)}\n\nCORRECTION: {correction}\n\nRECORDS:\n"
-            + "\n".join(f"- {r['id']}: {r['content']}" for r in records))
-
-
-def parse_match(text: str, records: List[dict], topics: List[str]) -> dict:
-    m = re.search(r"\{.*\}", text, re.S)
-    data = json.loads(m.group(0) if m else text)
-    ids = {r["id"] for r in records}
-    topic = data.get("topic") if data.get("topic") in topics else None
-    pick = lambda k: [i for i in data.get(k) or [] if i in ids]  # noqa: E731
-    relevant, contradicts = pick("relevant"), pick("contradicts")
-    return {"topic": topic, "relevant": sorted(set(relevant) | set(contradicts)),
-            "contradicts": contradicts}
-
-
-class _Matcher:
-    """Matching a correction to records: the model reads both (the person
-    still confirms); the scripted rule is the fallback if the model fails."""
-
-    def match(self, correction: str, records: List[dict], topics: Dict[str, Tuple[str, ...]]) -> dict:
-        try:
-            return parse_match(self.complete(MATCH_SYSTEM, match_prompt(correction, records, list(topics))),
-                               records, list(topics))
-        except Exception:
-            return Scripted().match(correction, records, topics)
-
-
-class Anthropic(_Matcher):
+class Anthropic:
     def __init__(self, model: str) -> None:
         import anthropic
 
@@ -200,12 +147,13 @@ class Anthropic(_Matcher):
         return Decision.parse("".join(b.text for b in r.content if b.type == "text"))
 
     def complete(self, system: str, user: str) -> str:
+        """Plain completion, for ``dod.admin.llm_matcher``."""
         r = self.client.messages.create(model=self.model, max_tokens=800, system=system,
                                         messages=[{"role": "user", "content": user}])
         return "".join(b.text for b in r.content if b.type == "text")
 
 
-class OpenAICompatible(_Matcher):
+class OpenAICompatible:
     def __init__(self, model: str, base_url: Optional[str] = None) -> None:
         import httpx
 

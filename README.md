@@ -338,6 +338,37 @@ print(result.replaced, result.dropped, result.failed)
 
 Each rewrite runs in its own `agent_task_scope`, so capture records it with whatever it retrieved as parents. Quarantined items can't be retrieved, so a rewrite can't pick the bad item back up. After each one, the replacement's recorded parents are checked: a replacement that wasn't captured, overwrites an old item in place, or was derived from a target is quarantined and reported in `failed`. Old items stay quarantined (or `then="delete"` deletes them through delete adapters); `dry_run=True` returns the ordered plan.
 
+## Admin: fixing from a statement, or @commands
+
+People don't have record IDs: they have a bad answer, or a fact they know is wrong. `dod.admin.Admin` goes from there. Give it a `Reader` per store (`records()` → `(record_id, text)` pairs; read only when you ask, never written to the ledger), a matcher (`keyword_matcher`, or `llm_matcher(complete)` for any model), and your app's side of a fix as `Actions`:
+
+```python
+from dod.admin import Actions, Admin, llm_matcher
+
+admin = Admin(ledger, readers={"notes": notes_reader, "crm": crm_reader}, capture=capture,
+              matcher=llm_matcher(lambda system, user: my_llm(system, user)),
+              classify=lambda item: "notify" if item[0] == "crm" else "fix",
+              actions=Actions(correct=write_correction_note, cancel=cancel_ticket,
+                              rerun=answer_again, notify=send_correction))
+
+match, records = admin.find("The refund window is 30 days, not 90.")  # what contradicts it
+plan = admin.plan("The refund window is 30 days, not 90.", match.contradicts)  # after a person confirms
+admin.apply(plan)       # record the correction, then regenerate from where it came from
+admin.undo()            # release what it quarantined
+```
+
+`plan` traces the confirmed records to their origin and groups everything built on it with `classify`: `fix` (quarantined), `cancel` (quarantined, and `Actions.cancel`), `notify` (sent outputs: answered again through `Actions.rerun`, or sent the correction through `Actions.notify` when they answered the origin itself) and `record` (history, quarantined). `apply` records the correction as a write (store `admin`, source `user`), so everything the fix writes traces back to it. Nothing is deleted, and the matcher only proposes: a person confirms.
+
+The same as commands, for a chat, a Slack bot or a script; `handle` returns text, buttons (as `(label, command)`), data and the equivalent library calls:
+
+```python
+admin.handle("@trace crm R3")                       # where did this come from?
+admin.handle("@impact the refund window is 90 days")  # what did it affect?
+r = admin.handle("@excise the refund window is 30 days")  # plan; r.choices: Fix it / Cancel
+admin.handle(r.choices[0][1])                       # @confirm <plan id>
+admin.handle("@undo"); admin.handle("@ledger"); admin.handle("@help")
+```
+
 ## Audit
 
 Open the ledger with `Ledger(path, audit=True)` (every time, once enabled) to hash-chain it; the first audited open seals the rows already in the file. `dod.audit.report(ledger, store, record_id)` is the evidence for an excision: the item and everything derived from it, each with its writes, quarantine actions and deletions (time, reason, actor), the audit entry that recorded each, and the chain's verification at report time. Like the ledger, it holds IDs, hashes and timestamps only. `dod.audit.to_markdown(report)` renders it.
