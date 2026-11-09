@@ -48,6 +48,7 @@
   .chip:hover { text-decoration: underline; }
   .note { font-size: 11px; color: var(--blast); margin-top: 2px; }
   .note.ok { color: var(--ok); }
+  .saved { font-size: 11px; color: var(--muted); margin-top: 3px; text-align: right; }
   .lead .bubble { background: var(--ink); color: #fff; }
   .prop { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; max-width: 100%; font-size: 13px; }
   .prop h4 { margin: 8px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
@@ -217,8 +218,8 @@
   <p>Each <b>row is one turn</b>: a customer message, and everything the agent wrote while handling it. An <b>arrow</b> from a box into a later row means that turn <b>read</b> the box: it was in the agent's context when it wrote that row. Solid: it was in the prompt; dashed: it was retrieved during the turn. When you trace, the arrows flip and point back to where things came from.</p>
   <h3>The story</h3>
   <ol>
-    <li><b>Ben</b> falsely claims the refund window was extended to 90 days (it's 30). The agent believes him and writes it down as a policy note.</li>
-    <li><b>Dev</b> asks about shipping: answered correctly, nothing to do with Ben.</li>
+    <li><b>Ops</b> posts a policy update on the internal channel: the refund window is now 90 days. It's a mistake (it's still 30), but it comes from staff, so the agent records it as a policy note.</li>
+    <li><b>Dev</b> asks about shipping: answered correctly, nothing to do with the update.</li>
     <li><b>Ana</b> asks to return an order delivered 45 days ago. The agent reads the note and wrongly approves it: a reply, a refund ticket, a note about her.</li>
     <li><b>Ana</b> asks when her refund arrives; the agent confirms it from its note. The mistake builds on itself.</li>
   </ol>
@@ -226,8 +227,8 @@
   <p>Cleanup starts when a person finds a mistake. Open the <b>Support lead</b> tab in the chat and type <b>@excise</b> with what's right: “@excise The refund window is 30 days, not 90.” With a real model, the model reads your correction and its memory to find what contradicts it. It replies in the chat:</p>
   <ol>
     <li><b>What contradicts you</b>: its memory about refunds, with the records that say something else ticked. Untick any that are right.</li>
-    <li><b>What it would do</b>: dod traces them to where they came from (Ben's message) and groups everything built on it: notes to <b>fix</b>, tickets to <b>cancel</b>, customers to <b>notify</b>, conversations kept <b>on record</b>, and what's untouched.</li>
-    <li><b>Fix it</b>: the correction is written as a note, the ticket is cancelled in the CRM, the wrong records stop being read (kept, not deleted), and Ben and Ana get corrected replies. Everything it writes traces back to the correction.</li>
+    <li><b>What it would do</b>: dod traces them to where they came from (the ops update) and groups everything built on it: notes to <b>fix</b>, tickets to <b>cancel</b>, customers to <b>notify</b>, conversations kept <b>on record</b>, and what's untouched.</li>
+    <li><b>Fix it</b>: the correction is written as a note, the ticket is cancelled in the CRM, the wrong records stop being read (kept, not deleted), and Ana (and ops) get corrections. Everything it writes traces back to the correction.</li>
   </ol>
   <p>You can still click any box to trace it (<b>where did this come from?</b>) or see what came from it.</p>
   <p class="empty">dod never decides what is false: a person does. dod makes “find everything built on it, and fix only that” a query instead of a wipe.</p>
@@ -261,8 +262,8 @@ const BW = 232, BH = 50, BGAP = 6, CGAP = 28, LANE = 9, ROWPAD = 9, TOP = 46, LE
 let S = null, tab = "all", sel = null, focus = null, lastResult = null, flowTurn = null;
 // The story, narrated one turn at a time.
 const CAPTIONS = [
-  "Ben claims the refund window was extended to 90 days. It's false (the policy is 30), but the agent believes him and writes it down as a policy note, plus a note on Ben.",
-  "Dev asks about shipping: the agent reads the handbook (arrow) and answers correctly. Nothing to do with Ben.",
+  "Ops posts an update on the internal channel: the refund window is now 90 days. It's a mistake (it's still 30), but staff are a trusted source, so the agent records it as a policy note.",
+  "Dev asks about shipping: the agent reads the handbook (arrow) and answers correctly. Nothing to do with the update.",
   "Ana asks for a refund 45 days after delivery. Follow the arrow: the agent reads the refunds note, believes the 90 days, and approves it: a wrong reply, a refund ticket and a note.",
   "Ana asks when her refund arrives. The agent reads its own note about her (arrow) and confirms it: the mistake is now building on itself.",
 ];
@@ -332,6 +333,9 @@ function nextStory() {
 }
 function replyBoxOf(e) { return S.box[S.replyBox[e.reply_id]]; }
 function isBad(e) { const b = replyBoxOf(e); return b && b.status === "corrected"; }
+// What a turn wrote besides its reply, shown under the reply.
+const SAVED = {policy_note: b => `policy note “${clip(b.preview, 50)}”`, customer_note: b => `note on ${b.label.replace("Note on ", "")}`,
+  ticket: b => b.label};
 function renderChat() {
   if (tab === "lead") return renderLead();
   const fixedBy = {};
@@ -340,11 +344,13 @@ function renderChat() {
   $("log").innerHTML = rows.map(e => {
     const bad = isBad(e), fixed = !!e.replaces;
     const q = fixed ? "" : `<div class="q"><div class="who">${cap(e.customer)}</div><div class="bubble">${esc(e.message)}</div></div>`;
+    const saved = S.boxes.filter(b => b.turn === e.turn && SAVED[b.kind]).map(b => SAVED[b.kind](b));
+    const savedLine = `<div class="saved">${saved.length ? "Saved: " + saved.map(esc).join(" · ") : "Saved nothing to memory"}</div>`;
     const note = bad ? `<div class="note">wrong · kept on record${fixedBy[e.reply_id] ? ` · correction sent as ${fixedBy[e.reply_id]}` : ""}</div>`
       : fixed ? `<div class="note ok">correction of ${e.replaces}</div>` : "";
     return `<div class="turn">${q}<div class="a ${bad ? "bad" : ""} ${fixed ? "fixed" : ""}">
       <div class="who">agent → ${cap(e.customer)}</div><div class="bubble">${esc(e.reply)}</div>
-      ${note}<div class="chip" data-r="${e.reply_id}">reply ${e.reply_id} · where did this come from? ↗</div></div></div>`;
+      ${savedLine}${note}<div class="chip" data-r="${e.reply_id}">reply ${e.reply_id} · where did this come from? ↗</div></div></div>`;
   }).join("") + (pending && (tab === "all" || tab === pending.customer)
     ? `<div class="turn"><div class="q"><div class="who">${cap(pending.customer)}</div><div class="bubble">${esc(pending.message)}</div></div>${TYPING(cap(pending.customer))}</div>` : "")
   || `<p class="empty">${tab === "all" ? "No conversations yet. Click <b>▶ Play the story</b>, or send the first story message below." : "No messages from " + cap(tab) + " yet."}</p>`;
@@ -490,7 +496,7 @@ async function replayFix(m, r, before, fixBox, onDone) {
      go: () => { live.clear(); focus = null; replay.upTo = newTurns[0].id; flowTurn = newTurns[0].id; }},
     ...newTurns.slice(1).map(t => ({
       cap: S.box[`msg:${t.id}`] ? `${cap(t.customer)}'s question is answered again from clean memory, and sent as a correction.`
-        : `${cap(t.customer)} is sent the correction itself (their message was the false claim).`,
+        : `${cap(t.customer)} is sent the correction itself (their message was the source of the mistake).`,
       go: () => { replay.upTo = t.id; flowTurn = t.id; }})),
   ];
   replay = {upTo: before, live};
@@ -610,7 +616,7 @@ function renderGraph() {
     if (b.status !== "live") cls.push("quar");
     const tk = V.turns.find(t => t.id === b.turn)?.kind;
     if ((tk === "regenerated" || tk === "correction") && b.status === "live") cls.push("fixed");
-    const tag = b.status !== "live" ? b.status : tk === "correction" ? "correction" : b.source === "user" ? "customer" : b.kind === "handbook" ? "company" : "agent";
+    const tag = b.status !== "live" ? b.status : tk === "correction" ? "correction" : b.source === "user" ? (S.staff.includes(S.turns.find(t => t.id === b.turn)?.customer) ? "staff" : "customer") : b.kind === "handbook" ? "company" : "agent";
     out += `<g class="${cls.join(" ")}" data-id="${esc(b.id)}" transform="translate(${p.x},${p.y})">
       <rect class="b" width="${BW}" height="${BH}" rx="8"/><rect width="4" height="${BH}" rx="2" fill="${COLOR[c]}"/>
       <text x="12" y="19" font-weight="600">${esc(clip(b.label, 22))}</text>
