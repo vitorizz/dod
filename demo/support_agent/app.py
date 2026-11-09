@@ -25,7 +25,7 @@ from dod import audit
 
 from . import correction
 from .lineage import Lineage
-from .world import CORRECTION, CUSTOMERS, STORE_LABELS, STORY, World
+from .world import CORRECTION, CUSTOMERS, STAFF, STORE_LABELS, STORY, World
 
 STATIC = Path(__file__).parent / "static"
 
@@ -55,7 +55,7 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
                 "audit": {"ok": v.ok, "entries": v.entries, "head": v.head},
                 "stores": STORE_LABELS, "customers": CUSTOMERS,
                 "story": [{"customer": c, "message": m} for c, m in STORY],
-                "correction_example": CORRECTION, "corrections": w.corrections}
+                "correction_example": CORRECTION, "staff": sorted(STAFF), "corrections": w.corrections}
 
     async def index(request: Request):
         return FileResponse(STATIC / "index.html")
@@ -174,10 +174,11 @@ def load_env(path: str) -> None:
 
 
 def default_model() -> str:
-    """``DEMO_MODEL``, else Claude when an Anthropic key is set, else scripted."""
+    """``DEMO_MODEL``, else Claude Haiku (fast and cheap enough for a support
+    agent) when an Anthropic key is set, else scripted."""
     if os.environ.get("DEMO_MODEL"):
         return os.environ["DEMO_MODEL"]
-    return "anthropic/claude-sonnet-5-5" if os.environ.get("ANTHROPIC_API_KEY") else "scripted"
+    return "anthropic/claude-haiku-5-5" if os.environ.get("ANTHROPIC_API_KEY") else "scripted"
 
 
 def main() -> None:

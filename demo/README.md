@@ -13,7 +13,7 @@ On the left of the web app is the customer chat, one tab per customer. On the ri
 
 ## The story
 
-1. **Ben** says a colleague told him the refund window was extended to 90 days. It's false (the policy is 30), but the agent records it as a policy note and notes it on Ben.
+1. **Ops** posts a policy update on the internal channel: the refund window is now 90 days. It's a staff mistake (the policy is still 30), but staff are a source the agent should trust, so it records the update as a policy note. (The same claim from a customer is answered but not recorded.)
 2. **Dev** asks about shipping: unrelated, answered correctly.
 3. **Ana** (45 days since delivery) asks for a refund. The agent reads the note, approves it, opens a refund ticket in the CRM and notes the approval.
 4. **Ana** asks when her refund arrives; the agent confirms it from its note. The mistake builds on itself.
@@ -23,14 +23,14 @@ On the left of the web app is the customer chat, one tab per customer. On the ri
 Cleanup starts when a person finds a mistake, so there are no cleanup buttons on records. The support lead opens the **Support lead** tab in the chat and tells the agent what's right: “The refund window is 30 days, not 90.” The agent answers in the chat, and nothing changes until the lead confirms:
 
 1. **What contradicts you**: the beliefs about refunds (policy notes, customer notes, the handbook), with those stating another number of days ticked. The lead can untick any; dod never decides what's false.
-2. **What I'd do**: dod traces them to their origin (Ben's message) and groups what was built on it by what to do:
+2. **What I'd do**: dod traces them to their origin (the ops update) and groups what was built on it by what to do:
    - **fix**: wrong notes stop being read; the correction is written as a policy note in their place;
    - **cancel**: Ana's refund ticket, so fulfilment doesn't act on it;
-   - **notify**: replies already sent stay on record, and Ben and Ana each get a correction;
+   - **notify**: replies already sent stay on record, and Ana and ops each get a correction;
    - **keep on record**: the conversations, hidden from the agent;
    - **untouched**: the handbook, Dev's conversation. Wiping memory would have lost those too.
-3. **Fix it**: the correction is recorded (store `console`, source `user`), its note written, the ticket cancelled through the CRM, then `dod.regenerate` from Ben's message quarantines what it reached (reversible: nothing is deleted) and sends the corrections: Ben gets the correction itself, Ana's two questions are re-answered on fresh threads. Everything the correction writes traces back to it, and afterwards the agent answers refunds from the correction's note.
-   The graph then replays the fix step by step, with a caption for each (in the ledger it takes milliseconds): the confirmed records, the trace to Ben's message, the blast radius, each group quarantined or cancelled in turn, then the correction and each corrected turn appearing. Pause, step or **Skip** it with the bar above the graph.
+3. **Fix it**: the correction is recorded (store `console`, source `user`), its note written, the ticket cancelled through the CRM, then `dod.regenerate` from the ops update quarantines what it reached (reversible: nothing is deleted) and sends the corrections: ops gets the correction itself, Ana's two questions are re-answered on fresh threads. Everything the correction writes traces back to it, and afterwards the agent answers refunds from the correction's note.
+   The graph then replays the fix step by step, with a caption for each (in the ledger it takes milliseconds): the confirmed records, the trace to the ops update, the blast radius, each group quarantined or cancelled in turn, then the correction and each corrected turn appearing. Pause, step or **Skip** it with the bar above the graph.
 4. **Audit report** (button on the agent's answer): every record the correction touched, what happened to it, and the audit entry that sealed it, with the ledger's hash chain checked. Downloadable as Markdown (`dod.audit.report`).
 
 You can still click any box: **where did this come from?** traces it back turn by turn; **what came from this?** shows its blast radius.
@@ -61,12 +61,12 @@ python -m demo.support_agent.app --model openai/qwen3:8b --pg ...
 
 # Claude: put the key in a .env file at the repository root (git-ignored), once
 echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env
-python -m demo.support_agent.app          # uses Claude (anthropic/claude-sonnet-5-5) when the key is set
+python -m demo.support_agent.app          # uses Claude Haiku (anthropic/claude-haiku-5-5) when the key is set
 ```
 
-Each message waits for the model (a few seconds with Claude; the console shows how long). For snappier rehearsals put `DEMO_MODEL=anthropic/claude-haiku-5-5` in `.env`.
+Each message waits for the model (a few seconds with Claude); the chat shows the agent typing meanwhile. For another model put e.g. `DEMO_MODEL=anthropic/claude-sonnet-5-5` in `.env`.
 
-A real model may not fall for Ben's claim, or may phrase things differently; that's the point of running it live. The scripted model (`--model scripted`, the default without a key) always does, so rehearsals and `tests/test_demo_support_agent.py` are deterministic.
+A real model may question the ops update, or phrase things differently; that's the point of running it live. The scripted model (`--model scripted`, the default without a key) always follows it, so rehearsals and `tests/test_demo_support_agent.py` are deterministic.
 
 ## Presenting
 
