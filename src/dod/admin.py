@@ -297,6 +297,14 @@ class Admin:
                 f" ({','.join('?' * len(ids))})", ids).fetchall()
         return [tuple(r) for r in rows]
 
+    def _first_seq(self, item: Item) -> int:
+        """When the item was first written (its oldest bound write)."""
+        with self.ledger._lock:
+            row = self.ledger._conn.execute(
+                "SELECT min(w.seq) FROM bindings b JOIN writes w ON w.write_id = b.write_id"
+                " WHERE b.store = ? AND b.record_id = ?", item).fetchone()
+        return row[0] if row and row[0] is not None else 0
+
     def resolve(self, ref: str) -> Item:
         """``"<store> <record_id>"``, or a record ID bound in one store only."""
         store, _, rid = ref.strip().partition(" ")
@@ -346,11 +354,20 @@ class Admin:
             for r in self.origins(statement, item):
                 if r not in roots:
                     roots.append(r)
+        blast = {r: {i for its in blast_radius(self.ledger, *r).bindings.values() for i in its}
+                 for r in roots}
+        # An origin isn't built on another origin: one in another's blast
+        # radius (a conversation the bad fact reached) is derived. Oldest
+        # first, so two that reached each other (a cycle) keep the older.
+        kept: List[Item] = []
+        for r in sorted(roots, key=self._first_seq):
+            if not any(r in blast[k] for k in kept):
+                kept.append(r)
+        roots = kept
         live = self._live()
         reached = set(wrong) | set(roots)
         for r in roots:
-            b = blast_radius(self.ledger, *r)
-            reached |= {i for its in b.bindings.values() for i in its}
+            reached |= blast[r]
         groups: Dict[str, List[Item]] = {g: [] for g in GROUPS}
         for item in sorted(reached & live):
             g = self.classify(item)
@@ -385,15 +402,16 @@ class Admin:
                     cancelled.append(item)
         notify = set(plan.groups["notify"])
 
+        replaced: Dict[Item, Item] = {}
+
         def rewrite(task: RegenerateTask) -> Optional[Item]:
-            if task.item not in notify:
+            if task.item not in notify or task.item in replaced:  # once, across origins
                 return None
             cap.on_retrieve(current_key(), [correction], "in_prompt")
             if any(p.status == "bad" for p in task.parents):  # answered the origin itself
                 return a.notify(task.item, plan.statement) if a.notify else None
             return a.rerun(task.item) if a.rerun else None
 
-        replaced: Dict[Item, Item] = {}
         quarantined: List[Item] = []
         failed: List[Tuple[Item, str]] = []
         for root in plan.roots:
