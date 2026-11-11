@@ -328,7 +328,8 @@ class World:
     def _read_notes(self):
         base = self.dir / "notes"
         for f in sorted(base.rglob("*.md")):
-            yield "/" + str(f.relative_to(base)), f.read_text()
+            # The memory tool's IDs are /-paths on every OS (not Windows' \\).
+            yield "/" + f.relative_to(base).as_posix(), f.read_text(encoding="utf-8")
 
     def _read_memory(self):
         for ns in [("policies",)] + list(self._raw_memory.list_namespaces(prefix=("customers",))):

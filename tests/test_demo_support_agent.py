@@ -45,6 +45,12 @@ def run(tmp_path, pg=None):
                 f"message:{a}" for a in ana_turns}
             assert lin.trace(f"msg:{ops_turn}")["self_origin"]
 
+            # Every record the readers return is one the ledger knows (IDs are
+            # /-paths on every OS, so a Windows path can't slip in).
+            for store, reader in w.admin.readers.items():
+                for rid, _ in reader.records():
+                    assert w.admin.resolve(f"{store} {rid}") == (store, rid)
+
             # 1. Candidates (dod.admin.find): beliefs about refunds; the
             # person confirms the ones that contradict the correction (the
             # handbook doesn't).

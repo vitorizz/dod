@@ -232,3 +232,9 @@ def test_a_failed_fix_stays_pending_and_setup_is_checked(world):
     with pytest.raises(ValueError):
         Admin(led, {"notes": s["notes"]}, searchable=["notes", "nope"])
     assert "Nothing in memory states that" in a.handle("@impact gift cards never expire").text
+
+
+def test_plan_refuses_records_the_ledger_does_not_know(world):
+    a, _ = admin_for(world)
+    with pytest.raises(KeyError):
+        a.plan(STATEMENT, [("notes", "\\memories\\policies\\refunds-1")])
