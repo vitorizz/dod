@@ -339,6 +339,8 @@ class Admin:
         wrong = list(dict.fromkeys(tuple(i) for i in wrong))
         if not wrong:
             raise ValueError("nothing to fix: no record contradicts the statement")
+        for store, rid in wrong:
+            self.resolve(f"{store} {rid}")  # KeyError for a record the ledger doesn't know
         roots: List[Item] = []
         for item in wrong:
             for r in self.origins(statement, item):

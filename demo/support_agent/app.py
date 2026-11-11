@@ -11,6 +11,7 @@ Then open http://localhost:8000.
 import argparse
 import asyncio
 import contextlib
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -26,6 +27,8 @@ from dod import audit
 from . import correction
 from .lineage import Lineage
 from .world import CORRECTION, CUSTOMERS, STAFF, STORE_LABELS, STORY, World
+
+log = logging.getLogger(__name__)
 
 STATIC = Path(__file__).parent / "static"
 
@@ -110,16 +113,23 @@ def create_app(model: str = "scripted", pg_uri: str = None) -> Starlette:
         w = state["world"]
         async with lock:
             items = list(body.get("items") or [])
-            if step == "candidates":
-                result = correction.candidates(w, text)
-            elif step == "plan":
-                result = correction.plan(w, text, items)
-            elif step == "apply":
-                result = await correction.apply(w, text, items)
-            elif step == "command":
-                result = correction.command(w, text)
-            else:
-                return JSONResponse({"error": f"unknown step {step}"}, status_code=404)
+            try:
+                if step == "candidates":
+                    result = correction.candidates(w, text)
+                elif step == "plan":
+                    result = correction.plan(w, text, items)
+                elif step == "apply":
+                    result = await correction.apply(w, text, items)
+                elif step == "command":
+                    result = correction.command(w, text)
+                else:
+                    return JSONResponse({"error": f"unknown step {step}"}, status_code=404)
+            except (KeyError, ValueError) as exc:  # e.g. a record the ledger doesn't know
+                return JSONResponse({"error": str(exc.args[0] if exc.args else exc)},
+                                    status_code=400)
+            except Exception as exc:  # say what broke instead of a bare 500 page
+                log.exception("correction step %s failed", step)
+                return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
         if "error" in result:
             return JSONResponse(result, status_code=400)
         return JSONResponse({"result": result, **snapshot()})
