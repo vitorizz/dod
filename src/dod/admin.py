@@ -297,6 +297,14 @@ class Admin:
                 f" ({','.join('?' * len(ids))})", ids).fetchall()
         return [tuple(r) for r in rows]
 
+    def _first_seq(self, item: Item) -> int:
+        """When the item was first written (its oldest bound write)."""
+        with self.ledger._lock:
+            row = self.ledger._conn.execute(
+                "SELECT min(w.seq) FROM bindings b JOIN writes w ON w.write_id = b.write_id"
+                " WHERE b.store = ? AND b.record_id = ?", item).fetchone()
+        return row[0] if row and row[0] is not None else 0
+
     def resolve(self, ref: str) -> Item:
         """``"<store> <record_id>"``, or a record ID bound in one store only."""
         store, _, rid = ref.strip().partition(" ")
@@ -348,9 +356,14 @@ class Admin:
                     roots.append(r)
         blast = {r: {i for its in blast_radius(self.ledger, *r).bindings.values() for i in its}
                  for r in roots}
-        # An origin isn't built on another origin: one that's in another's
-        # blast radius (a conversation the bad fact reached) is derived.
-        roots = [r for r in roots if not any(r in blast[o] for o in roots if o != r)]
+        # An origin isn't built on another origin: one in another's blast
+        # radius (a conversation the bad fact reached) is derived. Oldest
+        # first, so two that reached each other (a cycle) keep the older.
+        kept: List[Item] = []
+        for r in sorted(roots, key=self._first_seq):
+            if not any(r in blast[k] for k in kept):
+                kept.append(r)
+        roots = kept
         live = self._live()
         reached = set(wrong) | set(roots)
         for r in roots:

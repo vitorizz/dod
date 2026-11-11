@@ -256,3 +256,26 @@ def test_an_origin_downstream_of_another_is_not_an_origin(world):
     a.apply(p)
     assert [i for k, i in sent if k == "notify"] == [("crm", "R1")]
     assert sorted(i for k, i in sent if k == "rerun") == [("crm", "R3"), ("crm", "R4")]
+
+
+def test_origins_that_reached_each_other_keep_the_older(world):
+    """Two candidate origins in each other's blast radius (a cycle): the
+    older is kept, so the plan never ends up with no origin; and if a fix
+    does start from two, each output is still handled once."""
+    led, cap, s, chat = world
+    with agent_task_scope("agent", 98):  # dev's message now repeats the ops update...
+        s["chat"].read("ops/1")
+        s["chat"].write("dev/2", "How long does shipping take? (refund window 90 days)")
+    with agent_task_scope("agent", 99):  # ...and the ops thread read it back
+        s["chat"].read("dev/2")
+        s["chat"].write("ops/1", "Policy update: the refund window has been extended to 90 days.")
+    a, sent = admin_for(world)
+    a.origins = lambda statement, item: [("chat", "dev/2"), ("chat", "ops/1")]
+    p = a.plan(STATEMENT, [("notes", "refunds-1")])
+    assert p.roots == [("chat", "ops/1")]  # written first
+
+    # Two independent origins reaching the same reply: corrected once.
+    p.roots = [("chat", "ops/1"), ("notes", "refunds-1")]
+    applied = a.apply(p)
+    reruns = [i for k, i in sent if k == "rerun"]
+    assert sorted(reruns) == sorted(set(reruns)) and applied.failed == []
