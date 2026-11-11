@@ -22,7 +22,7 @@ On the left of the web app is the customer chat, one tab per customer. On the ri
 
 Cleanup starts when a person finds a mistake, so there are no cleanup buttons on records. The support lead opens the **Support lead** tab in the chat and tells the agent what's right: “The refund window is 30 days, not 90.” The agent answers in the chat, and nothing changes until the lead confirms:
 
-1. **What contradicts you**: the beliefs about refunds (policy notes, customer notes, the handbook), with those stating another number of days ticked. The lead can untick any; dod never decides what's false.
+1. **What contradicts you**: the beliefs about refunds (policy notes, customer notes, the handbook), split into what it will fix (those stating something else) and what it leaves alone; **Keep as is** / **Fix this too** move a record between the two; dod never decides what's false.
 2. **What I'd do**: dod traces them to their origin (the ops update) and groups what was built on it by what to do:
    - **fix**: wrong notes stop being read; the correction is written as a policy note in their place;
    - **cancel**: Ana's refund ticket, so fulfilment doesn't act on it;

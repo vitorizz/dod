@@ -53,6 +53,10 @@
   .prop { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; max-width: 100%; font-size: 13px; }
   .prop h4 { margin: 8px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
   .prop label { display: block; margin: 4px 0; }
+  .prop .cand { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; margin: 6px 0; }
+  .prop .cand .c { margin-left: 0; }
+  .prop .cand.kept { opacity: .7; }
+  .prop button.mini { font-size: 11px; padding: 2px 8px; white-space: nowrap; flex: none; }
   .prop .c { color: var(--muted); font-size: 12px; margin-left: 22px; }
   .prop .warn { color: var(--blast); font-size: 11px; }
   .prop .pill { font-size: 11px; }
@@ -227,7 +231,7 @@
   <h3>Then someone notices</h3>
   <p>Cleanup starts when a person finds a mistake. Open the <b>Support lead</b> tab in the chat and type <b>@excise</b> with what's right: “@excise The refund window is 30 days, not 90.” With a real model, the model reads your correction and its memory to find what contradicts it. It replies in the chat:</p>
   <ol>
-    <li><b>What contradicts you</b>: its memory about refunds, with the records that say something else ticked. Untick any that are right.</li>
+    <li><b>What contradicts you</b>: the records that say something else, which it will fix, and what it leaves alone. Move any record between the two with <b>Keep as is</b> / <b>Fix this too</b>.</li>
     <li><b>What it would do</b>: dod traces them to where they came from (the ops update) and groups everything built on it: notes to <b>fix</b>, tickets to <b>cancel</b>, customers to <b>notify</b>, conversations kept <b>on record</b>, and what's untouched.</li>
     <li><b>Fix it</b>: the correction is written as a note, the ticket is cancelled in the CRM, the wrong records stop being read (kept, not deleted), and Ana (and ops) get corrections. Everything it writes traces back to the correction.</li>
   </ol>
@@ -423,10 +427,18 @@ async function replan(m) {
 }
 function proposalHtml(m, i) {
   const open = m.state === "open", p = m.plan;
-  let h = `<div>Here's what my memory says about it. The ticked ones contradict you${open ? "; untick any that are actually right" : ""}:</div>`;
-  h += m.cands.map(c => `<label><input type="checkbox" data-m="${i}" value="${esc(JSON.stringify(c.item))}" ${m.picked.includes(JSON.stringify(c.item)) ? "checked" : ""} ${open ? "" : "disabled"}>
-    <b>${esc(c.label)}</b>${c.conflicts ? ' <span class="warn">contradicts you</span>' : ""}<div class="c">${esc(clip(c.content, 120))}</div></label>`).join("");
-  if (!p) return h + `<div class="c">Nothing ticked, so nothing to fix.</div>`;
+  // Two lists, not checkboxes to untick: what I'll fix, and what I'll leave
+  // alone. One button moves a record to the other list.
+  const key = c => JSON.stringify(c.item);
+  const row = (c, fix) => `<div class="cand ${fix ? "" : "kept"}"><div><b>${esc(c.label)}</b>${
+      !fix && c.conflicts ? ' <span class="warn">says something different</span>' : ""}<div class="c">${esc(clip(c.content, 120))}</div></div>${
+      open ? `<button class="mini" data-m="${i}" data-k="${esc(key(c))}">${fix ? "Keep as is" : "Fix this too"}</button>` : ""}</div>`;
+  const fix = m.cands.filter(c => m.picked.includes(key(c))), keep = m.cands.filter(c => !m.picked.includes(key(c)));
+  let h = fix.length
+    ? `<div>${fix.length === 1 ? "This says" : `These ${fix.length} say`} something different from you. I'll fix ${fix.length === 1 ? "it" : "them"}:</div>` + fix.map(c => row(c, true)).join("")
+    : `<div>Nothing selected to fix.</div>`;
+  if (keep.length) h += `<h4>Leaving alone</h4>` + keep.map(c => row(c, false)).join("");
+  if (!p) return h;
   h += `<h4>Where it came from</h4>` + p.roots.map(r => `<div>${esc(r.label)}: “${esc(clip(r.preview, 140))}”</div>`).join("");
   h += `<h4>What I'd do</h4>` + Object.entries(GROUP).filter(([g]) => p.groups[g].length).map(([g, [t, why]]) =>
     `<div><b>${t}</b> <span class="c" style="margin:0">${why}</span><div>${p.groups[g].map(x => `<span class="pill">${esc(x.label)}</span>`).join("")}</div></div>`).join("");
@@ -468,9 +480,9 @@ function renderLead() {
         m.kind === "agent" ? esc(m.text) : m.kind === "done" ? doneHtml(m.result) : m.kind === "admin" ? adminHtml(m.result, i) : proposalHtml(m, i)}</div></div></div>`).join("")
     + (leadTyping ? `<div class="turn">${TYPING("support lead")}</div>` : "")
     || `<p class="empty">Found a mistake? Type <b>@excise</b> and what's right, e.g. “@excise ${esc(S.correction_example)}” The agent shows what in its memory contradicts you and what fixing it involves; nothing changes until you confirm. Also: <b>@trace</b> R3 (where did a reply come from?), <b>@impact</b> &lt;a fact&gt; (what did it affect?), <b>@undo</b>, <b>@ledger</b>, <b>@help</b>. These run <code>dod.admin</code>, the same commands a Slack bot would.</p>`;
-  for (const cb of $("log").querySelectorAll("input[data-m]")) cb.onchange = () => {
-    const m = LEAD[+cb.dataset.m];
-    m.picked = [...$("log").querySelectorAll(`input[data-m="${cb.dataset.m}"]:checked`)].map(x => x.value);
+  for (const b of $("log").querySelectorAll("button[data-m]")) b.onclick = () => {
+    const m = LEAD[+b.dataset.m], k = b.dataset.k;
+    m.picked = m.picked.includes(k) ? m.picked.filter(x => x !== k) : [...m.picked, k];
     replan(m);
   };
   for (const b of $("log").querySelectorAll("[data-cancel]")) b.onclick = () => { LEAD[+b.dataset.cancel].state = "cancelled"; renderTabs(); renderLead(); };
