@@ -62,6 +62,7 @@
   .prop .pill { font-size: 11px; }
   .prop .acts { margin-top: 10px; display: flex; gap: 8px; }
   .prop table { font-size: 12px; }
+  details.code { margin-top: 8px; } details.code summary { font-size: 11px; color: var(--muted); cursor: pointer; }
   pre.code { background: #1f1f1f; color: #d6d6d6; font-size: 11px; padding: 6px 8px; border-radius: 6px; margin: 8px 0 0; white-space: pre-wrap; }
   #compose { border-top: 1px solid var(--line); padding: 12px 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
   #compose .row { display: flex; gap: 8px; }
@@ -451,11 +452,12 @@ function proposalHtml(m, i) {
 function doneHtml(r) {
   return `<div>Done. The correction is now a policy note${r.cancelled.length ? `, ticket ${esc(r.cancelled.join(", "))} is cancelled in the CRM` : ""}, the wrong records are kept but I no longer read them, and I sent ${r.pairs.length} correction${r.pairs.length === 1 ? "" : "s"}:</div>
     <table class="ba"><tr><th>Customer</th><th>Was told</th><th>Correction sent</th></tr>
-    ${r.pairs.map(p => `<tr><td><b>${esc(cap(p.customer))}</b></td><td class="before">${esc(p.before)}</td><td class="after">${esc(p.after)}</td></tr>`).join("")}</table>
+    ${r.pairs.map(p => `<tr><td><b>${esc(cap(p.customer))}</b></td><td class="before" title="${esc(p.before)}">${esc(clip(p.before, 90))}</td><td class="after" title="${esc(p.after)}">${esc(clip(p.after, 90))}</td></tr>`).join("")}</table>
     <div class="acts"><button data-proof="${esc(r.roots[0].box)}">Audit report</button></div>
     <div class="c" style="margin:6px 0 0">Changed your mind? <b>@undo</b> releases what this quarantined.</div>`;
 }
-const codeHtml = lines => lines && lines.length ? `<pre class="code">${esc(lines.join("\n"))}</pre>` : "";
+const codeHtml = lines => lines && lines.length
+  ? `<details class="code"><summary>Library calls</summary><pre class="code">${esc(lines.join("\n"))}</pre></details>` : "";
 // Every other command goes to dod.admin as is (Admin.handle); what it names
 // is highlighted on the graph.
 async function adminCommand(text) {

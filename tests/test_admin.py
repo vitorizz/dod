@@ -238,3 +238,21 @@ def test_plan_refuses_records_the_ledger_does_not_know(world):
     a, _ = admin_for(world)
     with pytest.raises(KeyError):
         a.plan(STATEMENT, [("notes", "\\memories\\policies\\refunds-1")])
+
+
+def test_an_origin_downstream_of_another_is_not_an_origin(world):
+    """A conversation the bad fact reached (its stored thread now repeats the
+    wrong number) looks like a second origin; it's derived, so the plan has
+    one origin and every output is corrected once."""
+    led, cap, s, chat = world
+    with agent_task_scope("agent", 99):  # the thread's state now holds the wrong reply
+        s["notes"].read("refunds-1")
+        s["chat"].write("ana/3", "Delivered 45 days ago, can I get a refund? -- Yes, within"
+                                 " our 90-day refund window.")
+    a, sent = admin_for(world)
+    assert a.origins(STATEMENT, ("notes", "ana")) == [("chat", "ops/1"), ("chat", "ana/3")]
+    p = a.plan(STATEMENT, [("notes", "refunds-1"), ("notes", "ana")])
+    assert p.roots == [("chat", "ops/1")]
+    a.apply(p)
+    assert [i for k, i in sent if k == "notify"] == [("crm", "R1")]
+    assert sorted(i for k, i in sent if k == "rerun") == [("crm", "R3"), ("crm", "R4")]

@@ -346,11 +346,15 @@ class Admin:
             for r in self.origins(statement, item):
                 if r not in roots:
                     roots.append(r)
+        blast = {r: {i for its in blast_radius(self.ledger, *r).bindings.values() for i in its}
+                 for r in roots}
+        # An origin isn't built on another origin: one that's in another's
+        # blast radius (a conversation the bad fact reached) is derived.
+        roots = [r for r in roots if not any(r in blast[o] for o in roots if o != r)]
         live = self._live()
         reached = set(wrong) | set(roots)
         for r in roots:
-            b = blast_radius(self.ledger, *r)
-            reached |= {i for its in b.bindings.values() for i in its}
+            reached |= blast[r]
         groups: Dict[str, List[Item]] = {g: [] for g in GROUPS}
         for item in sorted(reached & live):
             g = self.classify(item)
@@ -385,15 +389,16 @@ class Admin:
                     cancelled.append(item)
         notify = set(plan.groups["notify"])
 
+        replaced: Dict[Item, Item] = {}
+
         def rewrite(task: RegenerateTask) -> Optional[Item]:
-            if task.item not in notify:
+            if task.item not in notify or task.item in replaced:  # once, across origins
                 return None
             cap.on_retrieve(current_key(), [correction], "in_prompt")
             if any(p.status == "bad" for p in task.parents):  # answered the origin itself
                 return a.notify(task.item, plan.statement) if a.notify else None
             return a.rerun(task.item) if a.rerun else None
 
-        replaced: Dict[Item, Item] = {}
         quarantined: List[Item] = []
         failed: List[Tuple[Item, str]] = []
         for root in plan.roots:

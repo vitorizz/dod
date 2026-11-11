@@ -342,7 +342,10 @@ class World:
     def _read_threads(self):
         threads: Dict[str, List[str]] = {}
         for e in self.log:
-            threads.setdefault(e["thread"], []).extend([e["message"], e["reply"]])
+            # What was said, not the agent's replies: a thread's stored state
+            # also holds them, and a wrong reply would make the conversation
+            # itself look like where a mistake came from.
+            threads.setdefault(e["thread"], []).append(e["message"])
         for t, lines in threads.items():
             yield langgraph_graph.record_id(t, "", "messages"), "\n".join(lines)
 
