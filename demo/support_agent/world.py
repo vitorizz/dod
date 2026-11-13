@@ -75,6 +75,7 @@ STORY: List[Tuple[str, str]] = [
     ("ana", "Order 2001 was delivered 45 days ago. Can I still return it for a refund?"),
     ("ana", "When will the refund for order 2001 arrive?"),
 ]
+CORRECTION_PREFIX = "A correction to what I told you earlier: "
 STAFF = {"ops"}  # senders on the internal channel; everyone else is a customer
 CUSTOMERS = ["ana", "dev", "ops"]
 # What the support lead reports once a wrong answer surfaces.
@@ -273,7 +274,7 @@ class World:
                 "action": str(t.get("action", "other")), "summary": str(t.get("summary", ""))})
         reply = decision.reply
         if msg.get("correction"):
-            reply = "Correction to my earlier reply: " + reply
+            reply = CORRECTION_PREFIX + reply
         r = await self.crm.call_tool("send_reply", {
             "customer": customer, "question": text, "text": reply})
         reply_id = _result_id("send_reply", {}, r)
@@ -322,7 +323,8 @@ class World:
             capture=self.cap, matcher=matcher, classify=self._classify,
             searchable=["notes", self.memory_store],
             actions=Actions(correct=self._correct, cancel=self._cancel,
-                            rerun=self._rerun, notify=self._notify),
+                            rerun=self._rerun, notify=self._notify,
+                            group=lambda item: self._question(item[1])[0]),  # one per customer
             label=self.label)
 
     def _read_notes(self):
@@ -437,11 +439,15 @@ class World:
             applied = await asyncio.to_thread(self.admin.apply, plan, "support-lead")
         finally:
             self._close_correction_turn()
+        for old, new in applied.covered.items():  # the console links them too
+            for e in self.log:
+                if e["reply_id"] == new[1]:
+                    e.setdefault("covers", []).append(old[1])
         return {"plan": plan, "applied": applied}
 
     async def _notice(self, customer: str, question: str, replaces: str, text: str) -> dict:
         start = self._seq()
-        reply = f"Correction to my earlier reply: {text}"
+        reply = CORRECTION_PREFIX + text
         r = await self.crm.call_tool("send_reply", {
             "customer": customer, "question": question, "text": reply})
         entry = {"customer": customer, "message": question, "reply": reply,

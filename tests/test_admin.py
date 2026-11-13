@@ -279,3 +279,15 @@ def test_origins_that_reached_each_other_keep_the_older(world):
     applied = a.apply(p)
     reruns = [i for k, i in sent if k == "rerun"]
     assert sorted(reruns) == sorted(set(reruns)) and applied.failed == []
+
+
+def test_one_correction_per_group(world):
+    """Ana had two wrong replies: grouped by customer, she gets one
+    correction (to her latest question) that covers both."""
+    a, sent = admin_for(world)
+    a.actions.group = lambda item: a.readers["crm"].data[item[1]].split(":")[0]  # "To ana"
+    applied = a.apply(a.plan(STATEMENT))
+    assert sorted(i for k, i in sent if k == "rerun") == [("crm", "R4")]
+    assert applied.covered == {("crm", "R3"): applied.replaced[("crm", "R4")]}
+    assert ("crm", "R1") in applied.replaced  # ops, a group of its own
+    assert ("crm", "R3") in world[0].quarantined()  # still corrected, not left live

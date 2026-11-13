@@ -77,16 +77,18 @@ def run(tmp_path, pg=None):
             assert p["affected"] + p["untouched"] == p["wipe"]
 
             # 3. Apply: the ticket is cancelled in the CRM, ops gets the
-            # correction itself, Ana gets her questions answered again.
+            # correction itself, and Ana one correction (her latest question,
+            # answered again) covering both wrong replies.
             r = await correction.apply(w, CORRECTION, boxes)
             assert r["failed"] == [] and len(r["cancelled"]) == 1
             assert w.ticket_status(r["cancelled"][0]) == "cancelled"
-            after = {(x["customer"], x["old"]): x["after"] for x in r["pairs"]}
-            assert len(after) == 3 and all(a.startswith("Correction to my earlier reply:")
-                                           for a in after.values())
-            assert after[("ana", first["reply_id"])].endswith("outside our 30-day refund window.")
-            assert "don't see" in after[("ana", second["reply_id"])]
-            assert CORRECTION in next(a for (cu, _), a in after.items() if cu == "ops")
+            after = {x["customer"]: x for x in r["pairs"]}
+            assert sorted(after) == ["ana", "ops"]
+            assert all(x["after"].startswith("A correction to what I told you earlier:")
+                       for x in after.values())
+            assert after["ana"]["old"] == [first["reply_id"], second["reply_id"]]
+            assert len(after["ana"]["before"]) == 2 and "don't see" in after["ana"]["after"]
+            assert CORRECTION in after["ops"]["after"]
 
             lin = Lineage(w)
             view = lin.view()

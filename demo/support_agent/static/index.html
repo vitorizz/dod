@@ -27,7 +27,9 @@
   button.good { background: var(--ok); color: #fff; border-color: var(--ok); }
   button.help { width: 32px; height: 32px; padding: 0; border-radius: 50%; font-weight: 700; }
   button:disabled { opacity: .45; cursor: default; }
-  main { display: grid; grid-template-columns: 400px 1fr; height: calc(100% - 56px); }
+  main { display: grid; grid-template-columns: var(--chatw, 400px) 1fr; height: calc(100% - 56px); position: relative; }
+  #resize { position: absolute; top: 0; bottom: 0; left: calc(var(--chatw, 400px) - 3px); width: 7px; cursor: col-resize; z-index: 5; }
+  #resize:hover, #resize.on { background: var(--line); }
 
   /* chat */
   #chat { display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); min-height: 0; }
@@ -136,6 +138,9 @@
   .stat b { font-size: 20px; }
   table.ba { border-collapse: collapse; width: 100%; margin-top: 6px; font-size: 13px; }
   table.ba td, table.ba th { border-top: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+  table.ba tr.exp { cursor: pointer; } table.ba .long { display: none; }
+  table.ba tr.open .long { display: inline; } table.ba tr.open .short { display: none; }
+  table.ba td.before div + div { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
   table.ba th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border-top: none; }
   td.before { color: #8a3a33; text-decoration: line-through; text-decoration-color: #c8372d88; }
   td.after { color: var(--ok); }
@@ -183,6 +188,7 @@
 </header>
 <div id="working"><i></i><span id="worktext"></span></div>
 <main>
+  <div id="resize" title="Drag to resize"></div>
   <section id="chat">
     <div id="tabs"></div>
     <div id="log"></div>
@@ -348,7 +354,7 @@ const SAVED = {policy_note: b => `policy note “${clip(b.preview, 50)}”`, cus
 function renderChat() {
   if (tab === "lead") return renderLead();
   const fixedBy = {};
-  for (const e of S.log) if (e.replaces) fixedBy[e.replaces] = e.reply_id;
+  for (const e of S.log) for (const r of [e.replaces, ...(e.covers || [])]) if (r) fixedBy[r] = e.reply_id;
   const rows = S.log.filter(e => tab === "all" || e.customer === tab);
   $("log").innerHTML = rows.map(e => {
     const bad = isBad(e), fixed = !!e.replaces;
@@ -356,7 +362,7 @@ function renderChat() {
     const saved = S.boxes.filter(b => b.turn === e.turn && SAVED[b.kind]).map(b => SAVED[b.kind](b));
     const savedLine = `<div class="saved">${saved.length ? "Saved: " + saved.map(esc).join(" · ") : "Saved nothing to memory"}</div>`;
     const note = bad ? `<div class="note">wrong · kept on record${fixedBy[e.reply_id] ? ` · correction sent as ${fixedBy[e.reply_id]}` : ""}</div>`
-      : fixed ? `<div class="note ok">correction of ${e.replaces}</div>` : "";
+      : fixed ? `<div class="note ok">correction of ${[...(e.covers || []), e.replaces].join(", ")}</div>` : "";
     return `<div class="turn">${q}<div class="a ${bad ? "bad" : ""} ${fixed ? "fixed" : ""}">
       <div class="who">agent → ${cap(e.customer)}</div><div class="bubble">${esc(e.reply)}</div>
       ${savedLine}${note}<div class="chip" data-r="${e.reply_id}">reply ${e.reply_id} · where did this come from? ↗</div></div></div>`;
@@ -459,7 +465,10 @@ function proposalHtml(m, i) {
 function doneHtml(r) {
   return `<div>Done. The correction is now a policy note${r.cancelled.length ? `, ticket ${esc(r.cancelled.join(", "))} is cancelled in the CRM` : ""}, the wrong records are kept but I no longer read them, and I sent ${r.pairs.length} correction${r.pairs.length === 1 ? "" : "s"}:</div>
     <table class="ba"><tr><th>Customer</th><th>Was told</th><th>Correction sent</th></tr>
-    ${r.pairs.map(p => `<tr><td><b>${esc(cap(p.customer))}</b></td><td class="before" title="${esc(p.before)}">${esc(clip(p.before, 90))}</td><td class="after" title="${esc(p.after)}">${esc(clip(p.after, 90))}</td></tr>`).join("")}</table>
+    ${r.pairs.map(p => `<tr class="exp" title="Click to show the full text"><td><b>${esc(cap(p.customer))}</b>${p.before.length > 1 ? `<div class="c" style="margin:0">${p.before.length} replies, one correction</div>` : ""}</td>
+      <td class="before">${p.before.map(t => `<div><span class="short">${esc(clip(t, 90))}</span><span class="long">${esc(t)}</span></div>`).join("")}</td>
+      <td class="after"><span class="short">${esc(clip(p.after, 90))}</span><span class="long">${esc(p.after)}</span></td></tr>`).join("")}</table>
+    <div class="c" style="margin:4px 0 0">Click a row for the full text.</div>
     <div class="acts"><button data-proof="${esc(r.roots[0].box)}">Audit report</button></div>
     <div class="c" style="margin:6px 0 0">Changed your mind? <b>@undo</b> releases what this quarantined.</div>`;
 }
@@ -497,6 +506,7 @@ function renderLead() {
   for (const b of $("log").querySelectorAll("[data-cancel]")) b.onclick = () => { LEAD[+b.dataset.cancel].state = "cancelled"; renderTabs(); renderLead(); };
   for (const b of $("log").querySelectorAll("[data-apply]")) b.onclick = () => applyFix(LEAD[+b.dataset.apply]);
   for (const b of $("log").querySelectorAll("[data-proof]")) b.onclick = () => proof(b.dataset.proof);
+  for (const tr of $("log").querySelectorAll("tr.exp")) tr.onclick = () => tr.classList.toggle("open");
   for (const b of $("log").querySelectorAll("[data-cmd]")) b.onclick = () => leadSays(b.dataset.cmd);
   $("log").scrollTop = $("log").scrollHeight;
 }
@@ -693,7 +703,8 @@ function renderGraph() {
     if (b.status !== "live") cls.push("quar");
     const tk = V.turns.find(t => t.id === b.turn)?.kind;
     if ((tk === "regenerated" || tk === "correction") && b.status === "live") cls.push("fixed");
-    const fixedBy = b.kind === "reply" && b.status === "corrected" && S.log.find(e => e.replaces === b.item[1]);
+    const fixedBy = b.kind === "reply" && b.status === "corrected"
+      && S.log.find(e => e.replaces === b.item[1] || (e.covers || []).includes(b.item[1]));
     const tag = fixedBy ? `corrected → ${fixedBy.reply_id}` : b.status !== "live" ? b.status : tk === "correction" ? "correction" : b.source === "user" ? (S.staff.includes(S.turns.find(t => t.id === b.turn)?.customer) ? "staff" : "customer") : b.kind === "handbook" ? "company" : "agent";
     out += `<g class="${cls.join(" ")}" data-id="${esc(b.id)}" transform="translate(${p.x},${p.y})">
       <rect class="b" width="${BW}" height="${BH}" rx="8"/><rect width="4" height="${BH}" rx="2" fill="${COLOR[c]}"/>
@@ -853,6 +864,20 @@ $("pstop").onclick = stopPlayer;
 $("reset").onclick = () => busy(async () => { stopPlayer(); sel = null; focus = null; lastResult = null; tab = "all"; LEAD = []; load(await api("/api/reset", {})); });
 $("helpbtn").onclick = () => $("help").classList.add("on");
 for (const m of document.querySelectorAll(".modal")) m.onclick = e => { if (e.target === m) m.classList.remove("on"); };
+// The chat panel's width: drag the edge; remembered in this browser.
+(() => {
+  const main = document.querySelector("main"), h = $("resize");
+  const set = w => main.style.setProperty("--chatw", Math.max(300, Math.min(w, innerWidth * 0.7)) + "px");
+  try { const w = +localStorage.getItem("dod-chatw"); if (w) set(w); } catch (e) {}
+  h.onpointerdown = ev => {
+    h.setPointerCapture(ev.pointerId); h.classList.add("on");
+    h.onpointermove = e => set(e.clientX - main.getBoundingClientRect().left);
+    h.onpointerup = () => {
+      h.onpointermove = null; h.classList.remove("on");
+      try { localStorage.setItem("dod-chatw", parseInt(getComputedStyle(main).getPropertyValue("--chatw"))); } catch (e) {}
+    };
+  };
+})();
 api("/api/state").then(load);
 </script>
 </body>
