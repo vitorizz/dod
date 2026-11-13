@@ -96,8 +96,15 @@ async def apply(w: World, text: str, items: List[list]) -> dict:
     correction's turn); returns the corrected replies."""
     out = await w.correct(text, [tuple(i) for i in items])
     a = out["applied"]
-    pairs = [w.reply_pair(old[1], new[1]) for old, new in a.replaced.items()
-             if old[0] == "mcp:crm"]
+    # One row per correction sent, with every wrong reply it answers.
+    pairs = []
+    for old, new in a.replaced.items():
+        if old[0] != "mcp:crm":
+            continue
+        olds = [o for o, n in a.covered.items() if n == new] + [old]
+        rows = [w.reply_pair(o[1], new[1]) for o in olds]
+        pairs.append(dict(rows[-1], before=[r["before"] for r in rows],
+                          old=[r["old"] for r in rows]))
     return {"correction": a.correction[1], "cancelled": [i[1] for i in a.cancelled],
             "pairs": pairs, "failed": [[list(i), why] for i, why in a.failed],
             "quarantined": len(a.quarantined),

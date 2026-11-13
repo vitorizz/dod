@@ -40,7 +40,7 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Dict, Hashable, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from dod.capture import Capture
 from dod.ledger import Ledger
@@ -178,6 +178,9 @@ class Actions:
     notify: Optional[Callable[[Item, str], Optional[Item]]] = None
     """For an output that answered the origin itself (re-running would repeat
     the mistake): send the correction (the ``str``); return its item."""
+    group: Optional[Callable[[Item], Hashable]] = None
+    """Outputs with the same key (say, the customer they went to) get one
+    correction: the latest is answered again, and covers the earlier ones."""
 
 
 @dataclass
@@ -206,6 +209,9 @@ class Applied:
     replaced: Dict[Item, Item]
     quarantined: List[Item]
     failed: List[Tuple[Item, str]]
+    covered: Dict[Item, Item] = field(default_factory=dict)
+    """Outputs answered by another one's correction (``Actions.group``):
+    each maps to the correction that covers it."""
 
 
 @dataclass
@@ -403,9 +409,18 @@ class Admin:
         notify = set(plan.groups["notify"])
 
         replaced: Dict[Item, Item] = {}
+        # One correction per group: the latest output stands for the group.
+        latest: Dict[Item, Item] = {}
+        if a.group:
+            by_key: Dict[Hashable, Item] = {}
+            for item in sorted(notify, key=self._first_seq):
+                by_key[a.group(item)] = item
+            latest = {item: by_key[a.group(item)] for item in notify}
 
         def rewrite(task: RegenerateTask) -> Optional[Item]:
             if task.item not in notify or task.item in replaced:  # once, across origins
+                return None
+            if latest.get(task.item, task.item) != task.item:  # covered by a later one
                 return None
             cap.on_retrieve(current_key(), [correction], "in_prompt")
             if any(p.status == "bad" for p in task.parents):  # answered the origin itself
@@ -419,7 +434,8 @@ class Admin:
             replaced.update(r.replaced)
             quarantined += [(s, rid) for s, rids in r.done.items() for rid in rids]
             failed += [((f.store, f.record_id), f.reason) for f in r.failed]
-        out = Applied(plan, correction, cancelled, replaced, quarantined, failed)
+        covered = {i: replaced[l] for i, l in latest.items() if l != i and l in replaced}
+        out = Applied(plan, correction, cancelled, replaced, quarantined, failed, covered)
         self.pending.pop(plan.id, None)  # only now: if an action raised, it can be retried
         self.history.append(out)
         return out
