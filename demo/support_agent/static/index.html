@@ -62,7 +62,8 @@
   .prop .pill { font-size: 11px; }
   .prop .acts { margin-top: 10px; display: flex; gap: 8px; }
   .prop table { font-size: 12px; }
-  details.code { margin-top: 8px; } details.code summary { font-size: 11px; color: var(--muted); cursor: pointer; }
+  details.code, details.plan { margin-top: 8px; } details.plan summary { font-size: 12px; color: var(--muted); cursor: pointer; }
+  details.code summary { font-size: 11px; color: var(--muted); cursor: pointer; }
   pre.code { background: #1f1f1f; color: #d6d6d6; font-size: 11px; padding: 6px 8px; border-radius: 6px; margin: 8px 0 0; white-space: pre-wrap; }
   #compose { border-top: 1px solid var(--line); padding: 12px 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
   #compose .row { display: flex; gap: 8px; }
@@ -441,9 +442,15 @@ function proposalHtml(m, i) {
   if (keep.length) h += `<h4>Leaving alone</h4>` + keep.map(c => row(c, false)).join("");
   if (!p) return h;
   h += `<h4>Where it came from</h4>` + p.roots.map(r => `<div>${esc(r.label)}: “${esc(clip(r.preview, 140))}”</div>`).join("");
-  h += `<h4>What I'd do</h4>` + Object.entries(GROUP).filter(([g]) => p.groups[g].length).map(([g, [t, why]]) =>
-    `<div><b>${t}</b> <span class="c" style="margin:0">${why}</span><div>${p.groups[g].map(x => `<span class="pill">${esc(x.label)}</span>`).join("")}</div></div>`).join("");
-  h += `<div class="c" style="margin:8px 0 0">Untouched: ${p.untouched_labels.map(esc).join(" · ")}. Nothing is deleted, so this can be undone; wiping my memory would lose all ${p.wipe} records.</div>`;
+  const n = g => p.groups[g].length, plural = (k, one, many) => `${k} ${k === 1 ? one : many}`;
+  const summary = [n("fix") && `fix ${plural(n("fix"), "note", "notes")}`, n("cancel") && `cancel ${plural(n("cancel"), "ticket", "tickets")}`,
+    n("notify") && `correct ${plural(n("notify"), "reply", "replies")}`, n("record") && `keep ${plural(n("record"), "conversation", "conversations")} on record`]
+    .filter(Boolean).join(" · ");
+  h += `<h4>What I'd do</h4><div><b>${esc(summary.charAt(0).toUpperCase() + summary.slice(1))}</b>. ${p.untouched} other records untouched.</div>`;
+  h += `<details class="plan"><summary>Details</summary>` + Object.entries(GROUP).filter(([g]) => p.groups[g].length).map(([g, [t, why]]) =>
+    `<div><b>${t}</b> <span class="c" style="margin:0">${why}</span><div>${p.groups[g].map(x => `<span class="pill">${esc(x.label)}</span>`).join("")}</div></div>`).join("")
+    + `<div class="c" style="margin:8px 0 0">Untouched: ${p.untouched_labels.map(esc).join(" · ")}.</div></details>`;
+  h += `<div class="c" style="margin:8px 0 0">Nothing is deleted, so this can be undone (@undo). Wiping my memory instead would lose all ${p.wipe} records.</div>`;
   h += codeHtml(p.code);
   if (open) h += `<div class="acts"><button class="good" data-apply="${i}">Fix it</button><button data-cancel="${i}">Cancel</button></div>`;
   else h += `<div class="note ${m.state === "applied" ? "ok" : ""}" style="margin-top:6px">${m.state === "applied" ? "applied" : "cancelled"}</div>`;
@@ -556,13 +563,43 @@ async function replayFix(m, r, before, fixBox, onDone) {
 // as it was partway through (later turns hidden, some records still live).
 let V = null, replay = null;
 function graphView() {
-  if (!replay) return S;
-  const turns = S.turns.filter(t => t.id <= replay.upTo);
-  const shown = new Set(turns.map(t => t.id));
-  const boxes = S.boxes.filter(b => shown.has(b.turn)).map(b => replay.live.has(b.id) ? {...b, status: "live"} : b);
-  const ids = new Set(boxes.map(b => b.id));
-  return {turns, boxes, reads: S.reads.filter(r => ids.has(r.from) && shown.has(r.turn))};
+  let turns = S.turns, boxes = S.boxes, reads = S.reads;
+  if (replay) {
+    turns = S.turns.filter(t => t.id <= replay.upTo);
+    const shown = new Set(turns.map(t => t.id));
+    boxes = S.boxes.filter(b => shown.has(b.turn)).map(b => replay.live.has(b.id) ? {...b, status: "live"} : b);
+    const ids = new Set(boxes.map(b => b.id));
+    reads = S.reads.filter(r => ids.has(r.from) && shown.has(r.turn));
+  }
+  return stack({turns, boxes, reads});
 }
+// A model often writes several notes of one kind in a turn ("Note on ana"
+// three times): draw them as one box, "Note on ana ×3". ALIAS maps each
+// member to the box drawn, so reads, focus and selection still line up.
+let ALIAS = {};
+function stack(v) {
+  ALIAS = {};
+  const groups = new Map();
+  for (const b of v.boxes) {
+    const k = `${b.turn}|${b.store}|${b.kind}|${b.label}`;
+    (groups.get(k) || groups.set(k, []).get(k)).push(b);
+  }
+  const boxes = [];
+  for (const g of groups.values()) {
+    if (g.length === 1 || g[0].kind === "handbook") { boxes.push(...g); continue; }
+    const head = g[0], status = g.find(b => b.status !== "live")?.status || "live";
+    for (const b of g) ALIAS[b.id] = head.id;
+    boxes.push({...head, label: `${head.label} ×${g.length}`, preview: g[g.length - 1].preview,
+                status, members: g.map(b => b.id)});
+  }
+  const seen = new Set(), reads = [];
+  for (const r of v.reads) {
+    const from = ALIAS[r.from] || r.from, k = from + "|" + r.turn;
+    if (!seen.has(k)) { seen.add(k); reads.push({...r, from}); }
+  }
+  return {turns: v.turns, boxes, reads};
+}
+const shown = id => ALIAS[id] || id;
 function layout() {
   const rows = V.turns.map(t => ({t, cells: Object.fromEntries(COLS.map(c => [c, []]))}));
   const byTurn = Object.fromEntries(rows.map(r => [r.t.id, r]));
@@ -592,8 +629,8 @@ function layout() {
 
 function focusSets() {
   if (!focus) return null;
-  return {kind: focus.kind, boxes: new Set(focus.boxes), turns: new Set(focus.turns),
-          reads: new Set(focus.reads.map(([b, t]) => b + "|" + t)), origins: new Set(focus.origins || [])};
+  return {kind: focus.kind, boxes: new Set(focus.boxes.map(shown)), turns: new Set(focus.turns),
+          reads: new Set(focus.reads.map(([b, t]) => shown(b) + "|" + t)), origins: new Set((focus.origins || []).map(shown))};
 }
 
 function renderGraph() {
@@ -607,7 +644,7 @@ function renderGraph() {
     const t = r.t, cls = F && F.turns.has(t.id) ? F.kind : t.id === flowTurn ? "new" : (i % 2 ? "alt" : "");
     out += `<rect class="rowband ${cls}" x="0" y="${L.rowY[t.id]}" width="${L.width}" height="${L.rowH[t.id]}"/>`;
     out += `<text class="turnno" x="6" y="${L.rowY[t.id] + ROWPAD + 18}">${t.kind === "seed" ? "0" : t.id}</text>`;
-    if (t.kind === "correction") out += `<rect x="0" y="${L.rowY[t.id]}" width="3" height="${L.rowH[t.id]}" fill="var(--ok)"/>`;
+    if (t.kind === "correction" || t.kind === "regenerated") out += `<rect x="0" y="${L.rowY[t.id]}" width="3" height="${L.rowH[t.id]}" fill="var(--ok)"/>`;
   });
   for (const c of COLS) {
     out += `<text class="colhead" x="${L.colX[c] + L.gutter[c]}" y="18" fill="${COLOR[c]}">${HEAD[c][0]}</text>
@@ -647,7 +684,7 @@ function renderGraph() {
   }
   for (const r of L.rows) for (const c of COLS) for (const b of r.cells[c]) {
     const p = L.pos[b.id], cls = ["box"];
-    if (b.id === sel) cls.push("sel");
+    if (b.id === shown(sel)) cls.push("sel");
     if (F) {
       if (!F.boxes.has(b.id)) cls.push("dim");
       else if (F.kind === "trace") cls.push(F.origins.has(b.id) ? "origin" : "trace");
@@ -656,12 +693,13 @@ function renderGraph() {
     if (b.status !== "live") cls.push("quar");
     const tk = V.turns.find(t => t.id === b.turn)?.kind;
     if ((tk === "regenerated" || tk === "correction") && b.status === "live") cls.push("fixed");
-    const tag = b.status !== "live" ? b.status : tk === "correction" ? "correction" : b.source === "user" ? (S.staff.includes(S.turns.find(t => t.id === b.turn)?.customer) ? "staff" : "customer") : b.kind === "handbook" ? "company" : "agent";
+    const fixedBy = b.kind === "reply" && b.status === "corrected" && S.log.find(e => e.replaces === b.item[1]);
+    const tag = fixedBy ? `corrected → ${fixedBy.reply_id}` : b.status !== "live" ? b.status : tk === "correction" ? "correction" : b.source === "user" ? (S.staff.includes(S.turns.find(t => t.id === b.turn)?.customer) ? "staff" : "customer") : b.kind === "handbook" ? "company" : "agent";
     out += `<g class="${cls.join(" ")}" data-id="${esc(b.id)}" transform="translate(${p.x},${p.y})">
       <rect class="b" width="${BW}" height="${BH}" rx="8"/><rect width="4" height="${BH}" rx="2" fill="${COLOR[c]}"/>
       <text x="12" y="19" font-weight="600">${esc(clip(b.label, 22))}</text>
       <text class="sub" x="12" y="37">${esc(clip(b.preview, 34))}</text>
-      <text class="tagt" x="${BW - 8}" y="19" text-anchor="end" fill="${tag === "customer" ? "var(--blast)" : "var(--muted)"}">${tag}</text></g>`;
+      <text class="tagt" x="${BW - 8}" y="19" text-anchor="end" fill="${tag === "customer" ? "var(--blast)" : fixedBy ? "var(--ok)" : "var(--muted)"}">${tag}</text></g>`;
   }
   svg.innerHTML = out;
   for (const g of svg.querySelectorAll(".box")) g.onclick = () => selectBox(g.dataset.id);
